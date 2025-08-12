@@ -29,7 +29,7 @@ N_v_points = 12
 N_bath_samples_theory = 120000 
 
 out_prefix = "img/constant/constant_"
-output_format = "pdf"
+output_format = "png"
 isPreview = False
 
 def sigma_constant(V: np.ndarray, p: Dict[str, Any]) -> np.ndarray:
@@ -70,7 +70,7 @@ def sigmaV_max_bound(v_mag: float, s: float, sigma_fn: Callable, sigma_p: Dict[s
     return float(np.max(prod[finite]))
 
 
-def theory_rates_at_v(v_mag: float) -> Tuple[float, float, float]:
+def theory_rates_at_v(v_mag: float) -> Tuple[float, float, float, float, float]:
     v_vec = np.array([v_mag, 0.0, 0.0])
     mu = (m_t * m_f) / (m_t + m_f)
 
@@ -84,14 +84,20 @@ def theory_rates_at_v(v_mag: float) -> Tuple[float, float, float]:
     drift_par_coll = -(mu/m_t) * ex_g
     diff_par_coll = (mu/m_t)**2 * ((V**2)/3.0 + ex_g**2)
     diff_perp_coll = (mu/m_t)**2 * ((5.0/3.0) * (V**2) - ex_g**2)
+    third_par_coll = (mu/m_t)**3 * ( - V**2 * ex_g - ex_g**3 )
+    third_mix_coll = (mu/m_t)**3 * ( ex_g**3 - (5.0/3.0) * V**2 * ex_g )
 
     drift_rate = float(np.mean(wt * drift_par_coll))
     diff_par_rate = float(np.mean(wt * diff_par_coll))
     diff_perp_rate = float(np.mean(wt * diff_perp_coll))
+    third_par_rate = float(np.mean(wt * third_par_coll))
+    third_mix_rate = float(np.mean(wt * third_mix_coll))
 
     return (drift_rate * rate_boost,
             diff_par_rate * rate_boost,
-            diff_perp_rate * rate_boost)
+            diff_perp_rate * rate_boost,
+            third_par_rate * rate_boost,
+            third_mix_rate * rate_boost)
 
 
 @dataclass
@@ -103,6 +109,10 @@ class MCEstimate:
     diff_par_err: float
     diff_perp: float
     diff_perp_err: float
+    third_par: float
+    third_par_err: float
+    third_mix: float
+    third_mix_err: float
     acceptance: float
     blocks: int
     accepts: int
@@ -116,7 +126,7 @@ def simulate_fixed_v(v_mag: float) -> MCEstimate:
 
     t_block = 0.0
     acc_in_block = 0
-    sum_drift = sum_dpar = sum_dperp = 0.0
+    sum_drift = sum_dpar = sum_dperp = sum_tpar = sum_tmix = 0.0
     blocks = []
     attempts_total = 0
     accepts_total = 0
@@ -145,31 +155,38 @@ def simulate_fixed_v(v_mag: float) -> MCEstimate:
             dv_par = dv[0]
             dv_perp2 = float(np.dot(dv, dv) - dv_par**2)
 
+            dv_par3 = dv_par**3
+            dv_mix = dv_par * dv_perp2
+
             sum_drift += dv_par
             sum_dpar += dv_par**2
             sum_dperp += dv_perp2
+            sum_tpar += dv_par3
+            sum_tmix += dv_mix
             acc_in_block += 1
             accepts_total += 1
 
             if acc_in_block >= block_accepts:
-                blocks.append((sum_drift/t_block, sum_dpar/t_block, sum_dperp/t_block, t_block))
+                blocks.append((sum_drift/t_block, sum_dpar/t_block, sum_dperp/t_block, sum_tpar/t_block, sum_tmix/t_block, t_block))
                 t_block = 0.0
                 acc_in_block = 0
-                sum_drift = sum_dpar = sum_dperp = 0.0
+                sum_drift = sum_dpar = sum_dperp = sum_tpar = sum_tmix = 0.0
 
     if t_block > 0.0 and acc_in_block > 0:
-        blocks.append((sum_drift/t_block, sum_dpar/t_block, sum_dperp/t_block, t_block))
+        blocks.append((sum_drift/t_block, sum_dpar/t_block, sum_dperp/t_block, sum_tpar/t_block, sum_tmix/t_block, t_block))
 
-    arr = np.array([[b[0], b[1], b[2]] for b in blocks], dtype=float)
+    arr = np.array([[b[0], b[1], b[2], b[3], b[4]] for b in blocks], dtype=float)
     nblk = max(len(blocks), 1)
-    means = np.mean(arr, axis=0) if nblk > 0 else np.zeros(3)
-    errs = np.std(arr, axis=0, ddof=1)/np.sqrt(nblk) if nblk > 1 else np.zeros(3)
+    means = np.mean(arr, axis=0) if nblk > 0 else np.zeros(5)
+    errs = np.std(arr, axis=0, ddof=1)/np.sqrt(nblk) if nblk > 1 else np.zeros(5)
 
     return MCEstimate(
         v=v_mag,
         drift_par=float(means[0]), drift_par_err=float(errs[0]),
         diff_par=float(means[1]), diff_par_err=float(errs[1]),
         diff_perp=float(means[2]), diff_perp_err=float(errs[2]),
+        third_par=float(means[3]), third_par_err=float(errs[3]),
+        third_mix=float(means[4]), third_mix_err=float(errs[4]),
         acceptance=accepts_total/max(attempts_total,1),
         blocks=nblk, accepts=accepts_total
     )
@@ -183,12 +200,14 @@ for vmag in v_vals:
     theory.append((vmag, *theory_rates_at_v(vmag)))
     mc_pts.append(simulate_fixed_v(vmag))
 
-theory_df = pd.DataFrame(theory, columns=["v","drift_par","diff_par","diff_perp"])
+theory_df = pd.DataFrame(theory, columns=["v","drift_par","diff_par","diff_perp","third_par","third_mix"])
 mc_df = pd.DataFrame([
     dict(v=pt.v,
          drift_par=pt.drift_par, drift_par_err=pt.drift_par_err,
          diff_par=pt.diff_par, diff_par_err=pt.diff_par_err,
          diff_perp=pt.diff_perp, diff_perp_err=pt.diff_perp_err,
+         third_par=pt.third_par, third_par_err=pt.third_par_err,
+         third_mix=pt.third_mix, third_mix_err=pt.third_mix_err,
          acceptance=pt.acceptance, blocks=pt.blocks, accepts=pt.accepts)
     for pt in mc_pts
 ])
@@ -202,6 +221,8 @@ mc_df = pd.DataFrame([
 fig1 = f"{out_prefix}drift_vs_v.{output_format}"
 fig2 = f"{out_prefix}diff_par_vs_v.{output_format}"
 fig3 = f"{out_prefix}diff_perp_vs_v.{output_format}"
+fig4 = f"{out_prefix}third_par_vs_v.{output_format}"
+fig5 = f"{out_prefix}third_mix_vs_v.{output_format}"
 
 plt.figure()
 plt.plot(theory_df["v"], theory_df["drift_par"], label="Theory")
@@ -232,6 +253,28 @@ plt.xlabel("speed v")
 plt.ylabel(r"$\langle \Delta v_\perp^2 \rangle / dt$")
 plt.title("Perpendicular diffusion (sum of 2 components)")
 plt.legend(); plt.tight_layout(); plt.savefig(fig3, dpi=160); 
+
+if isPreview:
+    plt.show()
+
+plt.figure()
+plt.plot(theory_df["v"], theory_df["third_par"], label="Theory")
+plt.errorbar(mc_df["v"], mc_df["third_par"], yerr=mc_df["third_par_err"], fmt="o", capsize=3, label="MC")
+plt.xlabel("speed v")
+plt.ylabel(r"$\langle (\Delta v_\parallel)^3 \rangle / dt$")
+plt.title("Third-order parallel moment")
+plt.legend(); plt.tight_layout(); plt.savefig(fig4, dpi=160); 
+
+if isPreview:
+    plt.show()
+
+plt.figure()
+plt.plot(theory_df["v"], theory_df["third_mix"], label="Theory")
+plt.errorbar(mc_df["v"], mc_df["third_mix"], yerr=mc_df["third_mix_err"], fmt="o", capsize=3, label="MC")
+plt.xlabel("speed v")
+plt.ylabel(r"$\langle \Delta v_\parallel \Delta v_\perp^2 \rangle / dt$")
+plt.title("Third-order mixed moment")
+plt.legend(); plt.tight_layout(); plt.savefig(fig5, dpi=160); 
 
 if isPreview:
     plt.show()
