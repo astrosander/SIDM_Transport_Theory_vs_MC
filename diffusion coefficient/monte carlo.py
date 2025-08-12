@@ -13,7 +13,7 @@ s_bath = 1.5e5
 rho_dm = 5.35e-22
 n_f = rho_dm / m_f
 
-sigma_model = "powerlaw"
+sigma_model = "constant"
 sigma0 = 1.0e-27
 V0 = 150e3
 alpha_pow = -2.0
@@ -28,7 +28,7 @@ N_v_points = 12
 
 N_bath_samples_theory = 120000 
 
-out_prefix = "img/powerlaw/powerlaw_"
+out_prefix = "img/constant/constant_"
 output_format = "pdf"
 isPreview = False
 
