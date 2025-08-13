@@ -213,11 +213,6 @@ mc_df = pd.DataFrame([
 ])
 
 
-# th_path = f"{out_prefix}theory.csv"
-# mc_path = f"{out_prefix}mc.csv"
-# theory_df.to_csv(th_path, index=False)
-# mc_df.to_csv(mc_path, index=False)
-
 fig1 = f"{out_prefix}drift_vs_v.{output_format}"
 fig2 = f"{out_prefix}diff_par_vs_v.{output_format}"
 fig3 = f"{out_prefix}diff_perp_vs_v.{output_format}"
@@ -278,28 +273,3 @@ plt.legend(); plt.tight_layout(); plt.savefig(fig5, dpi=160);
 
 if isPreview:
     plt.show()
-
-# zero_energy_path = f"{out_prefix}energy_rate_zero.csv"
-# pd.DataFrame({"v": v_vals, "energy_rate": np.zeros_like(v_vals)}).to_csv(zero_energy_path, index=False)
-
-
-# sample_idx = np.linspace(0, len(v_vals)-1, 6, dtype=int)
-# compare = pd.DataFrame({
-#     "v": theory_df["v"].values[sample_idx],
-#     "th_drift_par": theory_df["drift_par"].values[sample_idx],
-#     "mc_drift_par": mc_df["drift_par"].values[sample_idx],
-#     "th_diff_par": theory_df["diff_par"].values[sample_idx],
-#     "mc_diff_par": mc_df["diff_par"].values[sample_idx],
-#     "th_diff_perp": theory_df["diff_perp"].values[sample_idx],
-#     "mc_diff_perp": mc_df["diff_perp"].values[sample_idx],
-# })
-# print(("Theory vs MC — sample speeds", compare))
-# # display_dataframe_to_user("Theory vs MC — sample speeds", compare)
-
-# print("Saved:")
-# print(th_path)
-# print(mc_path)
-# print(fig1)
-# print(fig2)
-# print(fig3)
-# print(zero_energy_path)
