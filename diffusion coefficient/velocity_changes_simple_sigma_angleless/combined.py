@@ -13,7 +13,6 @@ s_bath = 1.5e5
 rho_dm = 5.35e-22
 n_f = rho_dm / m_f
 
-sigma_model = "constant"
 sigma0 = 1.0e-27
 V0 = 150e3
 alpha_pow = -2.0
@@ -28,27 +27,15 @@ N_v_points = 12
 
 N_bath_samples_theory = 120000 
 
-out_prefix = "img/yukawa/yukawa_"
-output_format = "png"
+output_format = "pdf"
 isPreview = False
 
 def sigma_constant(V: np.ndarray, p: Dict[str, Any]) -> np.ndarray:
     return np.full_like(V, p["sigma0"], dtype=float)
 
-def sigma_powerlaw(V: np.ndarray, p: Dict[str, Any]) -> np.ndarray:
-    Vc = np.maximum(V, p["V_min_clip"])
-    return p["sigma0"] * (Vc / p["V0"]) ** p["alpha_pow"]
-
 def sigma_yukawa_like(V: np.ndarray, p: Dict[str, Any]) -> np.ndarray:
     Vc = np.maximum(V, p["V_min_clip"])
     return p["sigma0"] / (1.0 + (Vc / p["V0"]) ** 4)
-
-def get_sigma(name: str) -> Callable[[np.ndarray, Dict[str, Any]], np.ndarray]:
-    return {"constant": sigma_constant, "powerlaw": sigma_powerlaw, "yukawa": sigma_yukawa_like}[name]
-
-sigma_params = dict(sigma0=sigma0, V0=V0, alpha_pow=alpha_pow, V_min_clip=V_min_clip)
-sigma_fn = get_sigma(sigma_model)
-
 
 def gaussian_bath_velocities(n: int, s: float) -> np.ndarray:
     return rng.normal(0.0, s, size=(n, 3))
@@ -69,8 +56,7 @@ def sigmaV_max_bound(v_mag: float, s: float, sigma_fn: Callable, sigma_p: Dict[s
     finite = np.isfinite(prod) & (prod >= 0.0)
     return float(np.max(prod[finite]))
 
-
-def theory_rates_at_v(v_mag: float) -> Tuple[float, float, float, float, float]:
+def theory_rates_at_v(v_mag: float, sigma_fn: Callable, sigma_params: Dict[str, Any]) -> Tuple[float, float, float, float, float]:
     v_vec = np.array([v_mag, 0.0, 0.0])
     mu = (m_t * m_f) / (m_t + m_f)
 
@@ -99,7 +85,6 @@ def theory_rates_at_v(v_mag: float) -> Tuple[float, float, float, float, float]:
             third_par_rate * rate_boost,
             third_mix_rate * rate_boost)
 
-
 @dataclass
 class MCEstimate:
     v: float
@@ -117,7 +102,7 @@ class MCEstimate:
     blocks: int
     accepts: int
 
-def simulate_fixed_v(v_mag: float) -> MCEstimate:
+def simulate_fixed_v(v_mag: float, sigma_fn: Callable, sigma_params: Dict[str, Any]) -> MCEstimate:
     v_vec = np.array([v_mag, 0.0, 0.0])
     mu = (m_t * m_f) / (m_t + m_f)
 
@@ -191,74 +176,84 @@ def simulate_fixed_v(v_mag: float) -> MCEstimate:
         blocks=nblk, accepts=accepts_total
     )
 
+def generate_and_save_plot(sigma_fn: Callable, sigma_params: Dict[str, Any], title: str, filename: str):
+    v_vals = np.linspace(0.0, probe_v_max*s_bath, N_v_points)
+    theory = []
+    mc_pts = []
 
-# Generate data
-v_vals = np.linspace(0.0, probe_v_max*s_bath, N_v_points)
-theory = []
-mc_pts = []
+    for vmag in v_vals:
+        theory.append((vmag, *theory_rates_at_v(vmag, sigma_fn, sigma_params)))
+        mc_pts.append(simulate_fixed_v(vmag, sigma_fn, sigma_params))
 
-for vmag in v_vals:
-    theory.append((vmag, *theory_rates_at_v(vmag)))
-    mc_pts.append(simulate_fixed_v(vmag))
+    theory_df = pd.DataFrame(theory, columns=["v","drift_par","diff_par","diff_perp","third_par","third_mix"])
+    mc_df = pd.DataFrame([
+        dict(v=pt.v,
+             drift_par=pt.drift_par, drift_par_err=pt.drift_par_err,
+             diff_par=pt.diff_par, diff_par_err=pt.diff_par_err,
+             diff_perp=pt.diff_perp, diff_perp_err=pt.diff_perp_err,
+             third_par=pt.third_par, third_par_err=pt.third_par_err,
+             third_mix=pt.third_mix, third_mix_err=pt.third_mix_err,
+             acceptance=pt.acceptance, blocks=pt.blocks, accepts=pt.accepts)
+        for pt in mc_pts
+    ])
 
-theory_df = pd.DataFrame(theory, columns=["v","drift_par","diff_par","diff_perp","third_par","third_mix"])
-mc_df = pd.DataFrame([
-    dict(v=pt.v,
-         drift_par=pt.drift_par, drift_par_err=pt.drift_par_err,
-         diff_par=pt.diff_par, diff_par_err=pt.diff_par_err,
-         diff_perp=pt.diff_perp, diff_perp_err=pt.diff_perp_err,
-         third_par=pt.third_par, third_par_err=pt.third_par_err,
-         third_mix=pt.third_mix, third_mix_err=pt.third_mix_err,
-         acceptance=pt.acceptance, blocks=pt.blocks, accepts=pt.accepts)
-    for pt in mc_pts
-])
+    eps = 1e-30
+    def _norm_factor(series: pd.Series) -> float:
+        m = np.max(np.abs(series.values))
+        return float(m if m > eps else 1.0)
 
-# Create output directory
-os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
+    norms = {
+        "drift_par": _norm_factor(theory_df["drift_par"]),
+        "diff_par": _norm_factor(theory_df["diff_par"]),
+        "diff_perp": _norm_factor(theory_df["diff_perp"]),
+        "third_par": _norm_factor(theory_df["third_par"]),
+        "third_mix": _norm_factor(theory_df["third_mix"]),
+    }
 
-eps = 1e-30
+    plt.figure()
 
-def _norm_factor(series: pd.Series) -> float:
-    m = np.max(np.abs(series.values))
-    return float(m if m > eps else 1.0)
+    # High-contrast, easily distinguishable color palette
+    plt.plot(theory_df["v"], theory_df["drift_par"]/norms["drift_par"], color='#FF0000', linewidth=2.5, label="$\\langle \\Delta v_\\parallel \\rangle$")  # Bright Red
+    plt.plot(theory_df["v"], theory_df["diff_par"]/norms["diff_par"], color='#0000FF', linewidth=2.5, label="$\\langle \\Delta v_\\parallel^2 \\rangle$")  # Bright Blue
+    plt.plot(theory_df["v"], theory_df["diff_perp"]/norms["diff_perp"], color='#00FF00', linewidth=2.5, label="$\\langle \\Delta v_\\perp^2 \\rangle$")  # Bright Green
+    plt.plot(theory_df["v"], theory_df["third_par"]/norms["third_par"], color='#FF8000', linewidth=2.5, label="$\\langle \\Delta v_\\parallel^3 \\rangle$")  # Bright Orange
+    plt.plot(theory_df["v"], theory_df["third_mix"]/norms["third_mix"], color='#8000FF', linewidth=2.5, label="$\\langle \\Delta v_\\parallel \\Delta v_\\perp^2 \\rangle$")  # Bright Purple
 
-norms = {
-    "drift_par": _norm_factor(theory_df["drift_par"]),
-    "diff_par": _norm_factor(theory_df["diff_par"]),
-    "diff_perp": _norm_factor(theory_df["diff_perp"]),
-    "third_par": _norm_factor(theory_df["third_par"]),
-    "third_mix": _norm_factor(theory_df["third_mix"]),
-}
+    
+    plt.errorbar(mc_df["v"], mc_df["drift_par"]/norms["drift_par"],
+                 yerr=(mc_df["drift_par_err"]/norms["drift_par"]).replace([np.nan, np.inf, -np.inf], 0.0),
+                 fmt="o", capsize=3, color='#FF0000', markersize=8, capthick=2, elinewidth=2)
+    plt.errorbar(mc_df["v"], mc_df["diff_par"]/norms["diff_par"],
+                 yerr=(mc_df["diff_par_err"]/norms["diff_par"]).replace([np.nan, np.inf, -np.inf], 0.0),
+                 fmt="s", capsize=3, color='#0000FF', markersize=8, capthick=2, elinewidth=2)
+    plt.errorbar(mc_df["v"], mc_df["diff_perp"]/norms["diff_perp"],
+                 yerr=(mc_df["diff_perp_err"]/norms["diff_perp"]).replace([np.nan, np.inf, -np.inf], 0.0),
+                 fmt="^", capsize=3, color='#00FF00', markersize=8, capthick=2, elinewidth=2)
+    plt.errorbar(mc_df["v"], mc_df["third_par"]/norms["third_par"],
+                 yerr=mc_df["third_par_err"]/norms["third_par"],
+                 fmt="d", capsize=3, color='#FF8000', markersize=8, capthick=2, elinewidth=2)
+    plt.errorbar(mc_df["v"], mc_df["third_mix"]/norms["third_mix"],
+                 yerr=mc_df["third_mix_err"]/norms["third_mix"],
+                 fmt="v", capsize=3, color='#8000FF', markersize=8, capthick=2, elinewidth=2)
 
-plt.figure()
-# Theory curves (normalized)
-plt.plot(theory_df["v"], theory_df["drift_par"]/norms["drift_par"], label="Theory: drift‖")
-plt.plot(theory_df["v"], theory_df["diff_par"]/norms["diff_par"], label="Theory: diff‖")
-plt.plot(theory_df["v"], theory_df["diff_perp"]/norms["diff_perp"], label="Theory: diff⊥")
-plt.plot(theory_df["v"], theory_df["third_par"]/norms["third_par"], label="Theory: 3rd‖")
-plt.plot(theory_df["v"], theory_df["third_mix"]/norms["third_mix"], label="Theory: 3rd-mix")
+    plt.xlabel("Speed v (km/s)")
+    plt.ylabel("Average of the velocities incremenets (up to the third order)")
+    plt.title(title)
+    plt.legend()
+    
+    ax = plt.gca()
+    ax.set_xticklabels([f'{x/1000:.0f}' for x in ax.get_xticks()])
+    
+    plt.tight_layout()
+    plt.savefig(filename, dpi=160)
+    print(filename)
+    plt.close()
 
-# MC points with error bars (normalized by same factors)
-plt.errorbar(mc_df["v"], mc_df["drift_par"]/norms["drift_par"],
-             yerr=(mc_df["drift_par_err"]/norms["drift_par"]).replace([np.nan, np.inf, -np.inf], 0.0),
-             fmt="o", capsize=3, label="MC: drift‖")
-plt.errorbar(mc_df["v"], mc_df["diff_par"]/norms["diff_par"],
-             yerr=(mc_df["diff_par_err"]/norms["diff_par"]).replace([np.nan, np.inf, -np.inf], 0.0),
-             fmt="s", capsize=3, label="MC: diff‖")
-plt.errorbar(mc_df["v"], mc_df["diff_perp"]/norms["diff_perp"],
-             yerr=(mc_df["diff_perp_err"]/norms["diff_perp"]).replace([np.nan, np.inf, -np.inf], 0.0),
-             fmt="^", capsize=3, label="MC: diff⊥")
-plt.errorbar(mc_df["v"], mc_df["third_par"]/norms["third_par"],
-             yerr=mc_df["third_par_err"]/norms["third_par"],
-             fmt="d", capsize=3, label="MC: 3rd‖")
-plt.errorbar(mc_df["v"], mc_df["third_mix"]/norms["third_mix"],
-             yerr=mc_df["third_mix_err"]/norms["third_mix"],
-             fmt="v", capsize=3, label="MC: 3rd-mix")
+# os.makedirs("img/constant", exist_ok=True)
+# os.makedirs("img/yukawa", exist_ok=True)
 
-plt.xlabel("speed v")
-plt.ylabel("normalized value")
-plt.title("constant cross-section")
-plt.legend()
-plt.tight_layout()
-# plt.show()
-plt.savefig("constant.pdf", dpi=160); 
+constant_params = dict(sigma0=sigma0, V0=V0, alpha_pow=alpha_pow, V_min_clip=V_min_clip)
+yukawa_params = dict(sigma0=sigma0, V0=V0, alpha_pow=alpha_pow, V_min_clip=V_min_clip)
+
+generate_and_save_plot(sigma_constant, constant_params, "Constant Cross-Section $\\sigma (v)$", "img/constant/constant_cross_section.pdf")
+generate_and_save_plot(sigma_yukawa_like, yukawa_params, "Yukawa Cross-Section $\\sigma (v)$", "img/yukawa/yukawa_cross_section.pdf") 
