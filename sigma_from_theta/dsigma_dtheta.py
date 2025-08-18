@@ -16,14 +16,14 @@ theta_vals = np.linspace(0, np.pi, 500)
 
 plt.figure(figsize=(8,6))
 
-for x in np.logspace(0, 1, num=10, base=10):
+for x in np.logspace(0, 1, num=7, base=10):
     v = x / 4.5
     dsigma_vals = dsigma_dcos(theta_vals)
-    plt.plot(theta_vals, dsigma_vals, label=rf'$\frac{{v}}{{\omega}} = $ {v/w:.1f}')
+    plt.plot(theta_vals, dsigma_vals, label=rf'$v = $ {v/w:.1f}')
 
 plt.xlabel(r'$\theta$ (rad)')
 plt.ylabel(r'$\frac{d\sigma}{d\cos\theta}$')
-plt.title('Differential Cross Section vs Scattering Angle')
+plt.title(r'$\frac{d\sigma}{d\cos\theta}(\theta)$')
 plt.legend()
 plt.grid(True)
 plt.savefig("dsigma_dtheta.png", dpi=160)
