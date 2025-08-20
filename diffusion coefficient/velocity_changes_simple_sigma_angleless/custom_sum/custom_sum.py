@@ -8,7 +8,10 @@ rng = np.random.default_rng(1)
 
 # v_bath = []
 num_bath = 1000_000
-velocity_vals = np.linspace(0, 500_000, 100)
+# velocity_vals = np.logspace(0, 1000_000, num=10, base=10.0)
+# np.logspace(0, 1000_000, 5)
+
+velocity_vals = np.linspace(0, 1000_0000, 10)
 s_bath = 150_000
 number_encounters = 10_000
 m_particle = 1
@@ -84,13 +87,21 @@ for particle_velocity in velocity_vals:
 
 		g_after = gt-gn
 
+
+		# g_norm = np.linalg.norm(g, axis=1)
+	    # A1 = -(1.0 / 3.0) * g_norm * g[:, 0]
+	    # A2 = (g_norm**3 / 15.0) * (1.0 + 2.0 * c**2)
+	    # A_perp2 = (g_norm**3 / 15.0) * (2.0 - c**2)
+	    # A3 = -(g_norm**4 / 35.0) * (3.0 * c + 2.0 * c**3)
+	    # A_mix = -(g_norm**4 / 35.0) * c * (3.0 - 2.0 * c**2)
+	    
 		v_particle_after = (m_particle * v_particle_before + m_bath * (v_bath[bath_index] + g_after)) / (m_particle + m_bath)
 		dv_particle_parrallel = v_particle_after[0] - v_particle_before[0]
 		dv_particle_perp = v_particle_after[1] - v_particle_before[1]
 
 		def sigma(V):
-			return 1.0
-			# return 1.0 / (1.0 + (V/150000)**4)
+			# return 1.0
+			return 1.0 / (1.0 + (V/150000)**4)
 
 		dv_parallel += (dv_particle_parrallel) * np.linalg.norm(g)	*sigma(np.linalg.norm(g))
 		dv_parallel2 += (dv_particle_parrallel)**2 * np.linalg.norm(g)	*sigma(np.linalg.norm(g))
@@ -109,26 +120,34 @@ for particle_velocity in velocity_vals:
 	# mean_relative_magnitude = mean_relative_magnitude / number_encounters
 
 	# relative_magnitudes.append(mean_relative_magnitude)
-	dv_parallels.append(dv_parallel)
-	dv_parallels2.append(dv_parallel2)
-	dv_perps2.append(dv_perp2)
-	dv_parallels3.append(dv_parallel3)
-	dv_parallels_perps2.append(dv_parallel_perp2)
+	dv_parallels.append(abs(dv_parallel / s_bath))
+	dv_parallels2.append(abs(dv_parallel2 / s_bath**2))
+	dv_perps2.append(abs(dv_perp2 / s_bath**2))
+	dv_parallels3.append(abs(dv_parallel3 / s_bath**3))
+	dv_parallels_perps2.append(abs(dv_parallel_perp2 / s_bath**3))
 
 def normalize(dv):
 	return dv / max(abs(max(dv)), abs(min(dv)))
 
-dv_parallels = normalize(dv_parallels)
-dv_parallels2 = normalize(dv_parallels2)
-dv_perps2 = normalize(dv_perps2)
-dv_parallels3 = normalize(dv_parallels3)
-dv_parallels_perps2 = normalize(dv_parallels_perps2)
+dv_parallels = dv_parallels
+dv_parallels2 = dv_parallels2 
+dv_perps2 = dv_perps2 
+dv_parallels3 = dv_parallels3
+dv_parallels_perps2 = dv_parallels_perps2
 
-plt.plot(velocity_vals, dv_parallels, label = r"$\langle \Delta v_\parallel\rangle$")
-plt.plot(velocity_vals, dv_parallels2, label = r"$\langle \Delta v_\parallel^2\rangle$")
-plt.plot(velocity_vals, dv_perps2, label = r"$\langle \Delta v_\perp^2\rangle$")
-plt.plot(velocity_vals, dv_parallels3, label = r"$\langle \Delta v_\parallel^3\rangle$")
-plt.plot(velocity_vals, dv_parallels_perps2, label = r"$\langle \Delta v_\parallel \Delta v_\perp^2\rangle$")
+# plt.plot(velocity_vals, dv_parallels, label = r"$\langle \Delta v_\parallel\rangle$")
+# plt.plot(velocity_vals, dv_parallels2, label = r"$\langle \Delta v_\parallel^2\rangle$")
+# plt.plot(velocity_vals, dv_perps2, label = r"$\langle \Delta v_\perp^2\rangle$")
+# plt.plot(velocity_vals, dv_parallels3, label = r"$\langle \Delta v_\parallel^3\rangle$")
+# plt.plot(velocity_vals, dv_parallels_perps2, label = r"$\langle \Delta v_\parallel \Delta v_\perp^2\rangle$")
+
+
+plt.loglog(velocity_vals, dv_parallels, label = r"$\langle \Delta v_\parallel\rangle$")
+plt.loglog(velocity_vals, dv_parallels2, label = r"$\langle \Delta v_\parallel^2\rangle$")
+plt.loglog(velocity_vals, dv_perps2, label = r"$\langle \Delta v_\perp^2\rangle$")
+plt.loglog(velocity_vals, dv_parallels3, label = r"$\langle \Delta v_\parallel^3\rangle$")
+plt.loglog(velocity_vals, dv_parallels_perps2, label = r"$\langle \Delta v_\parallel \Delta v_\perp^2\rangle$")
+
 
 plt.xlabel(r'$v_\text{particle}$')
 plt.ylabel(r'$\langle \Delta v_\text{relative}\rangle$')
