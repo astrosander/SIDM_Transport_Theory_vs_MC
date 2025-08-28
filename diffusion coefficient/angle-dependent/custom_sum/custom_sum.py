@@ -150,6 +150,12 @@ for particle_velocity in velocity_vals:
 	dv_parallels3.append(abs(dv_parallel3 / s_bath**3))
 	dv_parallels_perps2.append(abs(dv_parallel_perp2 / s_bath**3))
 
+	# dv_parallels.append((dv_parallel / max(dv_parallel)))
+	# dv_parallels2.append((dv_parallel2 / max(dv_parallel2)))
+	# dv_perps2.append((dv_perp2 / max(dv_perp2)))
+	# dv_parallels3.append((dv_parallel3 / max(dv_parallel3)))
+	# dv_parallels_perps2.append((dv_parallel_perp2 / max(dv_parallel_perp2)))
+
 def normalize(dv):
 	return dv
 	# return dv / max(abs(max(dv)), abs(min(dv)))
@@ -165,6 +171,12 @@ plt.loglog(velocity_vals, dv_parallels2, label = r"$\langle \Delta v_\parallel^2
 plt.loglog(velocity_vals, dv_perps2, label = r"$\langle \Delta v_\perp^2\rangle$")
 plt.loglog(velocity_vals, dv_parallels3, label = r"$\langle \Delta v_\parallel^3\rangle$")
 plt.loglog(velocity_vals, dv_parallels_perps2, label = r"$\langle \Delta v_\parallel \Delta v_\perp^2\rangle$")
+
+# plt.plot(velocity_vals, dv_parallels, label = r"$\langle \Delta v_\parallel\rangle$")
+# plt.plot(velocity_vals, dv_parallels2, label = r"$\langle \Delta v_\parallel^2\rangle$")
+# plt.plot(velocity_vals, dv_perps2, label = r"$\langle \Delta v_\perp^2\rangle$")
+# plt.plot(velocity_vals, dv_parallels3, label = r"$\langle \Delta v_\parallel^3\rangle$")
+# plt.plot(velocity_vals, dv_parallels_perps2, label = r"$\langle \Delta v_\parallel \Delta v_\perp^2\rangle$")
 
 plt.xlabel(r'$v_\text{particle}$')
 plt.ylabel(r'$\langle \Delta v_\text{relative}\rangle$')
