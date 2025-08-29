@@ -20,6 +20,12 @@ number_encounters = 10_000_000
 
 m_particle = 1.0
 m_bath = 1.0
+mu = (m_particle * m_bath) / (m_particle + m_bath)
+
+KAPPA = 1.0
+
+USE_VDEP_THETA_MIN = True
+THETA_MIN_FIXED = 1.0e-3
 
 sigma0 = 2.0e-28
 w = 1.0e3
@@ -36,10 +42,29 @@ def _norm3(v):
     return math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2])
 
 @njit(fastmath=True, cache=True)
+def _theta_min_from(V: float, w_: float) -> float:
+    eps = 1e-15
+    if USE_VDEP_THETA_MIN:
+        Veff = V if V > eps else eps
+        th = 2.0 * w_ / Veff
+    else:
+        th = THETA_MIN_FIXED
+    if th < 1e-12:
+        th = 1e-12
+    if th > math.pi - 1e-12:
+        th = math.pi - 1e-12
+    return th
+
+@njit(fastmath=True, cache=True)
 def sigma_tot_rutherford_scalar(V: float, sigma0_: float, w_: float) -> float:
     # return sigma0_ / (1.0 + (V*V)/(w_*w_))
     # return sigma0_
-    return sigma0_ / (1.0 + (V*V*V*V)/(w_*w_*w_*w_))
+    # return sigma0_ / (1.0 + (V*V*V*V)/(w_*w_*w_*w_))
+    thmin = _theta_min_from(V, w_)
+    half = 0.5 * thmin
+    cot_half = math.cos(half) / math.sin(half)
+    pref = KAPPA / (mu * V * V) if V > 0.0 else 0.0
+    return math.pi * (pref * pref) * (cot_half * cot_half)
 
 @njit(fastmath=True, cache=True)
 def sample_cos_rutherford_scalar(V: float, w_: float) -> float:
@@ -55,7 +80,19 @@ def sample_cos_rutherford_scalar(V: float, w_: float) -> float:
     #     x = 1.0
     # return x
 
-    return 2.0 * np.random.random() - 1.0
+    # return 2.0 * np.random.random() - 1.0
+
+    thmin = _theta_min_from(V, w_)
+    u = np.random.random()
+    tmin = math.tan(0.5 * thmin)
+    denom = math.sqrt(max(1.0 - u, 1e-300))
+    t = tmin / denom
+    theta = 2.0 * math.atan(t)
+    if theta < 0.0:
+        theta = 0.0
+    if theta > math.pi:
+        theta = math.pi
+    return math.cos(theta)
 
 @njit(fastmath=True, cache=True)
 def ortho_basis_from(g_hat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -184,7 +221,8 @@ plt.loglog(velocity_vals, dv_parallels_perps2,    label = r"$\langle \Delta v_\p
 
 plt.xlabel(r'$v_{\rm particle}$')
 plt.ylabel(r'velocity increments')
-plt.title(r'velocity increments with rutherford scattering (Numba-parallel)')
+mode_text = r"$\theta_{\min}(V)=2w/V$" if USE_VDEP_THETA_MIN else r"$\theta_{\min}=\mathrm{const}$"
+plt.title(r'Velocity increments with Rutherford (Coulomb/grav.) scattering, ' + mode_text)
 plt.legend()
 plt.grid(True, which="both", ls=":")
 plt.tight_layout()
