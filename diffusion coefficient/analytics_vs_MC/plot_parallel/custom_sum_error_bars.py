@@ -37,21 +37,25 @@ def _norm3(v):
 
 @njit(fastmath=True, cache=True)
 def sigma_tot_rutherford_scalar(V: float, sigma0_: float, w_: float) -> float:
-    return sigma0_ / (1.0 + (V*V)/(w_*w_))
+    # return sigma0_ / (1.0 + (V*V)/(w_*w_))
+    # return sigma0_
+    return sigma0_ / (1.0 + (V*V*V*V)/(w_*w_*w_*w_))
 
 @njit(fastmath=True, cache=True)
 def sample_cos_rutherford_scalar(V: float, w_: float) -> float:
-    A = w_*w_ + 0.5*V*V
-    B = 0.5*V*V
-    u = np.random.random()
-    denom = (1.0/(A + B)) + (2.0*B / ((A + B)*max(A - B, 1e-300))) * u
-    inv = 1.0/denom
-    x = (A - inv)/B
-    if x < -1.0:
-        x = -1.0
-    elif x > 1.0:
-        x = 1.0
-    return x
+    # A = w_*w_ + 0.5*V*V
+    # B = 0.5*V*V
+    # u = np.random.random()
+    # denom = (1.0/(A + B)) + (2.0*B / ((A + B)*max(A - B, 1e-300))) * u
+    # inv = 1.0/denom
+    # x = (A - inv)/B
+    # if x < -1.0:
+    #     x = -1.0
+    # elif x > 1.0:
+    #     x = 1.0
+    # return x
+
+    return 2.0 * np.random.random() - 1.0
 
 @njit(fastmath=True, cache=True)
 def ortho_basis_from(g_hat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
