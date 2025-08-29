@@ -6,7 +6,13 @@ from typing import Tuple, Dict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 SEED               = 1
-VELOCITY_VALS      = np.linspace(0.0, 10_000_000.0, 100)
+# VELOCITY_VALS      = np.linspace(0.0, 10_000_000.0, 100)
+
+N_VELOCITY = 100
+V_MIN = 10_000.0
+V_MAX = 10000_000_000.0
+VELOCITY_VALS = np.geomspace(V_MIN, V_MAX, N_VELOCITY)
+
 S_BATH             = 150_000.0
 M_PARTICLE         = 1.0
 M_BATH             = 1.0
@@ -18,7 +24,7 @@ N_F                = 1.0
 SIGMA0             = 2.0e-28
 W                   = 1.0e3
 
-N_BATH_SAMPLES     = 400_000
+N_BATH_SAMPLES     = 4_000_000
 
 N_WORKERS          = min(os.cpu_count() or 1, len(VELOCITY_VALS))
 
