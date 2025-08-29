@@ -14,9 +14,14 @@ except Exception:
 rng = np.random.default_rng(1)
 
 num_bath = 1_000_000
-velocity_vals = np.linspace(0.0, 1_000_000.0, 100)
+
+N_VELOCITY = 50
+V_MIN = 10_000.0
+V_MAX = 1_000_000.0
+velocity_vals = np.geomspace(V_MIN, V_MAX, N_VELOCITY)
+
 s_bath = 150_000.0
-number_encounters = 10_000_000
+number_encounters = 20_000_000
 
 m_particle = 1.0
 m_bath = 1.0
@@ -57,42 +62,50 @@ def _theta_min_from(V: float, w_: float) -> float:
 
 @njit(fastmath=True, cache=True)
 def sigma_tot_rutherford_scalar(V: float, sigma0_: float, w_: float) -> float:
-    # return sigma0_ / (1.0 + (V*V)/(w_*w_))
+    # Regime: Rotherford
+    return sigma0_ / (1.0 + (V*V)/(w_*w_))
+    
+    # Regime: Isotropic
     # return sigma0_
     # return sigma0_ / (1.0 + (V*V*V*V)/(w_*w_*w_*w_))
-    thmin = _theta_min_from(V, w_)
-    half = 0.5 * thmin
-    cot_half = math.cos(half) / math.sin(half)
-    pref = KAPPA / (mu * V * V) if V > 0.0 else 0.0
-    return math.pi * (pref * pref) * (cot_half * cot_half)
+    
+    # Regime: Gravitational
+    # thmin = _theta_min_from(V, w_)
+    # half = 0.5 * thmin
+    # cot_half = math.cos(half) / math.sin(half)
+    # pref = KAPPA / (mu * V * V) if V > 0.0 else 0.0
+    # return math.pi * (pref * pref) * (cot_half * cot_half)
 
 @njit(fastmath=True, cache=True)
 def sample_cos_rutherford_scalar(V: float, w_: float) -> float:
-    # A = w_*w_ + 0.5*V*V
-    # B = 0.5*V*V
-    # u = np.random.random()
-    # denom = (1.0/(A + B)) + (2.0*B / ((A + B)*max(A - B, 1e-300))) * u
-    # inv = 1.0/denom
-    # x = (A - inv)/B
-    # if x < -1.0:
-    #     x = -1.0
-    # elif x > 1.0:
-    #     x = 1.0
-    # return x
+    # Regime: Rotherford
+    A = w_*w_ + 0.5*V*V
+    B = 0.5*V*V
+    u = np.random.random()
+    denom = (1.0/(A + B)) + (2.0*B / ((A + B)*max(A - B, 1e-300))) * u
+    inv = 1.0/denom
+    x = (A - inv)/B
+    if x < -1.0:
+        x = -1.0
+    elif x > 1.0:
+        x = 1.0
+    return x
 
+    # Regime: Isotropic
     # return 2.0 * np.random.random() - 1.0
 
-    thmin = _theta_min_from(V, w_)
-    u = np.random.random()
-    tmin = math.tan(0.5 * thmin)
-    denom = math.sqrt(max(1.0 - u, 1e-300))
-    t = tmin / denom
-    theta = 2.0 * math.atan(t)
-    if theta < 0.0:
-        theta = 0.0
-    if theta > math.pi:
-        theta = math.pi
-    return math.cos(theta)
+    # Regime: Gravitational
+    # thmin = _theta_min_from(V, w_)
+    # u = np.random.random()
+    # tmin = math.tan(0.5 * thmin)
+    # denom = math.sqrt(max(1.0 - u, 1e-300))
+    # t = tmin / denom
+    # theta = 2.0 * math.atan(t)
+    # if theta < 0.0:
+    #     theta = 0.0
+    # if theta > math.pi:
+    #     theta = math.pi
+    # return math.cos(theta)
 
 @njit(fastmath=True, cache=True)
 def ortho_basis_from(g_hat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
