@@ -47,9 +47,8 @@ def C2_analytic(r):
     A = 1.0 + 0.5*r*r
     B = 0.5*r*r
         
-    R = -2*B/(A+B)
-    logR = np.log1p(-2*B/(A+B))
-    I2 = (A*A/B**3)*(1/(A-B)-1/(A+B)) + (2*A/B**3)*logR + 2/B**2
+    R = (A - B) / (A + B)
+    I2 = (A*A/B**3)*(1/(A-B)-1/(A+B)) + (2*A/B**3)*np.log(R) + 2/B**2
     return I2/I0_analytic(r)
 
     # return (2/(B**2)+2*A/(B**3)*np.log(R)-2/(B**2-A**2)) / I0_analytic(r)
