@@ -86,7 +86,7 @@ plt.loglog(v_vals, y5, lw=2.2, label=r'$|\langle \Delta V_x \Delta V_y^2\rangle|
 
 plt.xlabel(r'$v$')
 plt.ylabel('normalized rates')
-plt.title(r'Gravitational (Coulomb) transport: drift, variances, and 3rd-order (Hénon)')
+# plt.title(r'Gravitational (Coulomb) transport: drift, variances, and 3rd-order (Hénon)')
 plt.grid(True, which='both', ls=':', alpha=0.5)
 plt.legend(ncol=2, fontsize=9)
 plt.tight_layout()
