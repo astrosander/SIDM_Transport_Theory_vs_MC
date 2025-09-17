@@ -33,9 +33,12 @@ def cum_at(x, xgrid, cum):
 
 def Lambda(v):
     Lam = (2.0 * w**3 / (v**2)) * np.sqrt(sigma0 / (4.0*np.pi))
-    return np.maximum(Lam, 1.0 + 1e-12)
+    print(Lam)
+    return Lam#np.maximum(Lam, 1.0 + 1e-12)
 
-def lnLambda(v): return np.log(Lambda(v))
+def lnLambda(v): 
+    # print(np.log(Lambda(v)))
+    return np.log(Lambda(v))
 
 A1 = -16.0 * np.pi**2 * G**2 * m_field * (M_test + m_field)
 A2 =  32.0 * np.pi**2 * G**2 * m_field**2 / 3.0
@@ -90,4 +93,6 @@ plt.ylabel('normalized rates')
 plt.grid(True, which='both', ls=':', alpha=0.5)
 plt.legend(ncol=2, fontsize=9)
 plt.tight_layout()
-plt.show()
+plt.savefig("binney_henon.pdf")
+plt.savefig("binney_henon.png")
+# plt.show()
