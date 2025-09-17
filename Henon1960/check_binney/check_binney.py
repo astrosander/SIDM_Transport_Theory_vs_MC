@@ -32,7 +32,7 @@ def cum_at(x, xgrid, cum):
     return np.interp(xx, xgrid, cum)
 
 def Lambda(v):
-    Lam = (2.0 * w**3 / (v**2)) * np.sqrt(sigma0 / (4.0*np.pi))
+    Lam = (2.0 * w**3 / (v**2)) #* np.sqrt(sigma0 / (4.0*np.pi))
     print(Lam)
     return Lam#np.maximum(Lam, 1.0 + 1e-12)
 
@@ -95,4 +95,4 @@ plt.legend(ncol=2, fontsize=9)
 plt.tight_layout()
 plt.savefig("binney_henon.pdf")
 plt.savefig("binney_henon.png")
-# plt.show()
+plt.show()
