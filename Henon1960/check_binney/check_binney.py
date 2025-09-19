@@ -17,7 +17,7 @@ N_INT    = 20000
 va       = np.linspace(0.0, va_max, N_INT)
 
 norm = 4.0 * np.pi / ((2.0*np.pi*s_bath**2)**1.5)
-a_of_v = norm * np.exp(-0.5*(va/s_bath)**2)
+a_of_v = norm * va**2 * np.exp(-0.5*(va/s_bath)**2)
 
 cum_I1 = cumtrapz(va**1 * a_of_v, va, initial=0.0)
 cum_I2 = cumtrapz(va**2 * a_of_v, va, initial=0.0)
