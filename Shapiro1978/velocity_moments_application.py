@@ -3,6 +3,17 @@ import multiprocessing as mp
 import time
 from functools import partial
 
+import matplotlib as mpl
+
+mpl.rcParams.update({
+    "text.usetex": False,
+    "font.family": "STIXGeneral",
+    "font.size": 12,
+    "mathtext.fontset": "stix",
+    "axes.unicode_minus": False,
+})
+
+
 # ---------------- SIDM local FP coefficients (unchanged from earlier) ----------------
 def maxwell_3d_pdf(u, s):
     c = (2.0*np.pi*s**2)**(-1.5)
@@ -221,7 +232,7 @@ if __name__ == "__main__":
 
     # strictly increasing energy grid: from deep to weak binding (all <0)
     # Create geometric sequence from -1000 to -0.01 (increasing)
-    E_grid = -np.geomspace(1e3, 1e-2, 22)  # increasing: -1000 ... -0.01
+    E_grid = -np.geomspace(1e3, 1e-2, 22*3)  # increasing: -1000 ... -0.01
     print(f"Energy grid: {len(E_grid)} points from E={E_grid[0]:.1e} to {E_grid[-1]:.1e}")
 
     g0 = lambda E: (-E)**0.5  # outer boundary "BW-like" seed; swap as needed
@@ -245,11 +256,14 @@ if __name__ == "__main__":
     print(f"DEE range: {DEE.min():.2e} to {DEE.max():.2e}")
 
     import matplotlib.pyplot as plt
+    # plt.rcParams['text.usetex'] = True
+    # plt.rcParams['font.family'] = 'serif'
+    
     x = -E
     fig, ax = plt.subplots(1,3, figsize=(14,4.2))
-    ax[0].loglog(x, g, lw=2.5, color='C0', label='g(E)')
+    ax[0].loglog(x, g, lw=2.5, color='C0', label=r'$g(E)$')
     ax[0].loglog(x, g0(E), ls='--', color='C3', label=r'$g_0(E)$')
     ax[0].set_xlabel(r'$-E$'); ax[0].set_ylabel(r'$g(E)$'); ax[0].grid(True, ls=':', alpha=0.4); ax[0].legend()
     ax[1].loglog(x, np.abs(AE), lw=2.5, color='C2'); ax[1].set_xlabel(r'$-E$'); ax[1].set_ylabel(r'$|A_E(E)|$'); ax[1].grid(True, ls=':', alpha=0.4)
     ax[2].loglog(x, DEE, lw=2.5, color='m'); ax[2].set_xlabel(r'$-E$'); ax[2].set_ylabel(r'$D_{EE}(E)$'); ax[2].grid(True, ls=':', alpha=0.4)
-    plt.tight_layout(); plt.savefig("fig/sidm_energy_fp_diagnostics.png", dpi=160)
+    plt.tight_layout(); plt.savefig("fig/sidm_energy_fp_diagnostics.pdf", dpi=160)
