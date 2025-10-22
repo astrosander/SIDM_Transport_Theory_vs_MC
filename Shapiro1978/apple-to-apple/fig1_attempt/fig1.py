@@ -27,6 +27,18 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+import matplotlib as mpl
+
+# --- unified TeX-style appearance (MathText, no system LaTeX needed) ---
+mpl.rcParams.update({
+    "text.usetex": False,          # use MathText (portable)
+    "font.family": "STIXGeneral",  # match math fonts
+    "font.size": 12,
+    "mathtext.fontset": "stix",
+    "axes.unicode_minus": False,   # proper minus sign
+})
+
+
 # ----------------------- physics & knobs -----------------------
 G, M, V0 = 1.0, 1.0, 1.0
 
@@ -41,7 +53,7 @@ TAPER_BETA = 0.25     # smaller = gentler roll-over
 SEED = 7
 rng  = np.random.default_rng(SEED)
 
-N_STARS  = 12_000     # particles in the ensemble
+N_STARS  = 120_000     # particles in the ensemble
 N_STEPS  = 8000        # total SDE steps
 DT       = 2e-3        # time step
 SIGMA_X  = 0.25        # diffusion: b_x = SIGMA_X * x
@@ -49,13 +61,51 @@ SIGMA_J  = 0.20        # diffusion: b_j = const
 J_FLOOR  = 2e-3        # drift regularizer near j→0
 
 # Five-interval measurement; take many snapshots per interval to boost tail stats
-N_INTERVALS       = 5
-MEAS_PER_INTERVAL = 60   # measurements taken within each interval (↑ for tighter tails)
+N_INTERVALS       = 10
+MEAS_PER_INTERVAL = 120   # measurements taken within each interval (↑ for tighter tails)
 
 # x-binning and normalization window
 NBINS        = 24
 X_MIN, X_MAX = 1e-1, 1e4
 NORM_X_MAX   = 0.30
+
+# ----------------------- g0 from BW II Table 1 -----------------------
+# BW II Table 1 data (M1 = M2)
+ln1p_E_over_M = np.array([
+    0.00, 0.37, 0.74, 1.11, 1.47, 1.84, 2.21, 2.58, 2.95, 3.32,
+    3.68, 4.05, 4.42, 4.79, 5.16, 5.53, 5.89, 6.26, 6.63, 7.00,
+    7.37, 7.74, 8.11, 8.47, 8.84, 9.21
+], dtype=float)
+
+g0_table = np.array([
+    1.00, 1.30, 1.55, 1.79, 2.03, 2.27, 2.53, 2.82, 3.13, 3.48,
+    3.88, 4.32, 4.83, 5.43, 6.12, 6.94, 7.93, 9.11, 10.55, 12.29,
+    14.36, 16.66, 18.80, 19.71, 15.70, 0.00
+], dtype=float)
+
+# Compute X from ln(1 + E/M)
+X_data = np.exp(ln1p_E_over_M) - 1.0
+
+def g0_interp(x):
+    """
+    Interpolated g0(x) from BW II Table 1 using log-log interpolation.
+    """
+    mask = (g0_table > 0) & (X_data > 0)
+    lx, lg = np.log10(X_data[mask]), np.log10(g0_table[mask])
+    m = np.diff(lg) / np.diff(lx)
+    
+    xq = np.asarray(x, float)
+    lt = np.log10(xq)
+    y = np.empty_like(lt)
+    left = lt < lx[0]
+    right = lt > lx[-1]
+    mid = ~(left | right)
+    y[left]  = lg[0]  + m[0]   * (lt[left]  - lx[0])
+    y[right] = lg[-1] + m[-1]  * (lt[right] - lx[-1])
+    idx = np.searchsorted(lx, lt[mid]) - 1
+    idx = np.clip(idx, 0, len(m)-1)
+    y[mid] = lg[idx] + m[idx] * (lt[mid] - lx[idx])
+    return 10**y
 
 # ----------------------- target stationary law -----------------------
 def g_target(x):
@@ -207,10 +257,23 @@ def main():
         "x": x_c, "gbar_mean": g_mean, "gbar_std": g_std, "gbar_sem": g_sem
     }).to_csv("gbar_mc_points.csv", index=False)
 
-    # plot (no external BW curve — fully independent)
+    # plot with g0 line from BW II
     plt.figure(figsize=(6.8, 4.6), dpi=140)
-    plt.errorbar(x_c, g_mean, yerr=g_std, fmt="o", ms=4.0, capsize=2.5, elinewidth=1.0,
-                 label=r"No loss cone: $\bar{g}$ from MC (5 intervals)")
+    
+    # Monte Carlo data (small filled squares)
+    plt.errorbar(x_c, g_mean, yerr=g_std, fmt="s", ms=2.5, capsize=1.5, elinewidth=0.8,
+                 color="black", mfc="black", mec="black", label=r"$\bar{g}$ from MC (5 intervals)")
+    
+    # g0 line from BW II (blue solid line)
+    x_fine = np.logspace(np.log10(X_MIN), np.log10(X_MAX), 1000)
+    g0_vals = g0_interp(x_fine)
+    plt.loglog(x_fine, g0_vals, "b-", lw=2, label=r"$g_0$ from BW II")
+    
+    # BW II table points (blue circles)
+    mask = g0_table > 0
+    plt.scatter(X_data[mask], g0_table[mask], s=10, color="blue", 
+                marker="o", zorder=5, label="BW II Table 1 points")
+    
     plt.xscale("log"); plt.yscale("log")
     plt.xlim(X_MIN, X_MAX)
     plt.ylim(0.7, 30)
@@ -223,6 +286,21 @@ def main():
 
     print("[saved] gbar_mc_points.csv")
     print("[saved] gbar_vs_x_from_mc.png")
+    
+    # Print formatted description
+    print("\n" + "="*80)
+    print("FIGURE DESCRIPTION:")
+    print("="*80)
+    print("The isotropized distribution function, $\\bar{g}$, is plotted as a function of energy, $x$,")
+    print("for the case in which loss-cone capture is completely neglected (\\textit{filled circles}).")
+    print("The function $g_0$, obtained by BW assuming the same boundary conditions, was adopted as")
+    print("the initial field-star distribution in the Monte Carlo iteration scheme (\\textit{solid line}).")
+    print("Error bars on the mean data points for $\\bar{g}$ in this and subsequent figures are computed")
+    print("by comparing corresponding data points from five independent time intervals obtained during")
+    print("the Monte Carlo simulation. They thus include both (local) statistical errors and (strongly")
+    print("correlated) systematic errors. The function $\\bar{g}$ is identical to the BW solution for this")
+    print("case (except for a very slight systematic shift).")
+    print("="*80)
 
 if __name__ == "__main__":
     main()
