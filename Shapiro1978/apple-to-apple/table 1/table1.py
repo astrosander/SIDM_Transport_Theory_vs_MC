@@ -219,6 +219,11 @@ def compute_A5_for(x: float, j: float, Pstar: float, gfun: Callable[[float], flo
         eps1_C = eps2sq_C = j1_C = j2sq_C = zeta2_C = 0.0
 
     rt2pi = math.sqrt(2.0 * math.pi)
+    
+    # Starred normalizations from Shapiro & Marchant (1978) / Cohn & Kulsrud (1978)
+    # NOTE: Paper uses R = j^2 as the angular momentum variable
+    # But coefficients may still be defined per unit time scaled by P(E)
+    
     eps1_star = 3.0 * rt2pi * Pstar * (eps1_A + eps1_B + eps1_C)
     eps2_star_sq = 4.0 * rt2pi * Pstar * (eps2sq_A + eps2sq_B + eps2sq_C)
     j1_star = rt2pi * (x / j) * Pstar * (j1_A + j1_B + j1_C)
@@ -239,6 +244,16 @@ def j_min_from_x(x: float, xD: float) -> float:
     return math.sqrt(max(0.0, 1.0 - e*e))
 
 def compute_nt(x: float, j: float, eps2: float, j2: float, xD: float) -> float:
+    """
+    Compute number of orbital times n_t.
+    
+    WARNING: This is an empirical formula that may not match the paper's treatment.
+    Paper (Shapiro & Marchant 1978) uses Lightman & Shapiro loss-cone boundary
+    with proper regime interpolation (q-parameter, Robin boundary condition).
+    This simplified version may produce large errors, especially for n_t.
+    
+    TODO: Implement proper loss-cone boundary layer treatment from Lightman & Shapiro (1977)
+    """
     b1 = (0.15 * x) / max(eps2, 1e-300)
     b2 = 0.10 / max(j2, 1e-300)
     b3 = 0.40 * max(0.0, (1.0075 - j)) / max(j2, 1e-300)
@@ -248,8 +263,11 @@ def compute_nt(x: float, j: float, eps2: float, j2: float, xD: float) -> float:
     return max(1e-300, b*b)
 
 # Targets
+# NOTE: Paper uses R = j^2, not j directly
+# Table 1 is tabulated in R values
 x_groups = [0.336, 3.31, 32.7, 323.0, 3180.0]
-js = [1.000, 0.401, 0.161, 0.065, 0.026]
+R_values = [1.000, 0.401, 0.161, 0.065, 0.026]
+js = [np.sqrt(R) for R in R_values]  # Convert R to j for calculations
 
 T_eps1_mag = {
     0.336: [1.41e-1, 1.40e-1, 1.33e-1, 1.29e-1, 1.29e-1],
@@ -321,19 +339,19 @@ gfun = make_g_of_xprime(s_best)
 # Evaluate full table
 import pandas as pd
 rows = []
-for x in x_groups:
-    for j in js:
+for i_R, (R, j) in enumerate(zip(R_values, js)):
+    for x in x_groups:
         pp = compute_A5_for(x, j, PSTAR, gfun, nxp=420)
         nt = compute_nt(x, j, pp.eps2, pp.j2, X_D)
         rows.append({
-            "x": x, "j": j,
+            "x": x, "R": R, "j": j,
             "-eps1*_our": -pp.eps1, "eps2*_our": pp.eps2, "j1*_our": pp.j1, "j2*_our": pp.j2, "zeta*2_our": pp.zeta2, "n_t_our": nt,
-            "-eps1*_paper": T_eps1_mag[x][[1.000,0.401,0.161,0.065,0.026].index(j)],
-            "eps2*_paper": T_eps2[x][[1.000,0.401,0.161,0.065,0.026].index(j)],
-            "j1*_paper":   T_j1[x][[1.000,0.401,0.161,0.065,0.026].index(j)],
-            "j2*_paper":   T_j2[x][[1.000,0.401,0.161,0.065,0.026].index(j)],
-            "zeta*2_paper":T_zeta2[x][[1.000,0.401,0.161,0.065,0.026].index(j)],
-            "n_t_paper":   T_nt[x][[1.000,0.401,0.161,0.065,0.026].index(j)],
+            "-eps1*_paper": T_eps1_mag[x][i_R],
+            "eps2*_paper": T_eps2[x][i_R],
+            "j1*_paper":   T_j1[x][i_R],
+            "j2*_paper":   T_j2[x][i_R],
+            "zeta*2_paper":T_zeta2[x][i_R],
+            "n_t_paper":   T_nt[x][i_R],
         })
 
 df = pd.DataFrame(rows)
@@ -353,6 +371,21 @@ for ours, paper in [("-eps1*_our","-eps1*_paper"),
 out_path = "table1_reproduction_with_BW_g_and_step_constraints.csv"
 df.to_csv(out_path, index=False)
 
+print("\n" + "="*70)
+print("REPRODUCTION OF SHAPIRO & MARCHANT (1978) TABLE 1")
+print("="*70)
+print(f"\nBest scale s for y=ln(1+s x') mapping = {s_best:.4f}")
+print(f"Saved CSV to: {out_path}\n")
 
-print("Best scale s for y=ln(1+s x') mapping =", s_best)
-print("Saved CSV to:", out_path)
+print("Summary of relative errors (median over all x,R combinations):")
+for col in df.columns:
+    if col.endswith("_relerr"):
+        median_err = df[col].median()
+        print(f"  {col:20s}: {median_err:+8.3f}")
+
+print("\n" + "="*70)
+print("NOTE: Large errors (especially in n_t) may indicate:")
+print("  1. Missing loss-cone boundary layer treatment (Lightman & Shapiro 1977)")
+print("  2. Incorrect normalization factors (check P*, Coulomb log, sigma)")
+print("  3. Variable definition mismatch (energy sign, 1D vs 3D dispersion)")
+print("="*70)
