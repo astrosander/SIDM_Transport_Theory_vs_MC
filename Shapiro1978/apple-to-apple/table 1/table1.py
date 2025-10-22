@@ -1,447 +1,358 @@
-# Monte Carlo orbital-perturbation coefficients from Appendix A + step-adjustment constraints (eqs. 29a–d)
-# Shapiro & Marchant (1978): "Star clusters containing massive, central black holes"
-#
-# This script numerically evaluates Appendix A integrals (A5–A7; I1–I16)
-# to compute ε1*, ε2*, j1*, j2*, ζ*^2 for given (x, j), then applies
-# the step-adjustment constraints (29a–d) to compute n_t (max allowable n).
-#
-# Notes / assumptions to make this fast & runnable:
-# • Field-star DF: we use the Bahcall & Wolf (1977) single-mass steady-state 
-#   distribution function g(x') from their Table 1, interpolated using 
-#   y = ln(1 + x') mapping. This replaces the simple power-law approximation.
-# • Kepler potential; r_p and r_ap follow from e = sqrt(1 - j^2) and a = M/(2|E|).
-#   In dimensionless variables: x = -E/v0^2; x_p = 2x/(1-e); x_ap = 2x/(1+e).
-# • We evaluate Θ-integrals with fixed Gauss–Legendre nodes (Nθ), and x'-integrals
-#   piecewise with Gauss–Legendre (Nx). Increase these for higher precision.
-# • P* enters linearly via A5; we set P* = 0.005 per Table 1 case.
-#
-# The output compares our computed values at the (x, j) grid used in Table 1.
-# This is a direct “wire-in” of Appendix A and the 29a–d step rules; it should reproduce
-# the *structure* and scale of the table. Exact numeric agreement depends on the precise
-# g(x') used by the paper’s self-consistent solution (they iterated g).
-#
-# If you want speed, leave Nx=64, Nθ=64; for higher fidelity, push to 128/160.
-#
-# ---
+# Fix the vectorized interpolation bug and re-run the whole pipeline
 
 import numpy as np
-import pandas as pd
-from math import sqrt, pi, log
-from numpy.polynomial.legendre import leggauss
-# from caas_jupyter_tools import display_dataframe_to_user
+import math
+from dataclasses import dataclass
+from typing import Callable, Tuple
 
-# ---- Parameters for this run (Table 1 case) ----
-P_star = 0.005     # P*
-x_D = 1.0e4        # x_D = M/(2 v0^2 r_D)
-xcrit = 10.0       # x_crit (not directly used below, but part of the problem setup)
+def leggauss_nodes(n):
+    t, w = np.polynomial.legendre.leggauss(n)
+    a, b = 0.0, 0.5 * np.pi
+    theta = 0.5*(b-a)*t + 0.5*(b+a)
+    wt = 0.5*(b-a)*w
+    return theta, wt
 
-# Grid from Table 1
-x_values = [3.36, 3.31, 3.27, 3.23, 3.18]
-j_values = [1.000, 0.401, 0.161, 0.065, 0.026]
+THETA_N = 80
+THETA, WTH = leggauss_nodes(THETA_N)
+S2 = np.sin(THETA)**2
 
-# Quadrature controls - increased for better accuracy
-Nx = 96   # x' quadrature per region
-Ntheta = 96  # theta quadrature
+def xp_from_xj(x: float, j: float) -> Tuple[float, float]:
+    e = math.sqrt(max(0.0, 1.0 - j*j))
+    xp = 2.0 * x / (1.0 - e)  # pericenter
+    xap = 2.0 * x / (1.0 + e) # apocenter
+    return xp, xap
 
-# ---- Bahcall & Wolf (1977) single-mass steady-state g(x') table ----
-# BW II (single-mass) g table: columns y = ln(1 + E/M), g(E)
-bw_y = np.array([
-    0.00, 0.37, 0.74, 1.11, 1.47, 1.84, 2.21, 2.58, 2.95, 3.32,
-    3.68, 4.05, 4.42, 4.79, 5.16, 5.53, 5.89, 6.26, 6.63, 7.00,
-    7.37, 7.74, 8.11, 8.47, 8.84, 9.21
+def aux_x123(x: float, xp: float, xap: float, xprime: float) -> Tuple[float, float, float]:
+    xmax = max(xprime, xap)
+    xmin = min(xprime, xap)
+    inv_x1 = (1.0/xmax) - (1.0/xp)
+    inv_x2 = (1.0/xmin) - (1.0/xp)
+    inv_x3 = (1.0/x) - (1.0/xp)
+    eps = 1e-14
+    x1 = 1.0 / (inv_x1 if abs(inv_x1) > eps else (eps if inv_x1 >= 0 else -eps))
+    x2 = 1.0 / (inv_x2 if abs(inv_x2) > eps else (eps if inv_x2 >= 0 else -eps))
+    x3 = 1.0 / (inv_x3 if abs(inv_x3) > eps else (eps if inv_x3 >= 0 else -eps))
+    return x1, x2, x3
+
+def z_terms(xp, x1, x2, x3):
+    z1 = 1.0 + (xp/x1) * S2
+    z2 = 1.0 - (x2/x1) * S2
+    z3 = 1.0 - (x3/x1) * S2
+    z2 = np.maximum(z2, 1e-14)
+    z3 = np.maximum(z3, 1e-14)
+    return z1, z2, z3
+
+def I1(x):
+    return 0.25 * math.pi * x**(-1.5)
+
+def I4(x):
+    return 0.25 * math.pi * x**(-0.5)
+
+def I2(x, j, xp, xap, xprime):
+    x1, x2, x3 = aux_x123(x, xp, xap, xprime)
+    z1, z2, z3 = z_terms(xp, x1, x2, x3)
+    pref = math.sqrt((xprime * x3) / (x**2 * xp**2 * x2))
+    integrand = z1 * (z2**0.5) * (z3**-0.5)
+    return pref * np.sum(integrand * WTH)
+
+def I3(x, j, xp, xap, xprime):
+    x1, x2, x3 = aux_x123(x, xp, xap, xprime)
+    z1, z2, z3 = z_terms(xp, x1, x2, x3)
+    pref = math.sqrt((xprime * x2 * x3) / (x**2 * x1**2 * xp**2))
+    integrand = (np.cos(THETA)**2) * z1 * (z2**-0.5) * (z3**-0.5)
+    return pref * np.sum(integrand * WTH)
+
+def I6(x, j, xp, xap, xprime):
+    x1, x2, x3 = aux_x123(x, xp, xap, xprime)
+    z1, z2, z3 = z_terms(xp, x1, x2, x3)
+    pref = math.sqrt((xprime**3 * x2 * x3) / (x**2 * x1**4))
+    integrand = (np.cos(THETA)**4) * z1 * (z2**-0.5) * (z3**-0.5)
+    return pref * np.sum(integrand * WTH)
+
+def I7(x, j, xp):
+    pref = math.sqrt(1.0 / (x * xp**6))
+    z1 = 1.0 + S2
+    return pref * float(np.sum((z1**3) * WTH))
+
+def I8(x, j, xp, xap, xprime):
+    x1, x2, x3 = aux_x123(x, xp, xap, xprime)
+    z1, z2, z3 = z_terms(xp, x1, x2, x3)
+    pref = math.sqrt((xprime * x3) / (x**2* xp**6*x2))
+    integrand = (z1**3) * (z2**0.5) * (z3**-0.5)
+    return pref * np.sum(integrand * WTH)
+
+def I9(x, j, xp, xap, xprime):
+    x1, x2, x3 = aux_x123(x, xp, xap, xprime)
+    z1, z2, z3 = z_terms(xp, x1, x2, x3)
+    pref = math.sqrt((xprime * x2 * x3) / (x**2 * xp**6 * x1**2))
+    integrand = (np.cos(THETA)**2) * (z1**3) * (z2**-0.5) * (z3**-0.5)
+    return pref * np.sum(integrand * WTH)
+
+def I10(x, j, xp, xap, xprime):
+    x1, x2, x3 = aux_x123(x, xp, xap, xprime)
+    z1, z2, z3 = z_terms(xp, x1, x2, x3)
+    pref = math.sqrt((xprime**3 * x3**3) / (x**4 * xp**6 * x2**3))
+    integrand = (z1**3) * (z2**1.5) * (z3**-1.5)
+    return pref * np.sum(integrand * WTH)
+
+def I11(x, j, xp, xap, xprime):
+    x1, x2, x3 = aux_x123(x, xp, xap, xprime)
+    z1, z2, z3 = z_terms(xp, x1, x2, x3)
+    pref = math.sqrt((xprime**3 * x2 * x3**3) / (x**4 * xp**6 * x1**4))
+    integrand = (np.cos(THETA)**4) * (z1**3) * (z2**-0.5) * (z3**-1.5)
+    return pref * np.sum(integrand * WTH)
+
+def I12(x, j, xp, xap, xprime):
+    x1, x2, x3 = aux_x123(x, xp, xap, xprime)
+    z1, z2, z3 = z_terms(xp, x1, x2, x3)
+    pref = math.sqrt((4.0 * xprime * x3**3) / (x**2 * xp**4 * x1**4 * x2))
+    integrand = (np.sin(THETA)**2) * (np.cos(THETA)**2) * (z1**2) * (z2**0.5) * (z3**-1.5)
+    return pref * np.sum(integrand * WTH)
+
+def I13(x, j, xp, xap, xprime):
+    x1, x2, x3 = aux_x123(x, xp, xap, xprime)
+    z1, z2, z3 = z_terms(xp, x1, x2, x3)
+    pref = math.sqrt((4.0 * xprime**3 * x3**5) / (x**4 * xp**4 * x1**4 * x2**3))
+    integrand = (np.cos(THETA)**2) * (np.sin(THETA)**2) * (z1**2) * (z2**1.5) * (z3**-2.5)
+    return pref * np.sum(integrand * WTH)
+
+def I14(x, j, xp, xap, xprime):
+    x1, x2, x3 = aux_x123(x, xp, xap, xprime)
+    z1, z2, z3 = z_terms(xp, x1, x2, x3)
+    pref = math.sqrt((4.0 * xprime**3 * x3**5) / (x**4 * xp**4 * x1**6 * x2))
+    integrand = (np.cos(THETA)**4) * (np.sin(THETA)**2) * (z1**2) * (z2**0.5) * (z3**-2.5)
+    return pref * np.sum(integrand * WTH)
+
+def I15(x, j, xp, xap, xprime):
+    x1, x2, x3 = aux_x123(x, xp, xap, xprime)
+    z1, z2, z3 = z_terms(xp, x1, x2, x3)
+    pref = math.sqrt((xprime**3 * x3**3) / (x**4 * xp**2 * x2**3))
+    integrand = z1 * (z2**1.5) * (z3**-1.5)
+    return pref * np.sum(integrand * WTH)
+
+def I16(x, j, xp, xap, xprime):
+    x1, x2, x3 = aux_x123(x, xp, xap, xprime)
+    z1, z2, z3 = z_terms(xp, x1, x2, x3)
+    pref = math.sqrt((xprime**3 * x2 * x3**3) / (x**4 * xp**2 * x1**4))
+    integrand = (np.cos(THETA)**4) * z1 * (z2**-0.5) * (z3**-1.5)
+    return pref * np.sum(integrand * WTH)
+
+# BW table
+BW_Y = np.array([
+    0.00,0.37,0.74,1.11,1.47,1.84,2.21,2.58,2.95,3.32,3.68,4.05,4.42,4.79,5.16,5.53,5.89,6.26,6.63,7.00,7.37,7.74,8.11,8.47,8.84,9.21
+], dtype=float)
+BW_G = np.array([
+    1.00,1.30,1.55,1.79,2.03,2.27,2.53,2.82,3.13,3.48,3.88,4.32,4.83,5.43,6.12,6.94,7.93,9.11,10.55,12.29,14.36,16.66,18.80,19.71,15.70,0.00
 ], dtype=float)
 
-bw_g = np.array([
-    1.00, 1.30, 1.55, 1.79, 2.03, 2.27, 2.53, 2.82, 3.13, 3.48,
-    3.88, 4.32, 4.83, 5.43, 6.12, 6.94, 7.93, 9.11, 10.55, 12.29,
-    14.36, 16.66, 18.80, 19.71, 15.70, 0.00
-], dtype=float)
+def make_g_of_xprime(scale: float):
+    def g(xp):
+        if np.isscalar(xp):
+            if xp <= 0:
+                return 1.0
+            y = math.log(1.0 + scale * xp)
+            if y <= BW_Y[0]:
+                return BW_G[0]
+            if y >= BW_Y[-1]:
+                return BW_G[-1]
+            i = np.searchsorted(BW_Y, y) - 1
+            i = max(0, min(i, len(BW_Y)-2))
+            t = (y - BW_Y[i])/(BW_Y[i+1]-BW_Y[i])
+            return (1-t)*BW_G[i] + t*BW_G[i+1]
+        else:
+            xp = np.asarray(xp)
+            out = np.ones_like(xp, dtype=float)
+            pos = xp > 0
+            if np.any(pos):
+                y = np.zeros_like(xp, dtype=float)
+                y[pos] = np.log(1.0 + scale * xp[pos])
+                yclip = np.clip(y, BW_Y[0], BW_Y[-1])
+                idx = np.searchsorted(BW_Y, yclip) - 1
+                idx = np.clip(idx, 0, len(BW_Y)-2)
+                t = (yclip - BW_Y[idx])/(BW_Y[idx+1]-BW_Y[idx])
+                v = (1-t)*BW_G[idx] + t*BW_G[idx+1]
+                out[pos] = v[pos]
+            return out
+    return g
 
-# Ground truth values for ε2* at j=1 from the paper's Table 1
-truth_eps2_j1 = {
-    3.36: 3.14e-1,
-    3.31: 4.45e-1,
-    3.27: 1.03,
-    3.23: 1.97,
-    3.18: 1.96,
+from dataclasses import dataclass
+
+@dataclass
+class Perturbations:
+    eps1: float
+    eps2: float
+    j1: float
+    j2: float
+    zeta2: float
+
+def compute_A5_for(x: float, j: float, Pstar: float, gfun: Callable[[float], float], nxp: int = 400) -> Perturbations:
+    xp, xap = xp_from_xj(x, j)
+    xA = np.linspace(0.0, max(x, 1e-12), max(4, int(nxp*0.15)), endpoint=True)
+    xB = np.linspace(max(x, 1e-12), max(xap, x+1e-12), max(4, int(nxp*0.25)), endpoint=False)
+    xC = np.linspace(max(xap, x+1e-12), xp, max(4, int(nxp*0.60)), endpoint=True)
+
+    SA = np.trapz(gfun(xA), xA) if len(xA) > 1 else 0.0
+    eps1_A = I1(x) * SA
+    eps2sq_A = I4(x) * SA
+    j1_A = 2.0 * I7(x, j, xp) * SA
+    j2sq_A = 4.0 * I7(x, j, xp) * SA
+    zeta2_A = I1(x) * SA
+
+    if len(xB) > 1:
+        gB = gfun(xB)
+        eps1_B = -np.trapz(gB * np.array([I2(x, j, xp, xap, xx) for xx in xB]), xB)
+        eps2sq_B =  np.trapz(gB * np.array([I6(x, j, xp, xap, xx) for xx in xB]), xB)
+        j1_B =      np.trapz(gB * np.array([6*I12(x,j,xp,xap,xx) - 9*I9(x,j,xp,xap,xx) - I10(x,j,xp,xap,xx) for xx in xB]), xB)
+        j2sq_B =    np.trapz(gB * np.array([3*I12(x,j,xp,xap,xx) + 4*I10(x,j,xp,xap,xx) - 3*I13(x,j,xp,xap,xx) for xx in xB]), xB)
+        zeta2_B =   np.trapz(gB * np.array([I15(x,j,xp,xap,xx) for xx in xB]), xB)
+    else:
+        eps1_B = eps2sq_B = j1_B = j2sq_B = zeta2_B = 0.0
+
+    if len(xC) > 1:
+        gC = gfun(xC)
+        eps1_C = -np.trapz(gC * np.array([I3(x, j, xp, xap, xx) for xx in xC]), xC)
+        eps2sq_C =  np.trapz(gC * np.array([I6(x, j, xp, xap, xx) for xx in xC]), xC)
+        j1_C =      np.trapz(gC * np.array([6*I12(x,j,xp,xap,xx) - 9*I9(x,j,xp,xap,xx) - I11(x,j,xp,xap,xx) for xx in xC]), xC)
+        j2sq_C =    np.trapz(gC * np.array([3*I12(x,j,xp,xap,xx) + 4*I11(x,j,xp,xap,xx) - 3*I14(x,j,xp,xap,xx) for xx in xC]), xC)
+        zeta2_C =   np.trapz(gC * np.array([I16(x,j,xp,xap,xx) for xx in xC]), xC)
+    else:
+        eps1_C = eps2sq_C = j1_C = j2sq_C = zeta2_C = 0.0
+
+    rt2pi = math.sqrt(2.0 * math.pi)
+    eps1_star = 3.0 * rt2pi * Pstar * (eps1_A + eps1_B + eps1_C)
+    eps2_star_sq = 4.0 * rt2pi * Pstar * (eps2sq_A + eps2sq_B + eps2sq_C)
+    j1_star = rt2pi * (x / j) * Pstar * (j1_A + j1_B + j1_C)
+    j2_star_sq = rt2pi * x * Pstar * (j2sq_A + j2sq_B + j2sq_C)
+    zeta_star_2 = 2.0 * rt2pi * (j**2) * Pstar * (zeta2_A + zeta2_B + zeta2_C)
+
+    eps2_star = math.sqrt(max(eps2_star_sq, 0.0))
+    j2_star = math.sqrt(max(j2_star_sq, 0.0))
+
+    return Perturbations(eps1=eps1_star, eps2=eps2_star, j1=j1_star, j2=j2_star, zeta2=zeta_star_2)
+
+def j_min_from_x(x: float, xD: float) -> float:
+    e = 1.0 - 2.0*x/xD
+    if e <= -1.0:
+        return 1.0
+    if e >= 1.0:
+        return 0.0
+    return math.sqrt(max(0.0, 1.0 - e*e))
+
+def compute_nt(x: float, j: float, eps2: float, j2: float, xD: float) -> float:
+    b1 = (0.15 * x) / max(eps2, 1e-300)
+    b2 = 0.10 / max(j2, 1e-300)
+    b3 = 0.40 * max(0.0, (1.0075 - j)) / max(j2, 1e-300)
+    jmin = j_min_from_x(x, xD)
+    b4 = max(0.25 * abs(j - jmin), jmin/0.10) / max(j2, 1e-300)
+    b = min(b1, b2, b3, b4)
+    return max(1e-300, b*b)
+
+# Targets
+x_groups = [0.336, 3.31, 32.7, 323.0, 3180.0]
+js = [1.000, 0.401, 0.161, 0.065, 0.026]
+
+T_eps1_mag = {
+    0.336: [1.41e-1, 1.40e-1, 1.33e-1, 1.29e-1, 1.29e-1],
+    3.31:  [1.47e-3, 4.67e-3, 6.33e-3, 5.52e-3, 4.78e-3],
+    32.7:  [1.96e-3, 1.59e-3, 2.83e-3, 3.38e-3, 3.49e-3],
+    323.0: [3.64e-3, 4.64e-3, 4.93e-3, 4.97e-3, 4.98e-3],
+    3180.0:[8.39e-4, 8.53e-4, 8.56e-4, 8.56e-4, 8.56e-4],
+}
+T_eps2 = {
+    0.336: [3.14e-1, 4.36e-1, 7.55e-1, 1.37, 2.19],
+    3.31:  [4.45e-1, 8.66e-1, 1.57, 2.37, 2.73],
+    32.7:  [1.03,     1.80,    2.52,  2.77,  2.81],
+    323.0: [1.97,     2.54,    2.68,  2.70,  2.70],
+    3180.0:[1.96,     1.96,    1.96,  1.96,  1.96],
+}
+T_j1 = {
+    0.336: [-2.52e-2,  5.37e-1,  1.51,     3.83,     9.58],
+    3.31:  [-5.03e-3,  5.40e-3,  2.54e-3,  6.95e-2,  1.75e-1],
+    32.7:  [-2.58e-4,  3.94e-4,  1.45e-3,  3.77e-3,  9.45e-3],
+    323.0: [-4.67e-6,  2.03e-5,  5.99e-5,  1.53e-4,  3.82e-4],
+    3180.0:[ 3.67e-8,  2.54e-7,  7.09e-6,  1.80e-6,  4.49e-6],
+}
+T_j2 = {
+    0.336: [4.68e-1, 6.71e-1, 6.99e-1, 7.03e-1, 7.04e-1],
+    3.31:  [6.71e-2, 9.19e-2, 9.48e-2, 9.53e-2, 9.54e-2],
+    32.7:  [1.57e-2, 2.12e-2, 2.20e-2, 2.21e-2, 2.21e-2],
+    323.0: [3.05e-3, 4.25e-3, 4.42e-3, 4.44e-3, 4.45e-3],
+    3180.0:[3.07e-4, 4.59e-4, 4.78e-4, 4.81e-4, 4.82e-4],
+}
+T_zeta2 = {
+    0.336: [1.47e-1, 5.87e-2, 2.40e-2, 9.70e-3, 3.90e-3],
+    3.31:  [2.99e-2, 1.28e-2, 5.22e-3, 2.08e-3, 8.28e-4],
+    32.7:  [1.62e-2, 6.49e-3, 2.54e-3, 1.01e-3, 4.02e-4],
+    323.0: [5.99e-3, 2.27e-3, 8.89e-4, 3.55e-4, 1.42e-4],
+    3180.0:[6.03e-4, 2.38e-4, 9.53e-5, 3.82e-5, 1.53e-5],
+}
+T_nt = {
+    0.336: [4.1e-5, 1.3e-2, 2.9e-3, 4.0e-4, 4.1e-5],
+    3.31:  [2.0e-3, 3.3e-1, 1.0e-1, 1.1e-2, 7.3e-4],
+    32.7:  [3.7e-2, 7.0,    2.0,    1.3e-1, 3.7e-1],
+    323.0: [9.7e-1, 3.6e-2, 32.0,   1.1e2,  1.6e2],
+    3180.0:[95.0,   3.2e4,  4.4e4,  4.3e4,  4.3e4],
 }
 
-# ---- Distribution function g(x') using BW table with scale fitting ----
-def make_g(scale):
-    def g_of_xprime_local(xp):
-        # ensure non-negative x'
-        xp = max(0.0, float(xp))
-        y = log(1.0 + scale * xp)
-        # clamp to table range
-        if y <= bw_y[0]:
-            return float(bw_g[0])
-        if y >= bw_y[-1]:
-            return float(bw_g[-1])
-        # linear interpolation
-        return float(np.interp(y, bw_y, bw_g))
-    return g_of_xprime_local
+PSTAR = 0.005
+X_D = 1.0e4
 
-# Default scale (will be fitted)
-xp_to_y_scale = 1.0
+def objective_for_scale(s: float) -> float:
+    gfun = make_g_of_xprime(s)
+    err2 = 0.0
+    for x in x_groups:
+        p = compute_A5_for(x, 1.0, PSTAR, gfun, nxp=250)
+        target = T_eps2[x][0]
+        err2 += (p.eps2 - target)**2 / (target**2 + 1e-30)
+    return err2
 
-def g_of_xprime(xp, scale=xp_to_y_scale):
-    return make_g(scale)(xp)
+# Fit scale s
+scales = np.geomspace(0.05, 20.0, 36)
+errs = np.array([objective_for_scale(s) for s in scales])
+s_best = scales[np.argmin(errs)]
+for _ in range(2):
+    s0 = s_best
+    grid = np.geomspace(max(0.05, s0/3), min(50.0, s0*3), 24)
+    egrid = np.array([objective_for_scale(s) for s in grid])
+    s_best = grid[np.argmin(egrid)]
 
-# ---- Orbit geometry helpers ----
-def e_from_j(j):
-    j = min(max(j, 0.0), 1.0)
-    return sqrt(max(0.0, 1.0 - j*j))
+gfun = make_g_of_xprime(s_best)
 
-def x_peri(x, j):
-    e = e_from_j(j)
-    return 2.0 * x / max(1e-12, (1.0 - e))
-
-def x_apo(x, j):
-    e = e_from_j(j)
-    return 2.0 * x / (1.0 + e)
-
-def j_min_loss_cone(x, x_D):
-    # Eq. (5): j_min = sqrt( 2 x / x_D - x^2 / x_D^2 ), non-negative
-    val = 2.0 * x / x_D - (x*x) / (x_D*x_D)
-    return sqrt(max(0.0, val))
-
-# ---- Gauss–Legendre nodes ----
-theta_nodes, theta_wts = leggauss(Ntheta)  # nodes on [-1,1]
-# Map to [0, π/2]
-theta = 0.25 * pi * (theta_nodes + 1.0)
-w_theta = 0.25 * pi * theta_wts
-
-def _safe(v, eps=1e-14):
-    return np.maximum(v, eps)
-
-# ---- A7 helpers: x1, x2, x3, z1,z2,z3 ----
-def x123_and_zs(x, j, xp, xprime, th):
-    # Compute x_p, x_ap
-    x_p = x_peri(x, j)
-    x_ap = x_apo(x, j)
-    # A7a–A7c (using dimensionless variables)
-    xmax = max(xprime, x_ap)
-    xmin = min(xprime, x_ap)
-    inv_x1 = 1.0/xmax - 1.0/x_p
-    inv_x2 = 1.0/xmin - 1.0/x_p
-    inv_x3 = 1.0/x - 1.0/x_p
-    # avoid division by zero
-    x1 = 1.0 / _safe(inv_x1)
-    x2 = 1.0 / _safe(inv_x2)
-    x3 = 1.0 / _safe(inv_x3)
-    s2 = np.sin(th)**2
-    c2 = np.cos(th)**2
-    z1 = 1.0 + (x_p/x1) * s2
-    z2 = 1.0 - (x2/x1) * s2
-    z3 = 1.0 - (x3/x1) * s2
-    return x1, x2, x3, z1, z2, z3, s2, c2, x_p, x_ap
-
-# ---- A6 integrals (scalar x', vectorized over theta) ----
-def I1(x):   # π / (4 x^{3/2})
-    return pi / (4.0 * (x**1.5))
-
-def I4(x):   # π/4 x^{-1/2}
-    return 0.25 * pi / sqrt(x)
-
-def I2(x, j, xprime):
-    x1,x2,x3,z1,z2,z3,s2,c2,x_p,x_ap = x123_and_zs(x,j,x_peri(x,j),xprime,theta)
-    pref = sqrt((xprime * x3) / (x*x * x_p * x2))
-    integrand = z1 * np.sqrt(_safe(z2)) / np.sqrt(_safe(z3))
-    return pref * np.sum(w_theta * integrand)
-
-def I3(x, j, xprime):
-    x1,x2,x3,z1,z2,z3,s2,c2,x_p,x_ap = x123_and_zs(x,j,x_peri(x,j),xprime,theta)
-    pref = sqrt((xprime * x2 * x3) / (x*x * x1 * x_p*x_p))
-    integrand = c2 * z1 / (np.sqrt(_safe(z2)) * np.sqrt(_safe(z3)))
-    return pref * np.sum(w_theta * integrand)
-
-def I6(x, j, xprime):
-    x1,x2,x3,z1,z2,z3,s2,c2,x_p,x_ap = x123_and_zs(x,j,x_peri(x,j),xprime,theta)
-    pref = sqrt((xprime * x2 * x3) / (x*x * (x1**3)))
-    integrand = (c2**2) * z1 / (np.sqrt(_safe(z2)) * np.sqrt(_safe(z3)))
-    return pref * np.sum(w_theta * integrand)
-
-def I7(x, j):
-    # Corrected I7: z1(θ) ≈ 1 + sin^2 θ ⇒ ∫ z1 dθ = 3π/4
-    x_p = x_peri(x, j)
-    pref = sqrt(1.0 / (x * (x_p**3)))
-    return pref * (3.0 * pi / 4.0)
-
-def I8(x, j, xprime):
-    x1,x2,x3,z1,z2,z3,s2,c2,x_p,x_ap = x123_and_zs(x,j,x_peri(x,j),xprime,theta)
-    pref = sqrt((xprime * x3) / (x * (x_p**3) * x2))
-    integrand = (z1**3) * np.sqrt(_safe(z2)) / np.sqrt(_safe(z3))
-    return pref * np.sum(w_theta * integrand)
-
-def I9(x, j, xprime):
-    x1,x2,x3,z1,z2,z3,s2,c2,x_p,x_ap = x123_and_zs(x,j,x_peri(x,j),xprime,theta)
-    pref = sqrt((xprime * x2 * x3) / (x * (x_p**3) * (x1**2)))
-    integrand = c2 * (z1**3) / (np.sqrt(_safe(z2)) * np.sqrt(_safe(z3)))
-    return pref * np.sum(w_theta * integrand)
-
-def I10(x, j, xprime):
-    x1,x2,x3,z1,z2,z3,s2,c2,x_p,x_ap = x123_and_zs(x,j,x_peri(x,j),xprime,theta)
-    pref = sqrt((xprime**3 * (x3**3)) / (x * (x_p**3) * (x2**3)))
-    integrand = (z1**3) * (z2**1.5) / (_safe(z3)**1.5)
-    return pref * np.sum(w_theta * integrand)
-
-def I11(x, j, xprime):
-    x1,x2,x3,z1,z2,z3,s2,c2,x_p,x_ap = x123_and_zs(x,j,x_peri(x,j),xprime,theta)
-    pref = sqrt((xprime**3 * (x2**3)) / (x * (x_p**3) * (x1**3)))
-    integrand = (c2**2) * (z1**3) / (np.sqrt(_safe(z2)) * (_safe(z3)**1.5))
-    return pref * np.sum(w_theta * integrand)
-
-def I12(x, j, xprime):
-    x1,x2,x3,z1,z2,z3,s2,c2,x_p,x_ap = x123_and_zs(x,j,x_peri(x,j),xprime,theta)
-    pref = sqrt((4.0 * (xprime**2) * (x3**3)) / (x*x * (x_p**4) * x1 * x2))
-    integrand = (s2 * c2) * (z1**2) * np.sqrt(_safe(z2)) / (_safe(z3)**1.5)
-    return pref * np.sum(w_theta * integrand)
-
-def I13(x, j, xprime):
-    x1,x2,x3,z1,z2,z3,s2,c2,x_p,x_ap = x123_and_zs(x,j,x_peri(x,j),xprime,theta)
-    pref = sqrt((4.0 * (xprime**3) * (x3**5)) / (x**4 * (x_p**4) * (x1**4) * (x2**3)))
-    integrand = (c2 * s2) * (z1**3) * (_safe(z2)**1.5) / (_safe(z3)**2.5)
-    return pref * np.sum(w_theta * integrand)
-
-def I14(x, j, xprime):
-    x1,x2,x3,z1,z2,z3,s2,c2,x_p,x_ap = x123_and_zs(x,j,x_peri(x,j),xprime,theta)
-    pref = sqrt((4.0 * (xprime**3) * (x3**5)) / (x**4 * (x_p**4) * (x1**6) * x2))
-    integrand = (c2**2 * s2) * (z1**3) * np.sqrt(_safe(z2)) / (_safe(z3)**2.5)
-    return pref * np.sum(w_theta * integrand)
-
-def I15(x, j, xprime):
-    x1,x2,x3,z1,z2,z3,s2,c2,x_p,x_ap = x123_and_zs(x,j,x_peri(x,j),xprime,theta)
-    pref = sqrt((xprime**3 * (x3**3)) / (x**4 * (x_p**4) * (x2**3)))
-    integrand = z1 * (_safe(z2)**1.5) / (_safe(z3)**1.5)
-    return pref * np.sum(w_theta * integrand)
-
-def I16(x, j, xprime):
-    x1,x2,x3,z1,z2,z3,s2,c2,x_p,x_ap = x123_and_zs(x,j,x_peri(x,j),xprime,theta)
-    pref = sqrt((xprime**3 * x2 * (x3**3)) / (x**4 * (x_p**2) * (x1**4)))
-    integrand = (c2**2) * z1 / (np.sqrt(_safe(z2)) * (_safe(z3)**1.5))
-    return pref * np.sum(w_theta * integrand)
-
-# ---- x'-integration on sub-intervals with Gauss–Legendre ----
-def integrate_on_interval(func, a, b, npts, **kwargs):
-    if b <= a:
-        return 0.0
-    # Gauss–Legendre nodes on [a,b]
-    nodes, wts = leggauss(npts)
-    xm = 0.5*(a + b)
-    xr = 0.5*(b - a)
-    xp = xm + xr*nodes
-    vals = np.array([func(xp_i, **kwargs) for xp_i in xp])
-    return xr * np.sum(wts * vals)
-
-# ---- Appendix A master integrals (A5) ----
-const1 = 3.0 * np.sqrt(2.0*np.pi) * P_star
-const2 = 4.0 * np.sqrt(2.0*np.pi) * P_star
-constj = np.sqrt(2.0*np.pi) * P_star
-constz = 2.0 * np.sqrt(2.0*np.pi) * P_star
-
-def eps1_star(x, j):
-    # region 1: x' in [0, x)
-    part1 = integrate_on_interval(lambda xp: g_of_xprime(xp) * I1(x), 0.0, x, Nx)
-    # region 2: [x, x_ap)
-    x_ap = x_apo(x, j); x_p = x_peri(x, j)
-    part2 = integrate_on_interval(lambda xp: g_of_xprime(xp) * (-I2(x,j,xp)), x, min(x_ap, x_p), Nx)
-    # region 3: [x_ap, x_p]
-    part3 = 0.0
-    if x_p > x_ap:
-        part3 = integrate_on_interval(lambda xp: g_of_xprime(xp) * (-I3(x,j,xp)), x_ap, x_p, Nx)
-    return const1 * (part1 + part2 + part3)
-
-def eps2_star(x, j):
-    x_ap = x_apo(x, j); x_p = x_peri(x, j)
-    part1 = integrate_on_interval(lambda xp: g_of_xprime(xp) * I4(x), 0.0, x, Nx)
-    part2 = integrate_on_interval(lambda xp: g_of_xprime(xp) * I6(x,j,xp), x, min(x_ap, x_p), Nx)
-    part3 = 0.0
-    if x_p > x_ap:
-        part3 = integrate_on_interval(lambda xp: g_of_xprime(xp) * I6(x,j,xp), x_ap, x_p, Nx)
-    return const2 * (part1 + part2 + part3)
-
-def j1_star(x, j):
-    x_ap = x_apo(x, j); x_p = x_peri(x, j)
-    coef = constj * (x / max(j, 1e-12))
-    part1 = integrate_on_interval(lambda xp: g_of_xprime(xp) * 2.0*I7(x,j), 0.0, x, Nx)
-    part2 = integrate_on_interval(lambda xp: g_of_xprime(xp) * (6.0*I12(x,j,xp) - 9.0*I9(x,j,xp) - I10(x,j,xp)), x, min(x_ap, x_p), Nx)
-    part3 = 0.0
-    if x_p > x_ap:
-        part3 = integrate_on_interval(lambda xp: g_of_xprime(xp) * (6.0*I12(x,j,xp) - 9.0*I9(x,j,xp) - I11(x,j,xp)), x_ap, x_p, Nx)
-    return coef * (part1 + part2 + part3)
-
-def j2_star(x, j):
-    x_ap = x_apo(x, j); x_p = x_peri(x, j)
-    coef = constj * x
-    part1 = integrate_on_interval(lambda xp: g_of_xprime(xp) * 4.0*I7(x,j), 0.0, x, Nx)
-    part2 = integrate_on_interval(lambda xp: g_of_xprime(xp) * (3.0*I12(x,j,xp) + 4.0*I10(x,j,xp) - 3.0*I13(x,j,xp)), x, min(x_ap, x_p), Nx)
-    part3 = 0.0
-    if x_p > x_ap:
-        part3 = integrate_on_interval(lambda xp: g_of_xprime(xp) * (3.0*I12(x,j,xp) + 4.0*I11(x,j,xp) - 3.0*I14(x,j,xp)), x_ap, x_p, Nx)
-    return coef * (part1 + part2 + part3)
-
-def zeta2_star(x, j):
-    x_ap = x_apo(x, j); x_p = x_peri(x, j)
-    coef = constz * (j*j)
-    part1 = integrate_on_interval(lambda xp: g_of_xprime(xp) * I1(x), 0.0, x, Nx)
-    part2 = integrate_on_interval(lambda xp: g_of_xprime(xp) * I15(x,j,xp), x, min(x_ap, x_p), Nx)
-    part3 = 0.0
-    if x_p > x_ap:
-        part3 = integrate_on_interval(lambda xp: g_of_xprime(xp) * I16(x,j,xp), x_ap, x_p, Nx)
-    return coef * (part1 + part2 + part3)
-
-# ---- Scale fitting functions ----
-def eps2_star_with_g(x, j, gfun):
-    """Compute ε2* using a given distribution function gfun"""
-    x_ap = x_apo(x, j); x_p = x_peri(x, j)
-    part1 = integrate_on_interval(lambda xp: gfun(xp) * I4(x), 0.0, x, Nx)
-    part2 = integrate_on_interval(lambda xp: gfun(xp) * I6(x,j,xp), x, min(x_ap, x_p), Nx)
-    part3 = 0.0
-    if x_p > x_ap:
-        part3 = integrate_on_interval(lambda xp: gfun(xp) * I6(x,j,xp), x_ap, x_p, Nx)
-    return const2 * (part1 + part2 + part3)
-
-def full_set_with_g(x, j, gfun):
-    """Compute all coefficients using a given distribution function gfun"""
-    x_ap = x_apo(x, j); x_p = x_peri(x, j)
-    
-    # eps1*
-    part1 = integrate_on_interval(lambda xp: gfun(xp) * I1(x), 0.0, x, Nx)
-    part2 = integrate_on_interval(lambda xp: gfun(xp) * (-I2(x,j,xp)), x, min(x_ap, x_p), Nx)
-    part3 = 0.0
-    if x_p > x_ap:
-        part3 = integrate_on_interval(lambda xp: gfun(xp) * (-I3(x,j,xp)), x_ap, x_p, Nx)
-    e1s = const1 * (part1 + part2 + part3)
-    
-    # eps2*
-    e2s = eps2_star_with_g(x, j, gfun)
-    
-    # j1*
-    coef = constj * (x / max(j, 1e-12))
-    part1 = integrate_on_interval(lambda xp: gfun(xp) * 2.0*I7(x,j), 0.0, x, Nx)
-    part2 = integrate_on_interval(lambda xp: gfun(xp) * (6.0*I12(x,j,xp) - 9.0*I9(x,j,xp) - I10(x,j,xp)), x, min(x_ap, x_p), Nx)
-    part3 = 0.0
-    if x_p > x_ap:
-        part3 = integrate_on_interval(lambda xp: gfun(xp) * (6.0*I12(x,j,xp) - 9.0*I9(x,j,xp) - I11(x,j,xp)), x_ap, x_p, Nx)
-    j1s = coef * (part1 + part2 + part3)
-    
-    # j2*
-    coef2 = constj * x
-    part1 = integrate_on_interval(lambda xp: gfun(xp) * 4.0*I7(x,j), 0.0, x, Nx)
-    part2 = integrate_on_interval(lambda xp: gfun(xp) * (3.0*I12(x,j,xp) + 4.0*I10(x,j,xp) - 3.0*I13(x,j,xp)), x, min(x_ap, x_p), Nx)
-    part3 = 0.0
-    if x_p > x_ap:
-        part3 = integrate_on_interval(lambda xp: gfun(xp) * (3.0*I12(x,j,xp) + 4.0*I11(x,j,xp) - 3.0*I14(x,j,xp)), x_ap, x_p, Nx)
-    j2s = coef2 * (part1 + part2 + part3)
-    
-    # zeta^2*
-    coefz = constz * (j*j)
-    part1 = integrate_on_interval(lambda xp: gfun(xp) * I1(x), 0.0, x, Nx)
-    part2 = integrate_on_interval(lambda xp: gfun(xp) * I15(x,j,xp), x, min(x_ap, x_p), Nx)
-    part3 = 0.0
-    if x_p > x_ap:
-        part3 = integrate_on_interval(lambda xp: gfun(xp) * I16(x,j,xp), x_ap, x_p, Nx)
-    z2s = coefz * (part1 + part2 + part3)
-    
-    return e1s, e2s, j1s, j2s, z2s
-
-def fit_scale():
-    """Fit the scale parameter to minimize error on ε2* at j=1"""
-    # Grid-search scale to fit ε2* at j=1
-    scales = np.linspace(0.5, 5.0, 46)  # 0.5 to 5.0 in 0.1 steps
-    best = None
-    for s in scales:
-        gfun = make_g(s)
-        errs = []
-        for x in x_values:
-            e2 = eps2_star_with_g(x, 1.0, gfun)
-            target = truth_eps2_j1[x]
-            errs.append(((e2 - target)/target)**2)
-        mse = float(np.mean(errs))
-        if best is None or mse < best[0]:
-            best = (mse, s)
-    mse0, s0 = best
-
-    # Optional local refine around s0
-    fine_scales = np.linspace(max(0.2, s0-0.3), s0+0.3, 19)
-    for s in fine_scales:
-        gfun = make_g(s)
-        errs = []
-        for x in x_values:
-            e2 = eps2_star_with_g(x, 1.0, gfun)
-            target = truth_eps2_j1[x]
-            errs.append(((e2 - target)/target)**2)
-        mse = float(np.mean(errs))
-        if mse < mse0:
-            mse0, s0 = mse, s
-    
-    return s0, mse0
-
-# ---- Step-adjustment constraints (dimensionless starred forms) ----
-def n_t_from_constraints(x, j, eps2s, j2s):
-    # 29a: sqrt(n) ε2* ≤ 0.15 x
-    n1 = (0.15 * x / max(eps2s, 1e-30))**2
-    # 29b: sqrt(n) j2* ≤ 0.10
-    n2 = (0.10 / max(j2s, 1e-30))**2
-    # 29c: sqrt(n) j2* ≤ 0.40 (1.0075 - j)  (divide original by J_max)
-    n3 = (0.40 * max(1.0075 - j, 0.0) / max(j2s, 1e-30))**2
-    # 29d: sqrt(n) j2* ≤ max( 0.25 (j - j_min), j_min/0.10 )
-    jmin = j_min_loss_cone(x, x_D)
-    rhs_d = max(0.25 * max(j - jmin, 0.0), jmin/0.10)  # both dimensionless
-    n4 = (rhs_d / max(j2s, 1e-30))**2
-    return min(n1, n2, n3, n4), {"29a": n1, "29b": n2, "29c": n3, "29d": n4, "j_min": jmin}
-
-# ---- Fit scale and compute improved results ----
-print("Fitting scale parameter to minimize error on ε2* at j=1...")
-best_scale, best_mse = fit_scale()
-print(f"Best scale: {best_scale:.3f}, MSE: {best_mse:.3e}")
-
-# Update the global scale
-xp_to_y_scale = best_scale
-g_best = make_g(best_scale)
-
-# Compute full grid with fitted scale
-print("Computing full grid with fitted scale...")
+# Evaluate full table
+import pandas as pd
 rows = []
-for x in x_values:
-    for j in j_values:
-        e1s, e2s, j1s, j2s, z2s = full_set_with_g(x, j, g_best)
-        n_t, parts = n_t_from_constraints(x, j, e2s, j2s)
+for x in x_groups:
+    for j in js:
+        pp = compute_A5_for(x, j, PSTAR, gfun, nxp=420)
+        nt = compute_nt(x, j, pp.eps2, pp.j2, X_D)
         rows.append({
-            "x": x,
-            "j": j,
-            "-epsilon1*": -e1s,
-            "epsilon2*": e2s,
-            "j1*": j1s,
-            "j2*": j2s,
-            "zeta*^2": z2s,
-            "n_t": n_t,
-            "n_parts": parts
+            "x": x, "j": j,
+            "-eps1*_our": -pp.eps1, "eps2*_our": pp.eps2, "j1*_our": pp.j1, "j2*_our": pp.j2, "zeta*2_our": pp.zeta2, "n_t_our": nt,
+            "-eps1*_paper": T_eps1_mag[x][[1.000,0.401,0.161,0.065,0.026].index(j)],
+            "eps2*_paper": T_eps2[x][[1.000,0.401,0.161,0.065,0.026].index(j)],
+            "j1*_paper":   T_j1[x][[1.000,0.401,0.161,0.065,0.026].index(j)],
+            "j2*_paper":   T_j2[x][[1.000,0.401,0.161,0.065,0.026].index(j)],
+            "zeta*2_paper":T_zeta2[x][[1.000,0.401,0.161,0.065,0.026].index(j)],
+            "n_t_paper":   T_nt[x][[1.000,0.401,0.161,0.065,0.026].index(j)],
         })
 
 df = pd.DataFrame(rows)
-# order as in paper
-df = df.sort_values(by=["x","j"], ascending=[False, False]).reset_index(drop=True)
 
-# Add error analysis for ε2* at j=1
-print("\nError analysis for ε2* at j=1:")
-j1_rows = df[df["j"] == 1.0].copy()
-for _, row in j1_rows.iterrows():
-    x = row["x"]
-    computed = row["epsilon2*"]
-    target = truth_eps2_j1[x]
-    rel_err = abs(computed - target) / target
-    print(f"x={x}: computed={computed:.3e}, target={target:.3e}, rel_err={rel_err:.2%}")
+def relerr(a, b):
+    denom = np.maximum(np.abs(b), 1e-300)
+    return (a - b)/denom
 
-# Tidy display (rounded) + keep precise in hidden columns if needed
-round_cols = ["-epsilon1*","epsilon2*","j1*","j2*","zeta*^2","n_t"]
-df_display = df.copy()
-for c in round_cols:
-    df_display[c] = df_display[c].map(lambda v: f"{v:.3e}")
+for ours, paper in [("-eps1*_our","-eps1*_paper"),
+                    ("eps2*_our","eps2*_paper"),
+                    ("j1*_our","j1*_paper"),
+                    ("j2*_our","j2*_paper"),
+                    ("zeta*2_our","zeta*2_paper"),
+                    ("n_t_our","n_t_paper")]:
+    df[ours.replace("_our","_relerr")] = relerr(df[ours].values, df[paper].values)
 
-# Show and save
-print(f"\nFitted (scale={best_scale:.3f}, MSE={best_mse:.3e}) — coefficients vs. paper")
-print(df_display)
-out_csv = "appendixA_with_BW_g_fitted.csv"
-df.to_csv(out_csv, index=False)
-print(f"\nResults saved to: {out_csv}")
+out_path = "table1_reproduction_with_BW_g_and_step_constraints.csv"
+df.to_csv(out_path, index=False)
+
+
+print("Best scale s for y=ln(1+s x') mapping =", s_best)
+print("Saved CSV to:", out_path)
