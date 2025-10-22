@@ -12,7 +12,7 @@ def leggauss_nodes(n):
     wt = 0.5*(b-a)*w
     return theta, wt
 
-THETA_N = 80
+THETA_N = 800
 THETA, WTH = leggauss_nodes(THETA_N)
 S2 = np.sin(THETA)**2
 
@@ -202,7 +202,7 @@ def compute_A5_for(x: float, j: float, Pstar: float, gfun: Callable[[float], flo
         gB = gfun(xB)
         eps1_B = -np.trapz(gB * np.array([I2(x, j, xp, xap, xx) for xx in xB]), xB)
         eps2sq_B =  np.trapz(gB * np.array([I6(x, j, xp, xap, xx) for xx in xB]), xB)
-        j1_B =      np.trapz(gB * np.array([6*I12(x,j,xp,xap,xx) - 9*I9(x,j,xp,xap,xx) - I10(x,j,xp,xap,xx) for xx in xB]), xB)
+        j1_B =      np.trapz(gB * np.array([6*I12(x,j,xp,xap,xx) - 9*I8(x,j,xp,xap,xx) - I10(x,j,xp,xap,xx) for xx in xB]), xB)
         j2sq_B =    np.trapz(gB * np.array([3*I12(x,j,xp,xap,xx) + 4*I10(x,j,xp,xap,xx) - 3*I13(x,j,xp,xap,xx) for xx in xB]), xB)
         zeta2_B =   np.trapz(gB * np.array([I15(x,j,xp,xap,xx) for xx in xB]), xB)
     else:
