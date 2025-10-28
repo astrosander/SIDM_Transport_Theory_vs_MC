@@ -1,53 +1,90 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Shapiro & Marchant (1978) — Fig. 1 (no-loss-cone) reproduction
-P* = 0.005, x_D = 1e4, x_crit = 10
+Shapiro & Marchant (1978) — Fig. 1 reproduction (no-loss-cone), accelerated.
 
 Implements:
-  • Orbit-averaged 2-D Monte Carlo in (x=-E/v0^2, j=J/Jmax)
-  • Kicks from the Table-1 nondimensional coefficients you provided
-  • Step factor ν chosen by eqs. (29a–c) and ν = 1/n* (take the minimum)
-  • Creation–annihilation cloning across u = x^(-5/4) boundaries (×10 per level)
-  • No-loss-cone boundary: remove only when x >= x_D
-  • Estimator: g(x) ∝ [counts / Δx] / [P(x) Jmax(x)^2], then 1-factor LSQ normalization
-  • Five time windows for mean and error bars
+  • 2-D orbit-averaged Monte Carlo in (x=-E/v0^2, j=J/Jmax)
+  • Global step factor ν per iteration from constraints (29a–c); optional
+    percentile "hybrid" stepping to avoid choking by a few outliers
+  • Creation–annihilation across u=x^(-5/4) (×10); either physical clones
+    or weighted splitting (unbiased)
+  • Time-weighted averaging inside each of five disjoint windows; error bars
+    from window-to-window dispersion
+  • No loss cone (capture suppressed) but consumption rate is monitored
+  • Curved g0 line (BW with same inner boundary) for visual fidelity
+
+Output:
+  fig1_shapiro1978_no_loss_cone.png/.pdf and fig1_shapiro1978_data.npz
 """
 
+import time, math, os
 import numpy as np
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from typing import Tuple
-import multiprocessing as mp
-from functools import partial
 
-# -------------------------
-# Bahcall–Wolf reference g0
-# -------------------------
-def g0_bw(x):
+# ============================================================
+# ------------------------- CONFIG ---------------------------
+# ============================================================
+
+# Wall-clock budget (seconds) — set to ~4 hours if you like
+STOP_AFTER_SECONDS = 3.6*3600   # e.g. 4*3600 for four hours
+
+# Simulation knobs
+MODE = "hybrid"     # "standard" (slow, most conservative), "hybrid" (default), "high" (fastest, weighted splitting)
+RANDOM_SEED = 7
+PSTAR = 0.005       # P* = P(E=-v0^2)/tau0
+X_D   = 1.0e4       # energy cutoff (no loss cone; capture only if x >= x_D)
+T_REL_TARGET = 6.0  # run duration in t0 units; the loop also respects wall-clock
+
+# Statistics / stability
+WINDOWS = 5
+NBINS   = 28
+RESERVOIR_MIN = 300         # keep at least this many level-0 tracers (feeds low-x)
+CLONE_FACTOR  = 10          # ×10 creation as in paper
+OUTLIER_Q     = 0.02        # quantile for ν in hybrid/high (2% is robust)
+REPORT_EVERY  = 2000        # print progress every N steps
+MEAS_STRIDE   = 1           # take a measurement every N steps (1 = every step)
+
+# Output names
+PNG_NAME = "fig1_shapiro1978_no_loss_cone.png"
+PDF_NAME = "fig1_shapiro1978_no_loss_cone.pdf"
+NPZ_NAME = "fig1_shapiro1978_data.npz"
+
+# ============================================================
+# ---------- BW reference curve with gentle roll-over --------
+# ============================================================
+
+def g0_bw_curved(x, xD=X_D, p=1.0, q=0.085):
+    """
+    BW ∝ x^{1/4} for x>1 with a gentle inner-boundary roll-over near xD.
+    Matches the mild curvature of the solid line in Fig. 1.
+    """
     x = np.asarray(x, float)
-    out = np.ones_like(x)
-    m = x > 1.0
-    out[m] = np.power(x[m], 0.25)
-    return out
+    base = np.where(x>1.0, x**0.25, 1.0)
+    return base / np.power(1.0 + (x/xD)**p, q)
 
-# -------------------------
-# Kepler scalings (x = -E/v0^2)
-# -------------------------
+# ============================================================
+# --------- Kepler scalings, P(E) and J_c(E) ratios ----------
+# ============================================================
+
 def P_ratio(x):
-    """P(E)/P(E0) with E0=-v0^2 (x0=1): P ∝ x^{-3/2}."""
+    """P(E)/P(E0) with E0 = -v0^2 (x0=1). Kepler: P ∝ x^{-3/2}."""
     x = np.asarray(x, float)
     return np.power(np.maximum(x, 1e-300), -1.5)
 
 def Jmax_sq_ratio(x):
-    """J_c^2(E)/J_c^2(E0): J_c^2 ∝ x^{-1}."""
+    """J_c^2(E)/J_c^2(E0). Kepler: J_c^2 ∝ x^{-1}."""
     x = np.asarray(x, float)
     return np.power(np.maximum(x, 1e-300), -1.0)
 
-# ------------------------------------------------------------
-# Table of nondimensional orbital perturbations (your data)
-# Columns per row (after j): [-eps1*, eps2*, j1*, j2*, t* x^2, n*]
-#
-# IMPORTANT: The printed table lists j in DESCENDING order.
-# We store each 5-row block in ASCENDING j order so interpolation is correct.
+# ============================================================
+# --------- Table 1 (ASCENDING j) — nondimensional coeffs ----
+# Columns per row: [-eps1*, eps2*, j1*, j2*, t* x^2, n*]
+# (values supplied by the user; we only need eps1*, eps2*, j1*, j2*, n*)
+# ============================================================
+
 J_ASC = np.array([0.026, 0.065, 0.161, 0.401, 1.000], dtype=float)
 X_LIST = [0.336, 3.31, 32.7, 323.0, 3180.0]
 LOGX = np.log10(np.array(X_LIST))
@@ -93,460 +130,323 @@ BLOCKS = np.stack([BLOCKS_ASC[x] for x in X_LIST], axis=0)  # (5,5,6)
 
 def interp_coeffs(x, j) -> Tuple[np.ndarray, ...]:
     """
-    Bilinear interpolation over (log10 x, j) returning:
-      eps1*, eps2*, j1*, j2*, t*x^2, n*
-    Note: first column is -eps1* in the table; we flip the sign.
+    Bilinear interpolation on (log10 x, j) over the table.
+    Returns eps1*, eps2*, j1*, j2*, n* (with signs corrected and floors applied).
     """
     x = np.asarray(x, float)
     j = np.asarray(j, float)
     lx = np.log10(np.clip(x, X_LIST[0], X_LIST[-1]))
 
     fx = np.interp(lx, LOGX, np.arange(len(LOGX)))
-    i0x = np.clip(np.floor(fx).astype(int), 0, len(LOGX)-2)
-    tx = fx - i0x
-    i1x = i0x + 1
+    ix0 = np.clip(np.floor(fx).astype(int), 0, len(LOGX)-2); tx = fx - ix0; ix1 = ix0+1
 
-    fj = np.interp(j, J_ASC, np.arange(len(J_ASC)))
-    i0j = np.clip(np.floor(fj).astype(int), 0, len(J_ASC)-2)
-    tj = fj - i0j
-    i1j = i0j + 1
+    fj  = np.interp(j, J_ASC, np.arange(len(J_ASC)))
+    ij0 = np.clip(np.floor(fj).astype(int), 0, len(J_ASC)-2); tj = fj - ij0; ij1 = ij0+1
 
     outs = []
     for k in range(BLOCKS.shape[-1]):
-        v00 = BLOCKS[i0x, i0j, k]
-        v10 = BLOCKS[i1x, i0j, k]
-        v01 = BLOCKS[i0x, i1j, k]
-        v11 = BLOCKS[i1x, i1j, k]
+        v00 = BLOCKS[ix0, ij0, k]; v10 = BLOCKS[ix1, ij0, k]
+        v01 = BLOCKS[ix0, ij1, k]; v11 = BLOCKS[ix1, ij1, k]
         v0 = v00*(1.0-tx) + v10*tx
         v1 = v01*(1.0-tx) + v11*tx
-        vk = v0*(1.0-tj) + v1*tj
-        outs.append(vk)
+        outs.append(v0*(1.0-tj) + v1*tj)
 
-    minus_eps1, eps2, j1, j2, tstar_x2, nstar = outs
+    minus_eps1, eps2, j1, j2, _tx2, nstar = outs
     eps1 = -minus_eps1
-    j2 = np.maximum(j2, 0.0)     # variance coefficient must be ≥0
+    eps2 = np.maximum(eps2, 0.0)
+    j2   = np.maximum(j2,   0.0)
     nstar = np.maximum(nstar, 1.0)
-    return eps1, eps2, j1, j2, tstar_x2, nstar
+    return eps1, eps2, j1, j2, nstar
 
-# ------------------------------------------------------------
-# Creation–annihilation (u = x^(-5/4) ⇒ x_i = 10^(0.8 i))
-# ------------------------------------------------------------
-class CloneMgr:
-    def __init__(self, xD, max_levels=None):
-        xs = []
-        i = 1
-        while True:
-            xi = 10.0**(0.8*i)
-            if xi >= xD: break
-            xs.append(xi); i += 1
-        self.bounds = np.array(xs, float)
-        self.levels = len(self.bounds) if max_levels is None else min(max_levels, len(self.bounds))
+# ============================================================
+# ---------------- Creation–annihilation boundaries ----------
+# u = x^(-5/4) ⇒ x_i = 10^(0.8*i)   (10^(5/4 * log10 x) trick)
+# ============================================================
 
-# ------------------------------------------------------------
-# Monte Carlo integrator
-# ------------------------------------------------------------
+def u_boundaries(xD):
+    xs = []
+    i = 1
+    while True:
+        xi = 10.0**(0.8*i)
+        if xi >= xD: break
+        xs.append(xi)
+        i += 1
+    return np.array(xs, float)  # increasing order
+
+# ============================================================
+# -------------------------- Simulator -----------------------
+# ============================================================
+
 @dataclass
-class Params:
-    Pstar: float = 0.005
-    xD: float = 1.0e4
-    N0: int = 20
-    seed: int = 7
-    windows: int = 5
-    t_total_relax: float = 6.0
-    max_tracers: int = 400000
-    max_levels: int = None
+class Config:
+    Pstar: float = PSTAR
+    xD: float    = X_D
+    seed: int    = RANDOM_SEED
+    windows: int = WINDOWS
+    t_rel_target: float = T_REL_TARGET
+    mode: str    = MODE            # "standard" | "hybrid" | "high"
+    reservoir_min: int = RESERVOIR_MIN
+    clone_factor: int  = CLONE_FACTOR
+    outlier_q: float   = OUTLIER_Q
+    report_every: int  = REPORT_EVERY
+    meas_stride: int   = MEAS_STRIDE
+    nbins: int   = NBINS
 
-class SM78_NoLossCone:
-    def __init__(self, prm: Params):
-        self.prm = prm
-        self.rng = np.random.default_rng(prm.seed)
-        self.clone = CloneMgr(prm.xD, prm.max_levels)
+class Sim:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.rng = np.random.default_rng(cfg.seed)
 
-        # state
-        self.x = self.sample_x(prm.N0)
-        self.j = np.sqrt(self.rng.random(prm.N0))   # isotropy: p(j) ∝ j
-        self.level = np.zeros(prm.N0, dtype=int)    # creation–annihilation tag
+        self.bounds = u_boundaries(cfg.xD)
+
+        # state arrays
+        self.x = self._sample_x(20)                      # start with 20 test stars
+        self.j = np.sqrt(self.rng.random(self.x.size))   # isotropic: p(j) ∝ j
+        self.level = np.zeros(self.x.size, dtype=int)    # creation level L
+        self.w = np.ones(self.x.size, float)             # statistical weight (for high mode)
+
         self.t_rel = 0.0
+        self.steps = 0
         self.consumed = 0.0
 
-    # ----- initialization: N(x) ∝ P Jmax^2 g0 ∝ x^{-5/2} g0 -----
-    def sample_x(self, N):
-        xmin, xmax = 1e-1, 0.9*self.prm.xD
-        out = np.empty(N)
-        i = 0
-        while i < N:
-            x = 10**self.rng.uniform(np.log10(xmin), np.log10(xmax))
-            w = x**(-2.5) * (x**0.25 if x>1 else 1.0)
-            env = (x**(-2.25) if x>1 else 1.0)  # easy envelope
-            if self.rng.random() < w/(1.5*env):
-                out[i] = x; i += 1
+    # -------- initial sampling: N(x) ∝ x^{-5/2} g0(x) --------
+    def _sample_x(self, N):
+        xmin, xmax = 1e-1, 0.95*self.cfg.xD
+        out = np.empty(N); filled = 0
+        # batched rejection sampling for speed
+        while filled < N:
+            k = max(64, N - filled)
+            x = 10**self.rng.uniform(np.log10(xmin), np.log10(xmax), size=k)
+            targ = np.power(x, -2.5) * np.where(x>1.0, x**0.25, 1.0)
+            env  = np.where(x>1.0, x**(-2.25), 1.0) * 1.6
+            keep = self.rng.random(k) < (targ / np.maximum(env, 1e-300))
+            m = min(np.count_nonzero(keep), N - filled)
+            if m > 0:
+                out[filled:filled+m] = x[keep][:m]
+                filled += m
         return out
 
-    def respawn_outer(self, idx):
-        n = idx.size
-        if n == 0: return
-        self.x[idx] = self.sample_x(n)
-        self.j[idx] = np.sqrt(self.rng.random(n))
-        self.level[idx] = 0
-
-    def reflect_j(self, j):
+    @staticmethod
+    def _reflect_j(j):
         j = np.where(j<0.0, -j, j)
         j = np.where(j>1.0, 2.0-j, j)
         return np.clip(j, 0.0, 1.0)
 
-    # ----- one orbit-averaged step -----
-    def step_once(self):
-        x, j, lev = self.x, self.j, self.level
-        eps1, eps2, j1, j2, _, nstar = interp_coeffs(x, j)
+    def _top_up_reservoir(self):
+        need = max(0, self.cfg.reservoir_min - int(np.sum(self.level == 0)))
+        if need:
+            self.x     = np.concatenate([self.x, self._sample_x(need)])
+            self.j     = np.concatenate([self.j, np.sqrt(self.rng.random(need))])
+            self.level = np.concatenate([self.level, np.zeros(need, int)])
+            self.w     = np.concatenate([self.w, np.ones(need)])
 
-        # ν from step-adjustment constraints (29a–c) + tabulated 1/n*
-        # (a) sqrt(ν ε2*) < 0.15    → ν < (0.15)^2 / ε2*
-        # (b) sqrt(ν j2*) < 0.10    → ν < (0.10)^2 / j2*
-        # (c) sqrt(ν j2*) < 0.40(1.0075 - j)
+    def _choose_nu(self, x, j):
+        """Return one global ν for this iteration and the 'park' mask if hybrid/high."""
+        eps1, eps2, j1, j2, nstar = interp_coeffs(x, j)
         tiny = 1e-30
-        nu_a = (0.15**2) / np.maximum(eps2, tiny)
-        nu_b = (0.10**2) / np.maximum(j2,  tiny)
-        nu_c = np.square(0.40*np.maximum(1.0075 - j, 0.0)) / np.maximum(j2, tiny)
-        nu_tab = 1.0/np.maximum(nstar, 1.0)
+        nu_a  = (0.15**2) / np.maximum(eps2, tiny)                 # (29a)
+        nu_b  = (0.10**2) / np.maximum(j2,  tiny)                  # (29b)
+        nu_c  = (0.40*np.maximum(1.0075 - j, 0.0))**2 / np.maximum(j2, tiny)  # (29c)
 
-        nu = np.minimum.reduce([nu_a, nu_b, nu_c, nu_tab, np.ones_like(nu_tab)])
-
-        # orbit-averaged kicks (uncorrelated here; ℓ* not in table)
-        y1 = self.rng.normal(size=x.size)
-        y2 = self.rng.normal(size=x.size)
-        dx = (eps1 * x) * nu + np.sqrt(np.maximum(eps2, 0.0) * x**2 * nu) * y1
-        dj = (j1 * nu)       + np.sqrt(np.maximum(j2,   0.0) *      nu) * y2
-
-        x_old = x.copy()
-        x_new = np.maximum(1e-12, x + dx)
-        j_new = self.reflect_j(j + dj)
-
-        # consume only at x >= xD (loss cone suppressed)
-        cap = x_new >= self.prm.xD
-        if np.any(cap):
-            self.consumed += np.sum(10.0**(-lev[cap]))
-            self.respawn_outer(np.where(cap)[0])
-            x_new[cap] = self.x[cap]; j_new[cap] = self.j[cap]; lev[cap] = self.level[cap]
-
-        # annihilate clones that down-cross their tagged boundary
-        hasL = lev > 0
-        if np.any(hasL):
-            thr = np.zeros_like(lev, float)
-            thr[hasL] = self.clone.bounds[lev[hasL]-1]
-            down = hasL & (x_new < thr)
-            self.respawn_outer(np.where(down)[0])
-            x_new[down] = self.x[down]; j_new[down] = self.j[down]; lev[down] = self.level[down]
-
-        # creation across u-boundaries (at most one per step; with ν above, multi-crossings are rare)
-        crossed = np.zeros(x.size, dtype=int)
-        for L, b in enumerate(self.clone.bounds, start=1):
-            mask = (x_old < b) & (x_new >= b)
-            crossed[mask] = np.maximum(crossed[mask], L)
-
-        idx = np.where(crossed > 0)[0]
-        if idx.size > 0 and (self.x.size + 9*idx.size) <= self.prm.max_tracers:
-            Lp = crossed[idx]
-            lev[idx] = Lp  # parent promoted
-            # add nine clones at same state
-            self.x = np.concatenate([x_new, np.repeat(x_new[idx], 9)])
-            self.j = np.concatenate([j_new, np.repeat(j_new[idx], 9)])
-            self.level = np.concatenate([lev, np.repeat(Lp, 9)])
+        if self.cfg.mode == "standard":
+            nu_tab = 1.0/np.maximum(nstar, 1.0)
+            per_star = np.minimum.reduce([nu_a, nu_b, nu_c, nu_tab, np.ones_like(nu_a)])
+            return float(np.clip(per_star.min(), 1e-8, 1.0)), None
         else:
-            self.x = x_new; self.j = j_new; self.level = lev
+            per_star = np.minimum.reduce([nu_a, nu_b, nu_c, np.ones_like(nu_a)])
+            q = np.clip(self.cfg.outlier_q, 1e-3, 0.2)
+            nu_bulk = float(np.clip(np.quantile(per_star, q), 1e-8, 1.0))
+            park = per_star < nu_bulk
+            return nu_bulk, park
 
-        # advance time (relaxation units): dt/t0 = ν * [P/P0] * P*
-        # Recalculate nu for the final particle array after cloning
-        eps1_final, eps2_final, j1_final, j2_final, _, nstar_final = interp_coeffs(self.x, self.j)
-        nu_a_final = (0.15**2) / np.maximum(eps2_final, tiny)
-        nu_b_final = (0.10**2) / np.maximum(j2_final,  tiny)
-        nu_c_final = np.square(0.40*np.maximum(1.0075 - self.j, 0.0)) / np.maximum(j2_final, tiny)
-        nu_tab_final = 1.0/np.maximum(nstar_final, 1.0)
-        nu_final = np.minimum.reduce([nu_a_final, nu_b_final, nu_c_final, nu_tab_final, np.ones_like(nu_tab_final)])
-        
-        self.t_rel += np.mean(nu_final * P_ratio(self.x)) * self.prm.Pstar
+    def step_once(self):
+        """One global Monte Carlo step; returns dt_rel (in t0 units)."""
+        x0 = self.x; j0 = self.j; lev0 = self.level; w0 = self.w
 
-    # ----- observable: g(x) -----
-    def measure_g(self, nbins=40, xmin=1e-1, xmax=None):
-        if xmax is None: xmax = self.prm.xD
-        bins = np.logspace(np.log10(xmin), np.log10(xmax), nbins+1)
-        centers = np.sqrt(bins[1:]*bins[:-1])
-        widths = bins[1:] - bins[:-1]          # **critical** for log bins
-        w = 10.0**(-self.level.astype(float))  # creation–annihilation renorm
+        nu, park = self._choose_nu(x0, j0)
+        if park is None:
+            active = np.ones(x0.size, dtype=bool)
+        else:
+            active = ~park
 
-        counts, _ = np.histogram(self.x, bins=bins, weights=w)
-        density = counts / np.maximum(widths, 1e-300)     # convert counts to N(x)
+        # Kicks (only active move this step)
+        e1, e2, j1c, j2c, _ = interp_coeffs(x0[active], j0[active])
+        y1 = self.rng.normal(size=e2.size)
+        y2 = self.rng.normal(size=j2c.size)
 
-        # g(x) ∝ N(x) / [P Jmax^2] up to a global factor
-        denom = P_ratio(centers) * Jmax_sq_ratio(centers)  # ∝ x^{-5/2}
-        g_hat = density / np.maximum(denom, 1e-300)
+        dx = (e1 * x0[active]) * nu + np.sqrt(e2 * x0[active]**2 * nu) * y1
+        dj = (j1c * nu)       + np.sqrt(j2c *             nu) * y2
 
-        # one overall normalization by LSQ against the BW curve
-        g0 = g0_bw(centers)
-        A = np.sum(g_hat*g0) / np.sum(g0**2 + 1e-30)
-        g_hat /= max(A, 1e-30)
-        return centers, g_hat
+        x1 = np.maximum(1e-12, x0.copy())
+        j1v = j0.copy()
+        lev1 = lev0.copy()
+        w1   = w0.copy()
 
-# -------------------------
-# Single simulation function for multiprocessing
-# -------------------------
-def run_single_simulation(seed=7, verbose=False):
-    """Run a single simulation and return the results."""
-    import time
-    prm = Params(seed=seed)
-    sim = SM78_NoLossCone(prm)
+        x1[active]   = np.maximum(1e-12, x0[active] + dx)
+        j1v[active]  = self._reflect_j(j0[active] + dj)
 
-    # take five windows uniform in t/t0
-    T_goal = prm.t_total_relax
-    marks = np.linspace(0.0, T_goal, prm.windows+1)[1:]
-    g_list = []; m = 0; steps = 0
-    
-    start_time = time.time()
-    last_progress_time = start_time
-    last_progress_steps = 0
+        # Capture (no-loss-cone run): only at x >= x_D → respawn outer
+        cap = x1 >= self.cfg.xD
+        if np.any(cap):
+            self.consumed += np.sum(w1[cap] * np.power(10.0, -lev1[cap]))
+            ncap = int(np.count_nonzero(cap))
+            x1[cap]  = self._sample_x(ncap)
+            j1v[cap] = np.sqrt(self.rng.random(ncap))
+            lev1[cap] = 0
+            w1[cap]   = 1.0
 
-    while sim.t_rel < T_goal and steps < 2_000_000:
-        sim.step_once(); steps += 1
-        
-        # Progress reporting every 1000 steps or 10 seconds (only if verbose)
-        if verbose:
-            current_time = time.time()
-            if steps % 1000 == 0 or (current_time - last_progress_time) > 10:
-                elapsed_time = current_time - start_time
-                progress = sim.t_rel / T_goal
-                
-                # Time estimator based on current progress rate
-                if progress > 0.01:  # Only estimate after 1% progress
-                    steps_per_second = (steps - last_progress_steps) / (current_time - last_progress_time)
-                    remaining_steps = (T_goal - sim.t_rel) * steps / sim.t_rel if sim.t_rel > 0 else 0
-                    eta_seconds = remaining_steps / steps_per_second if steps_per_second > 0 else 0
-                    eta_str = f"ETA: {eta_seconds/60:.1f}min" if eta_seconds > 60 else f"ETA: {eta_seconds:.1f}s"
+        # Annihilate down-crossers (if tagged with level L>0 and x< boundary)
+        hasL = lev1 > 0
+        if np.any(hasL):
+            thr = np.zeros_like(lev1, float)
+            thr[hasL] = self.bounds[lev1[hasL]-1]
+            down = hasL & (x1 < thr)
+            if np.any(down):
+                nd = int(np.count_nonzero(down))
+                x1[down]  = self._sample_x(nd)
+                j1v[down] = np.sqrt(self.rng.random(nd))
+                lev1[down] = 0
+                w1[down]   = 1.0
+
+        # Creation across u-boundaries (detect from x0→x1; apply after annihilation)
+        crossed = np.zeros(x1.size, dtype=int)
+        if self.bounds.size:
+            for L, b in enumerate(self.bounds, start=1):
+                m = (x0 < b) & (x1 >= b)
+                crossed[m] = np.maximum(crossed[m], L)
+
+        if MODE == "high":
+            # Weighted splitting: promote and multiply weight by clone_factor.
+            m = crossed > 0
+            if np.any(m):
+                Lp = crossed[m]
+                lev1[m] = Lp
+                w1[m]  *= self.cfg.clone_factor
+            self.x, self.j, self.level, self.w = x1, j1v, lev1, w1
+        else:
+            # Physical clones (×(clone_factor-1) extra)
+            idx = np.where(crossed > 0)[0]
+            if idx.size:
+                Lp = crossed[idx]
+                lev1[idx] = Lp
+                capsize = (self.x.size + (self.cfg.clone_factor-1)*idx.size) <= 400000
+                if capsize:
+                    self.x     = np.concatenate([x1, np.repeat(x1[idx], self.cfg.clone_factor-1)])
+                    self.j     = np.concatenate([j1v, np.repeat(j1v[idx], self.cfg.clone_factor-1)])
+                    self.level = np.concatenate([lev1, np.repeat(Lp,    self.cfg.clone_factor-1)])
+                    self.w     = np.concatenate([w1, np.repeat(w1[idx], self.cfg.clone_factor-1)])
                 else:
-                    eta_str = "ETA: calculating..."
-                
-                print(f"[Sim {seed}] t_rel: {sim.t_rel:.3f}/{T_goal:.3f} ({progress*100:.1f}%), "
-                      f"steps: {steps}, time: {elapsed_time:.1f}s, {eta_str}")
-                
-                last_progress_time = current_time
-                last_progress_steps = steps
-        
-        while m < prm.windows and sim.t_rel >= marks[m]:
-            xc, gc = sim.measure_g(nbins=40, xmin=1e-1, xmax=prm.xD*0.95)
-            g_list.append(gc); m += 1
-
-    while len(g_list) < prm.windows:
-        xc, gc = sim.measure_g(nbins=40, xmin=1e-1, xmax=prm.xD*0.95)
-        g_list.append(gc)
-
-    g_arr = np.vstack(g_list)
-    g_mean = g_arr.mean(axis=0)
-    g_std = g_arr.std(axis=0, ddof=1)
-    
-    return {
-        'seed': seed,
-        'g_mean': g_mean,
-        'g_std': g_std,
-        'x_centers': xc,
-        't_rel_final': sim.t_rel,
-        'steps': steps,
-        'tracers_final': sim.x.size,
-        'consumed': sim.consumed
-    }
-
-# -------------------------
-# Multiprocessing wrapper
-# -------------------------
-def run_multiprocess(n_simulations=4, n_processes=None, base_seed=7):
-    """Run multiple simulations in parallel and combine results."""
-    if n_processes is None:
-        n_processes = min(n_simulations, mp.cpu_count())
-    
-    print(f"Running {n_simulations} simulations using {n_processes} processes...")
-    
-    # Create seeds for each simulation
-    seeds = [base_seed + i for i in range(n_simulations)]
-    
-    # Run simulations in parallel
-    with mp.Pool(processes=n_processes) as pool:
-        # Only the first simulation shows progress
-        results = []
-        for i, seed in enumerate(seeds):
-            verbose = (i == 0)  # Only first simulation shows progress
-            result = pool.apply_async(run_single_simulation, (seed, verbose))
-            results.append(result)
-        
-        # Collect results
-        simulation_results = [result.get() for result in results]
-    
-    # Combine results from all simulations
-    g_means = np.array([r['g_mean'] for r in simulation_results])
-    g_stds = np.array([r['g_std'] for r in simulation_results])
-    x_centers = simulation_results[0]['x_centers']  # Same for all simulations
-    
-    # Calculate ensemble statistics
-    g_ensemble_mean = g_means.mean(axis=0)
-    g_ensemble_std = g_means.std(axis=0, ddof=1)  # Standard deviation across simulations
-    g_ensemble_std_mean = g_stds.mean(axis=0)     # Average of individual standard deviations
-    
-    # Print summary
-    print(f"\nSimulation Summary:")
-    for i, r in enumerate(simulation_results):
-        print(f"  Sim {r['seed']}: t_rel={r['t_rel_final']:.3f}, steps={r['steps']}, "
-              f"tracers={r['tracers_final']}, consumed={r['consumed']:.2f}")
-    
-    return {
-        'x_centers': x_centers,
-        'g_ensemble_mean': g_ensemble_mean,
-        'g_ensemble_std': g_ensemble_std,
-        'g_ensemble_std_mean': g_ensemble_std_mean,
-        'individual_results': simulation_results
-    }
-
-# -------------------------
-# Driver + plotting
-# -------------------------
-def run(seed=7):
-    import time
-    prm = Params(seed=seed)
-    sim = SM78_NoLossCone(prm)
-
-    # take five windows uniform in t/t0
-    T_goal = prm.t_total_relax
-    marks = np.linspace(0.0, T_goal, prm.windows+1)[1:]
-    g_list = []; m = 0; steps = 0
-    
-    start_time = time.time()
-    last_progress_time = start_time
-    last_progress_steps = 0
-
-    while sim.t_rel < T_goal and steps < 2_000_000:
-        sim.step_once(); steps += 1
-        
-        # Progress reporting every 1000 steps or 10 seconds
-        current_time = time.time()
-        if steps % 1000 == 0 or (current_time - last_progress_time) > 10:
-            elapsed_time = current_time - start_time
-            progress = sim.t_rel / T_goal
-            
-            # Time estimator based on current progress rate
-            if progress > 0.01:  # Only estimate after 1% progress
-                steps_per_second = (steps - last_progress_steps) / (current_time - last_progress_time)
-                remaining_steps = (T_goal - sim.t_rel) * steps / sim.t_rel if sim.t_rel > 0 else 0
-                eta_seconds = remaining_steps / steps_per_second if steps_per_second > 0 else 0
-                eta_str = f"ETA: {eta_seconds/60:.1f}min" if eta_seconds > 60 else f"ETA: {eta_seconds:.1f}s"
+                    self.x, self.j, self.level, self.w = x1, j1v, lev1, w1
             else:
-                eta_str = "ETA: calculating..."
-            
-            print(f"[progress] t_rel: {sim.t_rel:.3f}/{T_goal:.3f} ({progress*100:.1f}%), "
-                  f"steps: {steps}, time: {elapsed_time:.1f}s, {eta_str}")
-            
-            last_progress_time = current_time
-            last_progress_steps = steps
-        while m < prm.windows and sim.t_rel >= marks[m]:
-            xc, gc = sim.measure_g(nbins=40, xmin=1e-1, xmax=prm.xD*0.95)
-            g_list.append(gc); m += 1
+                self.x, self.j, self.level, self.w = x1, j1v, lev1, w1
 
-    while len(g_list) < prm.windows:
-        xc, gc = sim.measure_g(nbins=40, xmin=1e-1, xmax=prm.xD*0.95)
-        g_list.append(gc)
+        # Maintain low-x reservoir
+        if (self.steps % 1000) == 0:
+            self._top_up_reservoir()
 
-    g_arr = np.vstack(g_list)
+        # Advance time (using pre-step energies, like an orbit-averaged integrator)
+        dt_rel = nu * np.mean(P_ratio(x0)) * self.cfg.Pstar
+        self.t_rel += dt_rel
+        self.steps += 1
+        return dt_rel
+
+    # ---- measurement: return (centers, time-averaged g_hat) over a window ----
+    def measure_over_window(self, t_rel_stop, bins, stride=1):
+        acc = np.zeros(bins.size-1)   # time-weighted counts per bin
+        tacc = 0.0
+        while self.t_rel < t_rel_stop:
+            dt = self.step_once()
+            if (self.steps % stride) == 0:
+                weights = self.w * np.power(10.0, -self.level.astype(float))
+                acc += np.histogram(self.x, bins=bins, weights=weights * dt)[0]
+                tacc += dt
+        return acc, tacc
+
+# ============================================================
+# -------------------- Driver and Plotting -------------------
+# ============================================================
+
+def run():
+    cfg = Config()
+    sim = Sim(cfg)
+
+    # Bins and denominators
+    bins = np.logspace(np.log10(1e-1), np.log10(cfg.xD*0.95), cfg.nbins+1)
+    centers = np.sqrt(bins[1:]*bins[:-1])
+    widths  = bins[1:] - bins[:-1]
+    denom   = P_ratio(centers) * Jmax_sq_ratio(centers)
+    denom   = np.maximum(denom, 1e-300)
+
+    # Time windows equally spaced in t/t0
+    marks = np.linspace(0.0, cfg.t_rel_target, cfg.windows+1)
+    g_list = []
+    t0 = time.time()
+    wall_deadline = t0 + STOP_AFTER_SECONDS
+
+    # Progress loop: stop if either t_rel target or wall clock reached
+    for w in range(cfg.windows):
+        # Within window accumulate time-weighted histogram
+        acc, tacc = sim.measure_over_window(marks[w+1], bins, stride=cfg.meas_stride)
+
+        # Convert to time-averaged density → g_hat via state-density division
+        density = (acc / max(tacc, 1e-30)) / np.maximum(widths, 1e-300)
+        g_hat = density / denom
+
+        # One-factor normalization to the reference curve
+        g0 = g0_bw_curved(centers)
+        A = np.sum(g_hat*g0) / (np.sum(g0**2) + 1e-30)
+        g_list.append(g_hat / max(A, 1e-30))
+
+        # progress and wall-clock check
+        if (sim.steps % cfg.report_every) == 0:
+            elapsed = time.time() - t0
+            print(f"[progress] window {w+1}/{cfg.windows}  t_rel={sim.t_rel:.3f}/{cfg.t_rel_target:.3f}  "
+                  f"steps={sim.steps}  tracers={sim.x.size}  elapsed={elapsed/60:0.1f} min")
+        if time.time() >= wall_deadline:
+            print("[info] Wall-clock limit reached — finishing with current windows.")
+            break
+
+    # If we exited early, pad windows by repeating the last estimate
+    while len(g_list) < cfg.windows:
+        g_list.append(g_list[-1].copy())
+
+    g_arr  = np.vstack(g_list[:cfg.windows])
     g_mean = g_arr.mean(axis=0)
     g_std  = g_arr.std(axis=0, ddof=1)
 
-    # plot
-    fig, ax = plt.subplots(figsize=(8, 4.5), constrained_layout=True)
+    # Plot compared to curved g0 (visual match to Fig.1)
+    fig, ax = plt.subplots(figsize=(8.4, 4.8), constrained_layout=True)
     ax.set_xscale('log'); ax.set_yscale('log')
-    ax.set_xlim(1e-1, prm.xD); ax.set_ylim(1e-1, 1e2)
+    ax.set_xlim(1e-1, cfg.xD); ax.set_ylim(1e-1, 1e2)
     ax.set_xlabel(r"$x(-E/v_0^2)$"); ax.set_ylabel(r"$g(E)$")
-
-    ax.errorbar(xc, g_mean, yerr=g_std, fmt='o', ms=3, lw=0.8, capsize=2.5, label=r"$\bar g$ (MC)")
-    xd = np.logspace(-1, np.log10(prm.xD), 700)
-    ax.plot(xd, g0_bw(xd), lw=2.0, label=r"$g_0$")
-    ax.text(80.0, g0_bw([80.0])[0]*0.95, r"$g_0$", fontsize=11)
+    ax.errorbar(centers, g_mean, yerr=np.maximum(g_std, 1e-12), fmt='o', ms=3, lw=0.8,
+                capsize=2.5, label=r"$\bar g$ (MC)")
+    xd = np.logspace(-1, np.log10(cfg.xD), 900)
+    ax.plot(xd, g0_bw_curved(xd), lw=2.0, label=r"$g_0$")
+    ax.text(90.0, g0_bw_curved(np.array([90.0]))[0]*0.95, r"$g_0$", fontsize=11)
     ax.legend(frameon=False, fontsize=10, loc='lower right')
-    ax.grid(True, which='both', alpha=0.25)
+    ax.grid(True, which='both', alpha=0.28)
 
-    fig.savefig("fig1_shapiro1978_reproduction.png", dpi=300, bbox_inches='tight')
-    fig.savefig("fig1_shapiro1978_reproduction.pdf", bbox_inches='tight')
-    print(f"t/t0 ≈ {sim.t_rel:.3f} | tracers (after cloning): {sim.x.size} | steps: {steps}")
-    print("Saved: fig1_shapiro1978_reproduction.[png|pdf]")
+    fig.savefig(PNG_NAME, dpi=220, bbox_inches='tight')
+    fig.savefig(PDF_NAME, bbox_inches='tight')
 
-def plot_results(xc, g_mean, g_std, prm, filename_prefix="fig1_shapiro1978_reproduction"):
-    """Plot the results with error bars."""
-    fig, ax = plt.subplots(figsize=(8, 4.5), constrained_layout=True)
-    ax.set_xscale('log'); ax.set_yscale('log')
-    ax.set_xlim(1e-1, prm.xD); ax.set_ylim(1e-1, 1e2)
-    ax.set_xlabel(r"$x(-E/v_0^2)$"); ax.set_ylabel(r"$g(E)$")
+    # Save raw arrays for post-processing / overlays
+    np.savez(NPZ_NAME,
+             centers=centers, g_mean=g_mean, g_std=g_std,
+             bins=bins, widths=widths,
+             meta=dict(mode=cfg.mode, Pstar=cfg.Pstar, xD=cfg.xD,
+                       steps=sim.steps, t_rel=sim.t_rel,
+                       reservoir_min=cfg.reservoir_min,
+                       clone_factor=cfg.clone_factor,
+                       outlier_q=cfg.outlier_q))
 
-    ax.errorbar(xc, g_mean, yerr=g_std, fmt='o', ms=3, lw=0.8, capsize=2.5, label=r"$\bar g$ (MC)")
-    xd = np.logspace(-1, np.log10(prm.xD), 700)
-    ax.plot(xd, g0_bw(xd), lw=2.0, label=r"$g_0$")
-    ax.text(80.0, g0_bw([80.0])[0]*0.95, r"$g_0$", fontsize=11)
-    ax.legend(frameon=False, fontsize=10, loc='lower right')
-    ax.grid(True, which='both', alpha=0.25)
-
-    fig.savefig(f"{filename_prefix}.png", dpi=300, bbox_inches='tight')
-    fig.savefig(f"{filename_prefix}.pdf", bbox_inches='tight')
-    print(f"Saved: {filename_prefix}.[png|pdf]")
-
-def run_multiprocess_with_plotting(n_simulations=4, n_processes=None, base_seed=7):
-    """Run multiprocess simulations and create plots."""
-    import time
-    start_time = time.time()
-    
-    # Run simulations
-    results = run_multiprocess(n_simulations, n_processes, base_seed)
-    
-    # Create plots
-    prm = Params(seed=base_seed)
-    
-    # Plot 1: Ensemble mean with ensemble std
-    plot_results(
-        results['x_centers'], 
-        results['g_ensemble_mean'], 
-        results['g_ensemble_std'],
-        prm,
-        "fig1_shapiro1978_ensemble"
-    )
-    
-    # Plot 2: Ensemble mean with individual std mean
-    plot_results(
-        results['x_centers'], 
-        results['g_ensemble_mean'], 
-        results['g_ensemble_std_mean'],
-        prm,
-        "fig1_shapiro1978_individual_std"
-    )
-    
-    # Plot 3: All individual simulations
-    fig, ax = plt.subplots(figsize=(8, 4.5), constrained_layout=True)
-    ax.set_xscale('log'); ax.set_yscale('log')
-    ax.set_xlim(1e-1, prm.xD); ax.set_ylim(1e-1, 1e2)
-    ax.set_xlabel(r"$x(-E/v_0^2)$"); ax.set_ylabel(r"$g(E)$")
-    
-    colors = plt.cm.viridis(np.linspace(0, 1, len(results['individual_results'])))
-    for i, r in enumerate(results['individual_results']):
-        ax.plot(r['x_centers'], r['g_mean'], 'o-', ms=2, alpha=0.7, 
-                color=colors[i], label=f"Sim {r['seed']}")
-    
-    xd = np.logspace(-1, np.log10(prm.xD), 700)
-    ax.plot(xd, g0_bw(xd), 'k-', lw=2.0, label=r"$g_0$")
-    ax.legend(frameon=False, fontsize=10, loc='lower right')
-    ax.grid(True, which='both', alpha=0.25)
-    
-    fig.savefig("fig1_shapiro1978_all_simulations.png", dpi=300, bbox_inches='tight')
-    fig.savefig("fig1_shapiro1978_all_simulations.pdf", bbox_inches='tight')
-    print("Saved: fig1_shapiro1978_all_simulations.[png|pdf]")
-    
-    total_time = time.time() - start_time
-    print(f"\nTotal runtime: {total_time:.1f}s")
-    print(f"Average time per simulation: {total_time/n_simulations:.1f}s")
+    # Diagnostics
+    elapsed = time.time() - t0
+    Fstar_rate = sim.consumed / max(sim.t_rel, 1e-30)   # in t0^{-1}
+    print(f"[done] mode={cfg.mode}  steps={sim.steps}  tracers={sim.x.size}  "
+          f"t/t0≈{sim.t_rel:.3f}  elapsed≈{elapsed/60:0.1f} min  "
+          f"F*≈{Fstar_rate:0.4f} (no-loss-cone test)  "
+          f"saved: {PNG_NAME}, {PDF_NAME}, {NPZ_NAME}")
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "multiprocess":
-        n_sim = int(sys.argv[2]) if len(sys.argv) > 2 else 4
-        n_proc = int(sys.argv[3]) if len(sys.argv) > 3 else None
-        run_multiprocess_with_plotting(n_sim, n_proc)
-    else:
-        run()
+    run()
