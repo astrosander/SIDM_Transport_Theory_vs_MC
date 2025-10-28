@@ -222,13 +222,22 @@ def _build_kernels(use_jit=True):
         if x_new < 1e-12:
             x_new = 1e-12
 
-        # J update: 2D RW if large angular kick
-        if math.sqrt(n)*j2v > max(1e-12, j/4.0):
+        # J update: 2D RW only inside loss cone and small j (paper's gate)
+        use_2d = (
+            (math.sqrt(n)*j2v > max(1e-12, j/4.0)) and  # "step large vs J"
+            (j < 0.4) and                               # small j
+            (j < j_min_of_x(x))                         # INSIDE the loss cone
+        )
+        if use_2d:
+            # 2D RW (eq. 28)
             z1 = np.random.normal()
             z2 = np.random.normal()
             j_new = math.sqrt( (j + math.sqrt(n)*z1*j2v)**2 + (math.sqrt(n)*z2*j2v)**2 )
+            used_2d = True
         else:
+            # 1D Gaussian with correlation (eq. 27b)
             j_new = j + n*j1v + math.sqrt(n)*y2*j2v
+            used_2d = False
         if j_new < 0.0: j_new = 0.0
         if j_new > 1.0: j_new = 1.0
 
@@ -240,7 +249,7 @@ def _build_kernels(use_jit=True):
             if j_new < j_min_of_x(x_new):
                 captured = True
 
-        return x_new, j_new, phase, n, captured
+        return x_new, j_new, phase, n, captured, used_2d
 
     @njit(**fastmath)
     def run_stream(n_relax, floors, clones_per_split, x_bins, dx, seed):
@@ -269,6 +278,9 @@ def _build_kernels(use_jit=True):
         pericross = 0
         caps = 0
         escapes = 0
+        g_boundary_sum = 0.0
+        n_2d = 0
+        n_1d = 0
 
         # ḡ snapshots (once per t0): count weighted stars in each x-bin
         g_counts = np.zeros(x_bins.size, dtype=np.float64)
@@ -287,10 +299,14 @@ def _build_kernels(use_jit=True):
 
         while t0_used < n_relax:
             x_prev = x; j_prev = j
-            x, j, phase, n_used, cap = step_one(x, j, phase)
+            x, j, phase, n_used, cap, used_2d = step_one(x, j, phase)
             # advance time
             t0_used += (n_used * P_of_x(x_prev)) / T0
             pericross += 1  # Count steps as proxy for pericenter crossings
+            if used_2d:
+                n_2d += 1
+            else:
+                n_1d += 1
 
             # Check for escape from cusp (outward diffusion)
             if x < X_BOUND:
@@ -338,8 +354,12 @@ def _build_kernels(use_jit=True):
                 if cactive[i] == 0:
                     i += 1; continue
                 x_c, j_c, ph_c = cx[i], cj[i], cph[i]
-                x_c2, j_c2, ph_c2, n_c, cap_c = step_one(x_c, j_c, ph_c)
+                x_c2, j_c2, ph_c2, n_c, cap_c, used_2d_c = step_one(x_c, j_c, ph_c)
                 cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
+                if used_2d_c:
+                    n_2d += 1
+                else:
+                    n_1d += 1
 
                 # outward across its floor => remove
                 if j_c2*j_c2 >= cfloor[i]:
@@ -388,10 +408,16 @@ def _build_kernels(use_jit=True):
             while t0_used >= next_snap:
                 # parent
                 g_counts[bin_index(x)] += w
+                # parent at boundary?
+                if abs(x - X_BOUND) < 1e-12:
+                    g_boundary_sum += w
                 # active clones
                 for ii in range(ccount):
                     if cactive[ii]:
                         g_counts[bin_index(cx[ii])] += cw[ii]
+                        # clones at boundary?
+                        if abs(cx[ii] - X_BOUND) < 1e-12:
+                            g_boundary_sum += cw[ii]
                 n_snaps += 1
                 next_snap += 1.0
 
@@ -403,27 +429,24 @@ def _build_kernels(use_jit=True):
         for bi in range(FE.size):
             FE[bi] *= x_bins[bi]
 
-        # --- normalization: scale so ḡ at the outer cusp ≈ 1 ---
-        gbar = np.zeros_like(g_counts)
-        if n_snaps > 0:
-            for bi in range(g_counts.size):
-                if DX[bi] > 0.0:
-                    gbar[bi] = (g_counts[bi] / n_snaps) / DX[bi]
-
-        # pick first non-zero among the outer three bins
-        candidates = [0, 1, 2]  # 0.225, 0.303, 0.495
-        den = 0.0; wsum = 0.0
-        for ci in candidates:
-            if gbar[ci] > 0.0:
-                den += gbar[ci]; wsum += 1.0
+        # --- normalization: scale so ḡ at the true boundary x_b=0.2 ≈ 1 ---
+        # compute ḡ at the boundary per unit Δx around xb
+        dxb = DX[0]  # use first bin width as proxy
+        gbar_boundary = (g_boundary_sum / max(n_snaps, 1.0)) / max(dxb, 1e-30)
+        
+        # scale so ḡ(x_b) = 1
         s = 1.0
-        if wsum > 0.0:
-            s = 1.0 / (den / wsum)  # average ḡ over available outer bins
+        if gbar_boundary > 0.0:
+            s = 1.0 / gbar_boundary
 
         # Apply same scale to FE*x
         FE *= s
 
-        return FE
+        # Return diagnostic info for every 50th stream
+        if seed % 100 == 1:
+            return FE, caps, escapes, pericross, n_2d, n_1d, gbar_boundary, s
+        else:
+            return FE, 0, 0, 0, 0, 0, 0.0, 1.0
 
     return which_bin, P_of_x, T0, run_stream
 
@@ -433,9 +456,23 @@ def _worker(args):
         batch_ids, n_relax, floors, clones_per_split, stream_seeds, use_jit, _ = args
         which_bin, P_of_x, T0, run_stream = _build_kernels(use_jit=use_jit)
         FE_sum = np.zeros_like(X_BINS, dtype=np.float64)
+        diagnostic_info = []
         
         for sid in batch_ids:
-            FE_sum += run_stream(n_relax, floors, clones_per_split, X_BINS, DX, int(stream_seeds[sid]))
+            result = run_stream(n_relax, floors, clones_per_split, X_BINS, DX, int(stream_seeds[sid]))
+            if isinstance(result, tuple):
+                FE_sum += result[0]
+                if len(result) > 1 and result[1] > 0:  # Has diagnostic info
+                    diagnostic_info.append((int(stream_seeds[sid]), result[1], result[2], result[3], result[4], result[5], result[6], result[7]))
+            else:
+                FE_sum += result
+        
+        # Save diagnostic info to files
+        for seed, caps, escapes, pericross, n_2d, n_1d, gbar_boundary, s in diagnostic_info:
+            with open(f"diagnostic_stream_{seed}.txt", "w") as f:
+                f.write(f"Stream {seed}: {caps} captures, {escapes} escapes, {pericross} steps\n")
+                f.write(f"2D/RW fraction: {n_2d}/({n_1d}+{n_2d}) = {n_2d/(n_1d+n_2d) if (n_1d+n_2d) > 0 else 0}\n")
+                f.write(f"Normalization: gbar(x_b=0.2) = {gbar_boundary}, scale s = {s}\n")
         
         return FE_sum
     except Exception as e:
@@ -549,7 +586,6 @@ def main():
         )
 
         print(f"Simulation completed successfully!", file=sys.stderr)
-        print(f"Diagnostic: Check individual stream outputs for captures, escapes, and steps", file=sys.stderr)
         print("# x_center    FE_star_x  (dimensionless; Δx-normalized; per-stream global time; normalized ḡ(0.225)=1)")
         for xb, val in zip(X_BINS, FE):
             print(f"{xb:10.3g}  {val: .6e}")
