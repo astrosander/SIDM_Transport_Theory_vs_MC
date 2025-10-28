@@ -125,7 +125,7 @@ plt.annotate(r"$x_{\rm crit}=10$", xy=(10, 1e-1), xytext=(12, 2e-1),
 
 plt.xlabel(r"$X \equiv (-E/v_0^2)$")
 plt.ylabel(r"$\bar g(E),\  F_E^*\cdot X$")
-plt.title("Reproduction of Fig. 3 (canonical case: $x_{\\rm crit}=10,\\ x_D=10^4$)")
+# plt.title("Reproduction of Fig. 3 (canonical case: $x_{\\rm crit}=10,\\ x_D=10^4$)")
 plt.legend(loc="lower left", fontsize=9)
 plt.tight_layout()
 plt.savefig("figure3_repro.png")
