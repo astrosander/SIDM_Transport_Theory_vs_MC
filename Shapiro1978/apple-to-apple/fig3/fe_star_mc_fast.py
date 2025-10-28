@@ -68,7 +68,7 @@ J1 = np.array([
     [-5.03e-3,  5.40e-3,  2.54e-2,  6.95e-2,  1.75e-1],
     [-2.58e-4,  3.94e-4,  1.45e-3,  3.77e-3,  9.45e-3],
     [-4.67e-6,  2.03e-5,  5.99e-5,  1.53e-4,  3.82e-4],
-    [ 3.67e-8,  2.54e-4,  7.09e-7,  1.80e-6,  4.49e-6],
+    [ 3.67e-8,  2.54e-7,  7.09e-7,  1.80e-6,  4.49e-6],  # <-- fixed 2.54e-7
 ], dtype=np.float64)
 
 J2 = np.array([
@@ -76,7 +76,7 @@ J2 = np.array([
     [ 6.71e-2,  9.19e-2,  9.48e-2,  9.53e-2,  9.54e-2],
     [ 1.57e-2,  2.12e-2,  2.20e-2,  2.21e-2,  2.21e-2],
     [ 3.05e-3,  4.25e-3,  4.42e-3,  4.44e-3,  4.45e-3],
-    [ 3.07e-4,  4.59e-3,  4.78e-4,  4.81e-4,  4.82e-4],
+    [ 3.07e-4,  4.59e-4,  4.78e-4,  4.81e-4,  4.82e-4],  # <-- fixed 4.59e-4
 ], dtype=np.float64)
 
 ZETA2 = np.array([  # ζ*²
@@ -161,27 +161,27 @@ def _build_kernels(use_jit=True):
         jmin = j_min_of_x(x)
         nmax = 1e30
 
-        # (29a)  sqrt(n)*e2 <= 0.15*|E|   with x=-E
+        # (29a)  sqrt(n)*e2 <= 0.15*|E|  (x = -E)
         if e2v > 0.0:
-            v = (0.15*abs(x)/max(e2v,1e-30))**2
+            v = (0.15*abs(x) / max(e2v, 1e-30))**2
             if v < nmax: nmax = v
 
         if j2v > 0.0:
             # (29b)  |ΔJ|_rms <= 0.10   (ABSOLUTE cap; do NOT divide by j)
-            v = (0.10/j2v)**2
+            v = (0.10 / j2v)**2
             if v < nmax: nmax = v
 
             # (29c)  |ΔJ|_rms <= 0.40*(1.0075 − j)   (linear distance to circular)
-            v = (0.40*max(1.0075 - j, 0.0)/j2v)**2
+            v = (0.40 * max(1.0075 - j, 0.0) / j2v)**2
             if v < nmax: nmax = v
 
             # (29d)  |ΔJ|_rms <= max(|0.25*j − jmin|, 0.10*jmin)
-            floor = max(abs(0.25*j - jmin), 0.10*jmin)
+            floor = max(abs(0.25*j - jmin), 0.10 * jmin)
             if floor > 0.0:
-                v = (floor/j2v)**2
+                v = (floor / j2v)**2
                 if v < nmax: nmax = v
 
-        # choose n; tiny safety floor
+        # choose n; tiny safety floor to avoid zero
         n = nmax if nmax > 1e-8 else 1e-8
         return n
 
@@ -249,7 +249,7 @@ def _build_kernels(use_jit=True):
         w = 1.0
 
         # clone pool
-        MAX_CLONES = 256
+        MAX_CLONES = 2048
         cx  = np.zeros(MAX_CLONES, dtype=np.float64)
         cj  = np.zeros(MAX_CLONES, dtype=np.float64)
         cph = np.zeros(MAX_CLONES, dtype=np.float64)
@@ -368,18 +368,23 @@ def _build_kernels(use_jit=True):
         for bi in range(FE.size):
             FE[bi] *= x_bins[bi]
 
-        # --- normalization: scale so ḡ(0.225) ≈ 1 (paper uses g(Eb)=1) ---
-        # build ḡ(x) from snapshots and Δx
+        # --- normalization: scale so ḡ at the outer cusp ≈ 1 ---
         gbar = np.zeros_like(g_counts)
         if n_snaps > 0:
             for bi in range(g_counts.size):
                 if DX[bi] > 0.0:
                     gbar[bi] = (g_counts[bi] / n_snaps) / DX[bi]
-        # use first bin (0.225) for normalization proxy of g(Eb)=1
-        norm_idx = 0
+
+        # pick first non-zero among the outer three bins
+        candidates = [0, 1, 2]  # 0.225, 0.303, 0.495
+        den = 0.0; wsum = 0.0
+        for ci in candidates:
+            if gbar[ci] > 0.0:
+                den += gbar[ci]; wsum += 1.0
         s = 1.0
-        if gbar[norm_idx] > 0.0:
-            s = 1.0 / gbar[norm_idx]
+        if wsum > 0.0:
+            s = 1.0 / (den / wsum)  # average ḡ over available outer bins
+
         # Apply same scale to FE*x
         FE *= s
 
