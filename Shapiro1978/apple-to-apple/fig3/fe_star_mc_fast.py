@@ -421,32 +421,9 @@ def _build_kernels(use_jit=True):
                 n_snaps += 1
                 next_snap += 1.0
 
-        # raw differential rate per x (per t0), then multiply by x
-        FE = np.zeros_like(captures)
-        for bi in range(captures.size):
-            if DX[bi] > 0.0:
-                FE[bi] = captures[bi] / (n_relax * DX[bi])
-        for bi in range(FE.size):
-            FE[bi] *= x_bins[bi]
-
-        # --- normalization: scale so ḡ at the true boundary x_b=0.2 ≈ 1 ---
-        # compute ḡ at the boundary per unit Δx around xb
-        dxb = DX[0]  # use first bin width as proxy
-        gbar_boundary = (g_boundary_sum / max(n_snaps, 1.0)) / max(dxb, 1e-30)
-        
-        # scale so ḡ(x_b) = 1
-        s = 1.0
-        if gbar_boundary > 0.0:
-            s = 1.0 / gbar_boundary
-
-        # Apply same scale to FE*x
-        FE *= s
-
-        # Return diagnostic info for every 50th stream
-        if seed % 100 == 1:
-            return FE, caps, escapes, pericross, n_2d, n_1d, gbar_boundary, s
-        else:
-            return FE, 0, 0, 0, 0, 0, 0.0, 1.0
+        # --- return raw tallies; NO normalization here ---
+        # captures: counts per x-bin (weighted); g_counts: snapshot weights per x-bin; n_snaps: #snapshots
+        return captures, g_counts, n_snaps
 
     return which_bin, P_of_x, T0, run_stream
 
@@ -455,29 +432,22 @@ def _worker(args):
     try:
         batch_ids, n_relax, floors, clones_per_split, stream_seeds, use_jit, _ = args
         which_bin, P_of_x, T0, run_stream = _build_kernels(use_jit=use_jit)
-        FE_sum = np.zeros_like(X_BINS, dtype=np.float64)
-        diagnostic_info = []
-        
+        cap_sum  = np.zeros_like(X_BINS, dtype=np.float64)
+        g_sum    = np.zeros_like(X_BINS, dtype=np.float64)
+        snap_sum = 0.0
+
         for sid in batch_ids:
-            result = run_stream(n_relax, floors, clones_per_split, X_BINS, DX, int(stream_seeds[sid]))
-            if isinstance(result, tuple):
-                FE_sum += result[0]
-                if len(result) > 1 and result[1] > 0:  # Has diagnostic info
-                    diagnostic_info.append((int(stream_seeds[sid]), result[1], result[2], result[3], result[4], result[5], result[6], result[7]))
-            else:
-                FE_sum += result
-        
-        # Save diagnostic info to files
-        for seed, caps, escapes, pericross, n_2d, n_1d, gbar_boundary, s in diagnostic_info:
-            with open(f"diagnostic_stream_{seed}.txt", "w") as f:
-                f.write(f"Stream {seed}: {caps} captures, {escapes} escapes, {pericross} steps\n")
-                f.write(f"2D/RW fraction: {n_2d}/({n_1d}+{n_2d}) = {n_2d/(n_1d+n_2d) if (n_1d+n_2d) > 0 else 0}\n")
-                f.write(f"Normalization: gbar(x_b=0.2) = {gbar_boundary}, scale s = {s}\n")
-        
-        return FE_sum
+            cap_i, g_i, n_snaps_i = run_stream(n_relax, floors, clones_per_split, X_BINS, DX, int(stream_seeds[sid]))
+            cap_sum += cap_i
+            g_sum   += g_i
+            snap_sum += float(n_snaps_i)
+
+        # return a tuple
+        return cap_sum, g_sum, snap_sum
     except Exception as e:
         print(f"Worker error: {e}", file=sys.stderr)
-        return np.zeros_like(X_BINS, dtype=np.float64)
+        z = np.zeros_like(X_BINS, dtype=np.float64)
+        return z, z, 0.0
 
 # ---------------- parallel driver ----------------
 def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
@@ -517,7 +487,9 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
         
         print(f"Starting {n_streams} streams across {procs} processes...", file=sys.stderr)
 
-    FE_total = np.zeros_like(X_BINS, dtype=np.float64)
+    cap_total  = np.zeros_like(X_BINS, dtype=np.float64)
+    g_total    = np.zeros_like(X_BINS, dtype=np.float64)
+    snap_total = 0.0
     try:
         with cf.ProcessPoolExecutor(max_workers=procs) as ex:
             futs = [ex.submit(_worker, (batch, n_relax, floors, clones_per_split, stream_seeds, use_jit, None))
@@ -526,7 +498,10 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
             # Monitor progress
             if show_progress:
                 for i, f in enumerate(cf.as_completed(futs)):
-                    FE_total += f.result()
+                    cap_b, g_b, snap_b = f.result()
+                    cap_total  += cap_b
+                    g_total    += g_b
+                    snap_total += snap_b
                     completed_streams += len(batches[i])
                     
                     # Update progress display
@@ -543,7 +518,10 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
                         last_update = current_time
             else:
                 for f in cf.as_completed(futs):
-                    FE_total += f.result()
+                    cap_b, g_b, snap_b = f.result()
+                    cap_total  += cap_b
+                    g_total    += g_b
+                    snap_total += snap_b
                     
     except KeyboardInterrupt:
         if show_progress:
@@ -554,8 +532,42 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
             elapsed_total = time.time() - start_time
             print(f"\nCompleted {completed_streams}/{n_streams} streams in {elapsed_total:.1f}s", file=sys.stderr)
 
-    FE_mean = FE_total / float(n_streams) if n_streams>0 else np.zeros_like(X_BINS)
-    return FE_mean
+    # ---- compute FE*(x)*x from raw totals (no per-stream scaling) ----
+    # FE(x) = captures / (n_streams * n_relax * Δx)
+    FE = np.zeros_like(X_BINS, dtype=np.float64)
+    denom = float(n_streams) * float(n_relax)
+    for bi in range(X_BINS.size):
+        if DX[bi] > 0.0 and denom > 0.0:
+            FE[bi] = cap_total[bi] / (denom * DX[bi])
+
+    FE_x = FE * X_BINS  # what Fig. 3 plots
+
+    # ---- build global ḡ(x) from snapshots and normalize at boundary ----
+    gbar = np.zeros_like(X_BINS, dtype=np.float64)
+    if snap_total > 0.0:
+        for bi in range(X_BINS.size):
+            if DX[bi] > 0.0:
+                gbar[bi] = (g_total[bi] / snap_total) / DX[bi]
+
+    # find the bin that contains x_b = 0.2 by edges
+    norm_idx = 0
+    for i in range(X_EDGES.size - 1):
+        if (X_EDGES[i] <= X_BOUND) and (X_BOUND < X_EDGES[i+1]):
+            norm_idx = i
+            break
+
+    scale = 1.0
+    if gbar[norm_idx] > 0.0:
+        scale = 1.0 / gbar[norm_idx]
+
+    FE_x *= scale
+
+    # Debug normalization info
+    print(f"[norm] bin at x_b=0.2 is index {norm_idx} (center {X_BINS[norm_idx]:.3g}), "
+          f"gbar={gbar[norm_idx]:.3e}, scale={scale:.3g}", file=sys.stderr)
+    print(f"[norm] total captures: {cap_total.sum():.0f}, max single bin: {cap_total.max():.0f}", file=sys.stderr)
+
+    return FE_x
 
 # ---------------- CLI ----------------
 def main():
