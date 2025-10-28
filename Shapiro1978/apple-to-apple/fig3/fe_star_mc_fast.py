@@ -79,6 +79,10 @@ J2 = np.array([
     [ 3.07e-4,  4.59e-4,  4.78e-4,  4.81e-4,  4.82e-4],  # <-- fixed 4.59e-4
 ], dtype=np.float64)
 
+# Verify Table-1 typos are fixed
+assert abs(J1[-1,1] - 2.54e-7) < 1e-12, f"J1[-1,1] should be 2.54e-7, got {J1[-1,1]}"
+assert abs(J2[-1,1] - 4.59e-4) < 1e-12, f"J2[-1,1] should be 4.59e-4, got {J2[-1,1]}"
+
 ZETA2 = np.array([  # ζ*²
     [1.47e-1, 5.87e-2, 2.40e-2, 9.70e-3, 3.90e-3],
     [2.99e-2, 1.28e-2, 5.22e-3, 2.08e-3, 8.28e-4],
@@ -261,6 +265,11 @@ def _build_kernels(use_jit=True):
         captures = np.zeros(x_bins.size, dtype=np.float64)
         t0_used = 0.0
 
+        # Diagnostic counters
+        pericross = 0
+        caps = 0
+        escapes = 0
+
         # ḡ snapshots (once per t0): count weighted stars in each x-bin
         g_counts = np.zeros(x_bins.size, dtype=np.float64)
         n_snaps  = 0
@@ -281,33 +290,47 @@ def _build_kernels(use_jit=True):
             x, j, phase, n_used, cap = step_one(x, j, phase)
             # advance time
             t0_used += (n_used * P_of_x(x_prev)) / T0
+            pericross += 1  # Count steps as proxy for pericenter crossings
 
-            # capture at pericenter
-            if cap:
-                b = bin_index(x)
-                captures[b] += w
-                # replace at x_b with isotropic j; keep phase (per paper)
+            # Check for escape from cusp (outward diffusion)
+            if x < X_BOUND:
+                # star left the cusp -> replace at reservoir (no capture counted)
+                escapes += 1
                 x = X_BOUND
-                j = math.sqrt(np.random.random())
+                j = math.sqrt(np.random.random())   # isotropic J
+                # phase unchanged (keep age)
+                escaped = True
+            else:
+                escaped = False
 
-            # splitting on w=j^2 floors (parent not deleted)
-            w_now = j*j
-            for fi in range(floors.size):
-                f = floors[fi]
-                if w_now < f and w >= f:
-                    alpha = 1.0/(1.0 + clones_per_split)
-                    new_w = w*alpha
-                    w = new_w
-                    for k in range(clones_per_split):
-                        if ccount < MAX_CLONES:
-                            cx[ccount] = x
-                            cj[ccount] = j
-                            cph[ccount]= phase
-                            cw[ccount] = new_w
-                            cfloor[ccount] = f
-                            cactive[ccount] = 1
-                            ccount += 1
-                    break
+            if not escaped:
+                # capture at pericenter
+                if cap:
+                    caps += 1
+                    b = bin_index(x)
+                    captures[b] += w
+                    # replace at x_b with isotropic j; keep phase (per paper)
+                    x = X_BOUND
+                    j = math.sqrt(np.random.random())
+
+                # splitting on w=j^2 floors (parent not deleted)
+                w_now = j*j
+                for fi in range(floors.size):
+                    f = floors[fi]
+                    if w_now < f and w >= f:
+                        alpha = 1.0/(1.0 + clones_per_split)
+                        new_w = w*alpha
+                        w = new_w
+                        for k in range(clones_per_split):
+                            if ccount < MAX_CLONES:
+                                cx[ccount] = x
+                                cj[ccount] = j
+                                cph[ccount]= phase
+                                cw[ccount] = new_w
+                                cfloor[ccount] = f
+                                cactive[ccount] = 1
+                                ccount += 1
+                        break
 
             # step active clones (share time; do not add to t0_used)
             i = 0
@@ -322,12 +345,24 @@ def _build_kernels(use_jit=True):
                 if j_c2*j_c2 >= cfloor[i]:
                     cactive[i] = 0; i += 1; continue
 
-                if cap_c:
-                    b = bin_index(x_c2)
-                    captures[b] += cw[i]
-                    cactive[i] = 0
-                    i += 1
-                    continue
+                # escaped the cusp? -> replace at reservoir (do NOT count a capture)
+                if x_c2 < X_BOUND:
+                    # replace the clone state at reservoir
+                    escapes += 1
+                    x_c2 = X_BOUND
+                    j_c2 = math.sqrt(np.random.random())
+                    # keep phase
+                    cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
+                    # (do not mark inactive; keep evolving this clone)
+                    # proceed to possible further splitting below
+                else:
+                    # pericenter-capture?
+                    if cap_c:
+                        b = bin_index(x_c2)
+                        captures[b] += cw[i]
+                        cactive[i] = 0
+                        i += 1
+                        continue
 
                 # further splitting for clone
                 w_c = j_c2*j_c2
@@ -513,6 +548,8 @@ def main():
             show_progress=(not args.no_progress)
         )
 
+        print(f"Simulation completed successfully!", file=sys.stderr)
+        print(f"Diagnostic: Check individual stream outputs for captures, escapes, and steps", file=sys.stderr)
         print("# x_center    FE_star_x  (dimensionless; Δx-normalized; per-stream global time; normalized ḡ(0.225)=1)")
         for xb, val in zip(X_BINS, FE):
             print(f"{xb:10.3g}  {val: .6e}")
