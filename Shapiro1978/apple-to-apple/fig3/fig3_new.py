@@ -126,6 +126,9 @@ def choose_n(x, j, e2_val, j2_val, jmin):
     n = min(bounds) if bounds else 1.0
     return max(1e-6, min(1.0, n))
 
+# ------------------------- Reservoir parameters -------------------------
+X_RES_MIN, X_RES_MAX = 0.33, 0.38  # reservoir window near outer boundary
+
 # ------------------------- BW-II Table-1: g0(ln(1+x)) births -------------------------
 ln1p = np.array([
     0.00, 0.37, 0.74, 1.11, 1.47, 1.84, 2.21, 2.58, 2.95, 3.32,
@@ -145,17 +148,31 @@ y_edges[0]    = max(0.0, ln1p[0] - 0.5*(ln1p[1]-ln1p[0]))
 y_edges[-1]   = min(9.21, ln1p[-1] + 0.5*(ln1p[-1]-ln1p[-2]))
 dy = y_edges[1:] - y_edges[:-1]
 w  = np.maximum(g0_tab, 0.0) * np.maximum(dy, 0.0)
-cumw = np.cumsum(w); totw = cumw[-1]
+
+# Truncate g0 sampling at reservoir minimum and renormalize
+y_res_min = math.log(1.0 + X_RES_MIN)
+mask_res = y_edges[:-1] >= y_res_min
+w_res = w.copy()
+w_res[~mask_res] = 0.0
+cumw_res = np.cumsum(w_res); totw_res = cumw_res[-1]
 
 def sample_birth_x():
-    u = rng.random() * totw
-    k = int(np.searchsorted(cumw, u))
+    """Sample x from reservoir window (0.33-0.38) for replacements."""
+    return X_RES_MIN + (X_RES_MAX - X_RES_MIN) * rng.random()
+
+def sample_birth_x_from_g0():
+    """Sample x from truncated g0 distribution (x >= 0.33)."""
+    if totw_res <= 0:
+        return sample_birth_x()  # fallback to reservoir window
+    
+    u = rng.random() * totw_res
+    k = int(np.searchsorted(cumw_res, u))
     k = max(0, min(k, len(dy)-1))
     # uniform within the y-bin
     y0, y1 = y_edges[k], y_edges[k+1]
-    y = y0 + (y1 - y0) * rng.random() if w[k] > 0 else 0.5*(y0+y1)
+    y = y0 + (y1 - y0) * rng.random() if w_res[k] > 0 else 0.5*(y0+y1)
     x = math.exp(y) - 1.0
-    return min(max(x, 1e-6), 1.0e4)
+    return min(max(x, X_RES_MIN), 1.0e4)
 
 def sample_birth_j():
     # isotropic: j = sqrt(U), pdf f(j)=2j
@@ -196,8 +213,8 @@ def keep_star(star):
 # ------------------------- Simulate ONE non-clone stream -------------------------
 def run_one_stream(n_relax: float, max_iters: int = 10_000_000):
     """Return (captures_per_bin, elapsed_t0_stream)."""
-    # parent star (non-clone)
-    parent = Star(sample_birth_x(), sample_birth_j(), w=1.0, is_clone=False)
+    # parent star (non-clone) - use g0 distribution for initial birth
+    parent = Star(sample_birth_x_from_g0(), sample_birth_j(), w=1.0, is_clone=False)
     clones = []  # list[Star]
     captures = np.zeros_like(x_bins, dtype=float)
     t_stream = 0.0  # in units of t0
@@ -215,6 +232,14 @@ def run_one_stream(n_relax: float, max_iters: int = 10_000_000):
 
         # Time increment for THIS stream (clones share it; they do not add)
         dt0 = (n_p * P_of_x(parent.x)) / T0
+        
+        # Guard against huge dt0 steps that destabilize the random walk
+        if dt0 > 0.05:
+            # substep to keep per-iteration time increments tame
+            m = math.ceil(dt0 / 0.05)
+            n_p /= m
+            dt0 /= m
+        
         t_stream += dt0
 
         # Apply parent kicks
@@ -309,8 +334,9 @@ def run_mc(n_nonclone=200, n_relax=6.0):
 
 # ------------------------- Main -------------------------
 if __name__ == "__main__":
-    FE_star_x, captures, total_t0 = run_mc(n_nonclone=40, n_relax=6.0)
+    FE_star_x, captures, total_t0 = run_mc(n_nonclone=300, n_relax=6.0)
     print("# x_center    FE_star_x  (dimensionless; Δx-normalized; per-stream time)")
     for x, y in zip(x_bins, FE_star_x):
         print(f"{x:10.3g}  {y: .6e}")
     print(f"\n# Debug: total_time_t0 (sum over streams) = {total_t0:.6f}, total weighted captures = {captures.sum():.6f}")
+    print(f"# Reservoir window: x ∈ [{X_RES_MIN:.3f}, {X_RES_MAX:.3f}]")
