@@ -48,6 +48,21 @@ gbar     = np.array([r[1] for r in rows], dtype=float)
 gbar_err = np.array([r[2] for r in rows], dtype=float)
 Fstar    = np.array([sci(r[3]) if r[3] is not None else np.nan for r in rows], dtype=float)
 Fstar_err= np.array([sci(r[4]) if r[4] is not None else np.nan for r in rows], dtype=float)
+# New data to replace F_E^*\cdot X
+new_data_x = np.array([
+    0.225, 0.303, 0.495, 1.04, 1.26, 1.62, 2.35, 5.0, 7.2, 8.94,
+    12.1, 19.7, 41.6, 50.3, 64.6, 93.6, 198, 287, 356, 480,
+    784, 1650, 2000, 2570, 3730
+], dtype=float)
+
+new_data_y = np.array([
+    0.000000e+00, 3.214348e-04, 5.321495e-04, 1.558334e-04, 5.422527e-04,
+    3.610911e-03, 7.038733e-04, 4.041021e-02, 1.230824e-01, 2.114299e-01,
+    1.914627e-01, 2.353178e-01, 1.387421e-01, 1.218783e-01, 6.558564e-03,
+    2.027822e-01, 1.329827e-02, 2.959764e-03, 2.431357e-03, 1.675451e-04,
+    9.579539e-05, 1.555108e-04, 0.000000e+00, 0.000000e+00, 0.000000e+00
+], dtype=float)
+
 FE_x     = Fstar * x_vals
 FE_x_err = Fstar_err * x_vals
 
@@ -94,6 +109,7 @@ if tail.any():
 # ---- Save CSVs ----
 pd.DataFrame({"x": x_vals, "gbar": gbar, "gbar_err": gbar_err}).to_csv("/mnt/data/figure3_gbar.csv", index=False)
 pd.DataFrame({"x": x_vals, "Fstar": Fstar, "Fstar_err": Fstar_err, "FE_x": FE_x, "FE_x_err": FE_x_err}).to_csv("/mnt/data/figure3_FEx.csv", index=False)
+pd.DataFrame({"x": new_data_x, "y": new_data_y}).to_csv("/mnt/data/figure3_new_data.csv", index=False)
 pd.DataFrame({"x": X_line, "g0": g0_line}).to_csv("/mnt/data/figure3_g0_curve.csv", index=False)
 
 # ---- Plot ----
@@ -116,16 +132,22 @@ large = mask_f & (rel_err >= 0.6)
 small = mask_f & ~large
 
 plt.errorbar(x_vals[small], FE_x[small], yerr=FE_x_err[small],
-             fmt="s", markersize=4, capsize=2, label=r"$F_E^*\cdot X$")
+             fmt="s", markersize=4, capsize=2, label=r"$F_E^*\cdot X$ (table)")
 plt.errorbar(x_vals[large], FE_x[large], yerr=FE_x_err[large],
              fmt="s", mfc="none", markersize=5, capsize=2, label="large-error points")
 
-plt.annotate(r"$x_{\rm crit}=10$", xy=(10, 1e-1), xytext=(12, 2e-1),
-             arrowprops=dict(arrowstyle="->", lw=1))
+# Plot new data alongside F_E^*\cdot X
+mask_new = new_data_y > 0  # Only plot non-zero values
+plt.scatter(new_data_x[mask_new], new_data_y[mask_new], 
+            s=30, marker="^", label="$F_E^*\cdot X$ (MC)", alpha=0.7, color="red")
+
+# plt.annotate(r"$x_{\rm crit}=10$", xy=(10, 1e-1), xytext=(12, 2e-1),
+#              arrowprops=dict(arrowstyle="->", lw=1))
 
 plt.xlabel(r"$X \equiv (-E/v_0^2)$")
-plt.ylabel(r"$\bar g(E),\  F_E^*\cdot X$")
+plt.ylabel(r"$\bar g(E),\  F_E^*\cdot X$, MC")
 # plt.title("Reproduction of Fig. 3 (canonical case: $x_{\\rm crit}=10,\\ x_D=10^4$)")
 plt.legend(loc="lower left", fontsize=9)
 plt.tight_layout()
 plt.savefig("figure3_repro.png")
+plt.show()
