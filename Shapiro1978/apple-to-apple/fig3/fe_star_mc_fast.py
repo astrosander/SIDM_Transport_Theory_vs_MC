@@ -240,6 +240,16 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
         return y1, y2
 
     @njit(**fastmath)
+    def floor_index_for_j2(j2, floors):
+        # return the deepest floor index k such that j2 < floors[k]
+        # if j2 >= floors[0], return -1 (above the top floor)
+        k = -1
+        for i in range(floors.size):
+            if j2 < floors[i]:
+                k = i
+        return k
+
+    @njit(**fastmath)
     def step_one(x, j, phase, cone_gamma_val):
         e1, e2v, j1v, j2v, z2v = bilinear_coeffs(x, j)
         n_raw = pick_n(x, j, e2v, j2v, cone_gamma_val)
@@ -287,15 +297,16 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
         x = x_init
         j = math.sqrt(np.random.random())  # isotropic j
         phase = 0.0
-        w = 1.0
+        w = 1.0  # statistical weight
+        parent_floor_idx = floor_index_for_j2(j*j, floors)  # -1 if above floors[0]
 
-        # clone pool
+        # clone pool (use floor indices, not floor values)
         MAX_CLONES = 512
         cx  = np.zeros(MAX_CLONES, dtype=np.float64)
         cj  = np.zeros(MAX_CLONES, dtype=np.float64)
         cph = np.zeros(MAX_CLONES, dtype=np.float64)
         cw  = np.zeros(MAX_CLONES, dtype=np.float64)
-        cfloor = np.zeros(MAX_CLONES, dtype=np.float64)
+        cfloor_idx = np.full(MAX_CLONES, -1, dtype=np.int32)
         cactive = np.zeros(MAX_CLONES, dtype=np.uint8)
         ccount = 0
 
@@ -322,28 +333,34 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                 # recycle parent at reservoir (keep weight)
                 x = X_BOUND
                 j = math.sqrt(np.random.random())
+                parent_floor_idx = floor_index_for_j2(j*j, floors)
             elif x < X_BOUND:
                 x = X_BOUND
                 j = math.sqrt(np.random.random())
+                parent_floor_idx = floor_index_for_j2(j*j, floors)
+            else:
+                # splitting for parent: split only when entering a new deeper floor
+                j2_now = j*j
+                target_idx = floor_index_for_j2(j2_now, floors)
+                
+                # If we just crossed deeper floors, process each newly-entered floor once.
+                while parent_floor_idx < target_idx:
+                    parent_floor_idx += 1  # we are now in this deeper floor
 
-            # splitting for parent
-            w_now = j*j
-            for fi in range(floors.size):
-                f = floors[fi]
-                if w_now < f and w >= f:
-                    alpha = 1.0/(1.0 + clones_per_split)
-                    w = w * alpha
-                    for k in range(clones_per_split):
-                        if ccount >= MAX_CLONES:
-                            break
-                        cx[ccount] = x
-                        cj[ccount] = j
-                        cph[ccount]= phase
-                        cw[ccount] = w
-                        cfloor[ccount] = f
-                        cactive[ccount] = 1
-                        ccount += 1
-                    break
+                    # Split only if we can spawn the full batch.
+                    if ccount <= MAX_CLONES - clones_per_split:
+                        alpha = 1.0 / (1.0 + clones_per_split)
+                        new_w = w * alpha
+                        w = new_w  # parent keeps one share
+                        for k in range(clones_per_split):
+                            cx[ccount] = x
+                            cj[ccount] = j
+                            cph[ccount]= phase
+                            cw[ccount] = new_w
+                            cfloor_idx[ccount] = parent_floor_idx
+                            cactive[ccount] = 1
+                            ccount += 1
+                    # else: capacity reached → do NOT change weight, just continue
 
             # evolve clones without tally
             i = 0
@@ -359,7 +376,8 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                     cx[i]  = X_BOUND
                     cj[i]  = math.sqrt(np.random.random())
                     cph[i] = ph_c2
-                    cfloor[i] = floors[0]
+                    # set its current floor index at birth
+                    cfloor_idx[i] = floor_index_for_j2(cj[i]*cj[i], floors)
                     cactive[i] = 1
                     i += 1
                     continue
@@ -368,29 +386,35 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                     x_c2 = X_BOUND
                     j_c2 = math.sqrt(np.random.random())
                     cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
+                    cfloor_idx[i] = floor_index_for_j2(j_c2*j_c2, floors)
 
-                if j_c2*j_c2 >= cfloor[i]:
-                    cactive[i] = 0
-                    i += 1
-                    continue
+                # outward across its own floor -> remove
+                if cfloor_idx[i] >= 0:
+                    if j_c2*j_c2 >= floors[cfloor_idx[i]]:
+                        cactive[i] = 0
+                        i += 1
+                        continue
 
-                w_c = j_c2*j_c2
-                for fi in range(floors.size):
-                    f = floors[fi]
-                    if w_c < f and cw[i] >= f:
-                        alpha = 1.0/(1.0 + clones_per_split)
-                        cw[i] = cw[i] * alpha
+                # deeper splitting for clone: split only when entering a new deeper floor
+                j2_c = j_c2 * j_c2
+                target_idx_c = floor_index_for_j2(j2_c, floors)
+                
+                while cfloor_idx[i] < target_idx_c:
+                    cfloor_idx[i] += 1  # deeper floor reached
+
+                    if ccount <= MAX_CLONES - clones_per_split:
+                        alpha = 1.0 / (1.0 + clones_per_split)
+                        new_w = cw[i] * alpha
+                        cw[i] = new_w  # existing clone keeps one share
                         for k in range(clones_per_split):
-                            if ccount >= MAX_CLONES:
-                                break
                             cx[ccount] = x_c2
                             cj[ccount] = j_c2
                             cph[ccount]= ph_c2
-                            cw[ccount] = cw[i]
-                            cfloor[ccount] = f
+                            cw[ccount] = new_w
+                            cfloor_idx[ccount] = cfloor_idx[i]
                             cactive[ccount] = 1
                             ccount += 1
-                        break
+                    # else: capacity reached → no split, no weight change
                 i += 1
 
         # ---------- (2) zero tallies; start measurement window ----------
@@ -431,6 +455,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                     debug_flag = 1
                 x = X_BOUND                 # replace at reservoir
                 j = math.sqrt(np.random.random())
+                parent_floor_idx = floor_index_for_j2(j*j, floors)
 
             else:
                 # 2) outward escape replacement
@@ -438,25 +463,30 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                     escapes += 1
                     x = X_BOUND
                     j = math.sqrt(np.random.random())  # keep phase
+                    parent_floor_idx = floor_index_for_j2(j*j, floors)
+                else:
+                    # 3) split on j^2 floors *after* cap/escape: split only when entering a new deeper floor
+                    j2_now = j*j
+                    target_idx = floor_index_for_j2(j2_now, floors)
+                    
+                    # If we just crossed deeper floors, process each newly-entered floor once.
+                    while parent_floor_idx < target_idx:
+                        parent_floor_idx += 1  # we are now in this deeper floor
 
-            # 3) split on w=j^2 floors *after* cap/escape
-            w_now = j*j
-            for fi in range(floors.size):
-                f = floors[fi]
-                if w_now < f and w >= f:
-                    alpha = 1.0/(1.0 + clones_per_split)
-                    w = w * alpha
-                    for k in range(clones_per_split):
-                        if ccount >= MAX_CLONES:
-                            break
-                        cx[ccount] = x
-                        cj[ccount] = j
-                        cph[ccount]= phase
-                        cw[ccount] = w
-                        cfloor[ccount] = f
-                        cactive[ccount] = 1
-                        ccount += 1
-                    break
+                        # Split only if we can spawn the full batch.
+                        if ccount <= MAX_CLONES - clones_per_split:
+                            alpha = 1.0 / (1.0 + clones_per_split)
+                            new_w = w * alpha
+                            w = new_w  # parent keeps one share
+                            for k in range(clones_per_split):
+                                cx[ccount] = x
+                                cj[ccount] = j
+                                cph[ccount]= phase
+                                cw[ccount] = new_w
+                                cfloor_idx[ccount] = parent_floor_idx
+                                cactive[ccount] = 1
+                                ccount += 1
+                        # else: capacity reached → do NOT change weight, just continue
 
             # step active clones (share time; do not add to t0_used)
             i = 0
@@ -482,8 +512,8 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                     cx[i]  = X_BOUND
                     cj[i]  = math.sqrt(np.random.random())  # isotropic j
                     cph[i] = ph_c2                           # shares parent time
-                    # Reset its floor to the outermost so it can split again
-                    cfloor[i] = floors[0]                    # (=1.0)
+                    # set its current floor index at birth
+                    cfloor_idx[i] = floor_index_for_j2(cj[i]*cj[i], floors)
                     cactive[i] = 1
                     i += 1
                     continue
@@ -494,38 +524,43 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                     x_c2 = X_BOUND
                     j_c2 = math.sqrt(np.random.random())
                     cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
+                    cfloor_idx[i] = floor_index_for_j2(j_c2*j_c2, floors)
 
-                # 3) floor removal last (don't suppress a capture)
-                if j_c2*j_c2 >= cfloor[i]:
-                    cactive[i] = 0
-                    i += 1
-                    continue
+                # 3) floor removal last (don't suppress a capture): outward across its own floor -> remove
+                if cfloor_idx[i] >= 0:
+                    if j_c2*j_c2 >= floors[cfloor_idx[i]]:
+                        cactive[i] = 0
+                        i += 1
+                        continue
 
-                # 4) clone splitting
-                w_c = j_c2*j_c2
-                for fi in range(floors.size):
-                    f = floors[fi]
-                    if w_c < f and cw[i] >= f:
-                        alpha = 1.0/(1.0 + clones_per_split)
-                        cw[i] = cw[i] * alpha
+                # 4) clone splitting: split only when entering a new deeper floor
+                j2_c = j_c2 * j_c2
+                target_idx_c = floor_index_for_j2(j2_c, floors)
+                
+                while cfloor_idx[i] < target_idx_c:
+                    cfloor_idx[i] += 1  # deeper floor reached
+
+                    if ccount <= MAX_CLONES - clones_per_split:
+                        alpha = 1.0 / (1.0 + clones_per_split)
+                        new_w = cw[i] * alpha
+                        cw[i] = new_w  # existing clone keeps one share
                         for k in range(clones_per_split):
-                            if ccount >= MAX_CLONES:
-                                break
                             cx[ccount] = x_c2
                             cj[ccount] = j_c2
                             cph[ccount]= ph_c2
-                            cw[ccount] = cw[i]
-                            cfloor[ccount] = f
+                            cw[ccount] = new_w
+                            cfloor_idx[ccount] = cfloor_idx[i]
                             cactive[ccount] = 1
                             ccount += 1
-                        break
+                    # else: capacity reached → no split, no weight change
                 i += 1
 
         # --- return raw tallies; NO normalization here ---
         # captures: counts per x-bin (weighted); g_time: time-weighted occupancy; total_t0: total time
         # sanity check: did we actually count captures?
         did_count = 1.0 if captures.sum() > 0.0 else 0.0
-        return captures, g_time, total_t0, crosses, caps, did_count
+        # diagnostic: clone capacity high-water mark
+        return captures, g_time, total_t0, crosses, caps, did_count, ccount
 
     return which_bin, P_of_x, T0, run_stream
 
@@ -580,8 +615,9 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
             
             completed = 0
             zero_count_streams = 0
+            max_ccount = 0
             for f in cf.as_completed(futs):
-                cap_b, gtime_b, t0_b, peri_b, caps_b, did_count_b = f.result()
+                cap_b, gtime_b, t0_b, peri_b, caps_b, did_count_b, ccount_b = f.result()
                 cap_total  += cap_b
                 gtime_total+= gtime_b
                 t0_total   += t0_b
@@ -589,6 +625,8 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
                 caps_total += caps_b
                 if did_count_b == 0.0:
                     zero_count_streams += 1
+                if ccount_b > max_ccount:
+                    max_ccount = ccount_b
                 completed += 1
                 
                 if show_progress:
@@ -608,33 +646,31 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
             elapsed_total = time.time() - start_time
             print(f"\nCompleted {completed}/{n_streams} streams in {elapsed_total:.1f}s", file=sys.stderr)
 
-    # ---- FE from capture histogram ----
-    denom = float(n_streams) * float(n_relax)
+    # --- FE*(x) from weighted capture counts (no extra scaling by gbar) ---
     FE = np.zeros_like(X_BINS)
-    np.divide(cap_total, denom*DX, out=FE, where=(DX>0))
+    np.divide(cap_total, (n_streams * n_relax) * DX, out=FE, where=(DX > 0))
     FE_x = FE * X_BINS
 
-    # ---- ḡ(x) from *time-weighted* occupancy ----
+    # --- OPTIONAL: compute gbar(x) only for diagnostics (not used to scale FE) ---
     gbar = np.zeros_like(X_BINS)
     if t0_total > 0.0:
         tmp = gtime_total / t0_total
-        np.divide(tmp, DX, out=gbar, where=(DX>0))
+        np.divide(tmp, DX, out=gbar, where=(DX > 0))
 
-    # boundary bin containing x_b = 0.2 (by edges)
+    # boundary index from edges
     norm_idx = 0
     for i in range(X_EDGES.size-1):
         if X_EDGES[i] <= X_BOUND < X_EDGES[i+1]:
             norm_idx = i; break
 
-    scale = 1.0/gbar[norm_idx] if gbar[norm_idx] > 0 else 1.0
-    FE_x *= scale
-
-    # ---- robust diags + safety guard ----
+    # Print with scientific notation so tiny numbers are visible
     print(f"[norm] bin at x_b=0.2 is index {norm_idx} (center {X_BINS[norm_idx]:.3g}), "
-          f"gbar={gbar[norm_idx]:.3e}, scale={scale:.3g}", file=sys.stderr)
-    print(f"[norm] total captures (weighted): {cap_total.sum():.3f}, max bin: {cap_total.max():.3f}", file=sys.stderr)
+          f"gbar={gbar[norm_idx]:.6e}", file=sys.stderr)
+    print(f"[norm] total captures (weighted): {cap_total.sum():.6e}, "
+          f"max bin: {cap_total.max():.6e}", file=sys.stderr)
     print(f"[diag] pericenter crossings (total): {peri_total}", file=sys.stderr)
     print(f"[diag] captures (events, unweighted): {caps_total}", file=sys.stderr)
+    print(f"[diag] clone capacity high-water: {max_ccount}", file=sys.stderr)
     if zero_count_streams > 0:
         print(f"[WARNING] {zero_count_streams} streams returned zero weighted captures (check capture tallying)", file=sys.stderr)
 
@@ -681,7 +717,7 @@ def main():
         )
 
         print(f"Simulation completed successfully!", file=sys.stderr)
-        print("# x_center    FE_star_x  (dimensionless; Δx-normalized; per-stream global time; normalized ḡ(0.225)=1)")
+        print("# x_center    FE_star_x  (dimensionless; Δx-normalized; per-stream global time)")
         for xb, val in zip(X_BINS, FE):
             print(f"{xb:10.3g}  {val: .6e}")
 
