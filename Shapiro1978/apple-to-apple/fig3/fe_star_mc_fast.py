@@ -401,6 +401,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
         escapes = 0
         g_time = np.zeros(x_bins.size, dtype=np.float64)
         total_t0 = 0.0
+        debug_flag = 0  # for first-capture debug
 
         while t0_used < n_relax:
             x_prev = x; j_prev = j
@@ -424,7 +425,10 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
             if cap:
                 caps += 1
                 b = bin_index(x)            # energy *at capture*
-                captures[b] += w
+                captures[b] += w            # add weighted capture
+                if debug_flag == 0:
+                    # First capture debug (will print once per stream if captures happen)
+                    debug_flag = 1
                 x = X_BOUND                 # replace at reservoir
                 j = math.sqrt(np.random.random())
 
@@ -469,8 +473,11 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                 # 1) capture first
                 if cap_c:
                     b = bin_index(x_c2)
-                    captures[b] += cw[i]
+                    captures[b] += cw[i]    # add weighted capture
                     caps += 1
+                    if debug_flag == 0:
+                        # First capture debug (will print once per stream if captures happen)
+                        debug_flag = 1
                     # --- creation–annihilation: recycle THIS clone as a fresh birth at the reservoir
                     cx[i]  = X_BOUND
                     cj[i]  = math.sqrt(np.random.random())  # isotropic j
@@ -516,7 +523,9 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
 
         # --- return raw tallies; NO normalization here ---
         # captures: counts per x-bin (weighted); g_time: time-weighted occupancy; total_t0: total time
-        return captures, g_time, total_t0, crosses, caps
+        # sanity check: did we actually count captures?
+        did_count = 1.0 if captures.sum() > 0.0 else 0.0
+        return captures, g_time, total_t0, crosses, caps, did_count
 
     return which_bin, P_of_x, T0, run_stream
 
@@ -570,13 +579,16 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
                     for sid in range(n_streams)]
             
             completed = 0
+            zero_count_streams = 0
             for f in cf.as_completed(futs):
-                cap_b, gtime_b, t0_b, peri_b, caps_b = f.result()
+                cap_b, gtime_b, t0_b, peri_b, caps_b, did_count_b = f.result()
                 cap_total  += cap_b
                 gtime_total+= gtime_b
                 t0_total   += t0_b
                 peri_total += peri_b
                 caps_total += caps_b
+                if did_count_b == 0.0:
+                    zero_count_streams += 1
                 completed += 1
                 
                 if show_progress:
@@ -619,10 +631,12 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
 
     # ---- robust diags + safety guard ----
     print(f"[norm] bin at x_b=0.2 is index {norm_idx} (center {X_BINS[norm_idx]:.3g}), "
-          f"gbar={gbar[norm_idx]:.3e}, scale={scale:.2g}", file=sys.stderr)
+          f"gbar={gbar[norm_idx]:.3e}, scale={scale:.3g}", file=sys.stderr)
     print(f"[norm] total captures (weighted): {cap_total.sum():.3f}, max bin: {cap_total.max():.3f}", file=sys.stderr)
     print(f"[diag] pericenter crossings (total): {peri_total}", file=sys.stderr)
     print(f"[diag] captures (events, unweighted): {caps_total}", file=sys.stderr)
+    if zero_count_streams > 0:
+        print(f"[WARNING] {zero_count_streams} streams returned zero weighted captures (check capture tallying)", file=sys.stderr)
 
     # If no capture mass was tallied, do NOT print fake FE
     if cap_total.sum() <= 0.0:
