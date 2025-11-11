@@ -270,12 +270,10 @@ def _build_kernels(use_jit=True):
         crosses = 0
         caps = 0
         escapes = 0
-        g_boundary_sum = 0.0
 
-        # ḡ snapshots (once per t0): count weighted stars in each x-bin
-        g_counts = np.zeros(x_bins.size, dtype=np.float64)
-        n_snaps  = 0
-        next_snap = 1.0  # 1,2,3,... t0
+        # time-weighted occupancy per x-bin (t0 units)
+        g_time = np.zeros(x_bins.size, dtype=np.float64)
+        total_t0 = 0.0
 
         # helpers
         def bin_index(xv):
@@ -290,7 +288,17 @@ def _build_kernels(use_jit=True):
         while t0_used < n_relax:
             x_prev = x; j_prev = j
             x, j, phase, n_used, cap, crossed = step_one(x, j, phase)
-            t0_used += (n_used * P_of_x(x_prev)) / T0
+            
+            # dt0 (this step) in t0 units from the *parent's* previous state
+            dt0 = (n_used * P_of_x(x_prev)) / T0
+            t0_used += dt0
+            total_t0 += dt0
+
+            # time-average occupancy at the *start* of the step for each active object (weights sum ≈ 1)
+            g_time[bin_index(x_prev)] += w * dt0
+            for ii in range(ccount):
+                if cactive[ii]:
+                    g_time[bin_index(cx[ii])] += cw[ii] * dt0
 
             # count pericenter crossings
             if crossed: crosses += 1
@@ -381,26 +389,9 @@ def _build_kernels(use_jit=True):
                         break
                 i += 1
 
-            # snapshot ḡ once per t0 boundary
-            while t0_used >= next_snap:
-                # parent
-                g_counts[bin_index(x)] += w
-                # parent at boundary?
-                if abs(x - X_BOUND) < 1e-12:
-                    g_boundary_sum += w
-                # active clones
-                for ii in range(ccount):
-                    if cactive[ii]:
-                        g_counts[bin_index(cx[ii])] += cw[ii]
-                        # clones at boundary?
-                        if abs(cx[ii] - X_BOUND) < 1e-12:
-                            g_boundary_sum += cw[ii]
-                n_snaps += 1
-                next_snap += 1.0
-
         # --- return raw tallies; NO normalization here ---
-        # captures: counts per x-bin (weighted); g_counts: snapshot weights per x-bin; n_snaps: #snapshots
-        return captures, g_counts, n_snaps, crosses, caps
+        # captures: counts per x-bin (weighted); g_time: time-weighted occupancy; total_t0: total time
+        return captures, g_time, total_t0, crosses, caps
 
     return which_bin, P_of_x, T0, run_stream
 
@@ -411,13 +402,13 @@ def _worker(args):
         which_bin, P_of_x, T0, run_stream = _build_kernels(use_jit=use_jit)
 
         cap_sum  = np.zeros_like(X_BINS, dtype=np.float64)
-        g_sum    = np.zeros_like(X_BINS, dtype=np.float64)
-        snap_sum = 0.0
+        gtime_sum= np.zeros_like(X_BINS, dtype=np.float64)
+        t0_sum   = 0.0
         peri_sum = 0
         caps_sum = 0
 
         for sid in batch_ids:
-            cap_i, g_i, n_i, cross_i, caps_i = run_stream(
+            cap_i, gtime_i, t0_i, cross_i, caps_i = run_stream(
                 n_relax, floors, clones_per_split, X_BINS, DX, int(stream_seeds[sid])
             )
             # ASSERT: if a stream saw captures, the array must reflect it
@@ -425,12 +416,12 @@ def _worker(args):
                 raise RuntimeError("stream captured>0 but capture array all-zero (wiring bug)")
 
             cap_sum  += cap_i
-            g_sum    += g_i
-            snap_sum += float(n_i)
+            gtime_sum+= gtime_i
+            t0_sum   += float(t0_i)
             peri_sum += int(cross_i)
             caps_sum += int(caps_i)
 
-        return cap_sum, g_sum, snap_sum, peri_sum, caps_sum
+        return cap_sum, gtime_sum, t0_sum, peri_sum, caps_sum
     except Exception as e:
         print(f"Worker error: {e}", file=sys.stderr)
         z = np.zeros_like(X_BINS, dtype=np.float64)
@@ -475,8 +466,8 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
         print(f"Starting {n_streams} streams across {procs} processes...", file=sys.stderr)
 
     cap_total  = np.zeros_like(X_BINS, dtype=np.float64)
-    g_total    = np.zeros_like(X_BINS, dtype=np.float64)
-    snap_total = 0.0
+    gtime_total= np.zeros_like(X_BINS, dtype=np.float64)
+    t0_total   = 0.0
     peri_total = 0
     caps_total = 0
     try:
@@ -487,10 +478,10 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
             # Monitor progress
             if show_progress:
                 for i, f in enumerate(cf.as_completed(futs)):
-                    cap_b, g_b, snap_b, peri_b, caps_b = f.result()
+                    cap_b, gtime_b, t0_b, peri_b, caps_b = f.result()
                     cap_total  += cap_b
-                    g_total    += g_b
-                    snap_total += snap_b
+                    gtime_total+= gtime_b
+                    t0_total   += t0_b
                     peri_total += peri_b
                     caps_total += caps_b
                     completed_streams += len(batches[i])
@@ -509,10 +500,10 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
                         last_update = current_time
             else:
                 for f in cf.as_completed(futs):
-                    cap_b, g_b, snap_b, peri_b, caps_b = f.result()
+                    cap_b, gtime_b, t0_b, peri_b, caps_b = f.result()
                     cap_total  += cap_b
-                    g_total    += g_b
-                    snap_total += snap_b
+                    gtime_total+= gtime_b
+                    t0_total   += t0_b
                     peri_total += peri_b
                     caps_total += caps_b
                     
@@ -525,19 +516,19 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
             elapsed_total = time.time() - start_time
             print(f"\nCompleted {completed_streams}/{n_streams} streams in {elapsed_total:.1f}s", file=sys.stderr)
 
-    # ---- FE from captures only ----
+    # ---- FE from capture histogram ----
     denom = float(n_streams) * float(n_relax)
     FE = np.zeros_like(X_BINS)
     np.divide(cap_total, denom*DX, out=FE, where=(DX>0))
     FE_x = FE * X_BINS
 
-    # ---- ḡ(x) for normalization ----
+    # ---- ḡ(x) from *time-weighted* occupancy ----
     gbar = np.zeros_like(X_BINS)
-    if snap_total > 0:
-        tmp = g_total / snap_total
+    if t0_total > 0.0:
+        tmp = gtime_total / t0_total
         np.divide(tmp, DX, out=gbar, where=(DX>0))
 
-    # boundary bin that contains x_b
+    # boundary bin containing x_b = 0.2 (by edges)
     norm_idx = 0
     for i in range(X_EDGES.size-1):
         if X_EDGES[i] <= X_BOUND < X_EDGES[i+1]:
@@ -549,8 +540,7 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
     # ---- robust diags + safety guard ----
     print(f"[norm] bin at x_b=0.2 is index {norm_idx} (center {X_BINS[norm_idx]:.3g}), "
           f"gbar={gbar[norm_idx]:.3e}, scale={scale:.2g}", file=sys.stderr)
-    print(f"[norm] total captures (weighted sum over bins): {cap_total.sum():.3f}, "
-          f"max bin: {cap_total.max():.3f}", file=sys.stderr)
+    print(f"[norm] total captures (weighted): {cap_total.sum():.3f}, max bin: {cap_total.max():.3f}", file=sys.stderr)
     print(f"[diag] pericenter crossings (total): {peri_total}", file=sys.stderr)
     print(f"[diag] captures (events, unweighted): {caps_total}", file=sys.stderr)
 
