@@ -204,52 +204,42 @@ def _build_kernels(use_jit=True):
 
     @njit(**fastmath)
     def step_one(x, j, phase):
-        # One stochastic step (E=-x): returns x_new, j_new, phase_new, n_used, captured?
         e1, e2v, j1v, j2v, z2v = bilinear_coeffs(x, j)
         n_raw = pick_n(x, j, e2v, j2v)
 
-        # Pericenter truncation: if we would cross an integer, land exactly there
+        # land exactly on next pericenter if we'd cross it
         next_int = math.floor(phase) + 1.0
-        if phase + n_raw > next_int:
-            n = next_int - phase
-        else:
-            n = n_raw
+        crossed_peri = (phase + n_raw >= next_int)
+        n = next_int - phase if crossed_peri else n_raw
 
-        # Correlated diffusion
+        # correlated normals
         y1, y2 = correlated_normals(e2v, j2v, z2v)
+
+        # energy update (x = -E)
         dE = n*e1 + math.sqrt(n)*y1*e2v
         x_new = x - dE
-        if x_new < 1e-12:
-            x_new = 1e-12
+        if x_new < 1e-12: x_new = 1e-12
 
-        # J update: 2D RW only inside loss cone and small j (paper's gate)
-        use_2d = (
-            (math.sqrt(n)*j2v > max(1e-12, j/4.0)) and  # "step large vs J"
-            (j < 0.4) and                               # small j
-            (j < j_min_of_x(x))                         # INSIDE the loss cone
-        )
-        if use_2d:
-            # 2D RW (eq. 28)
+        # J update: 2-D RW if step large vs J *and* j small
+        if (math.sqrt(n)*j2v > max(1e-12, j/4.0)) and (j < 0.4):
             z1 = np.random.normal()
             z2 = np.random.normal()
             j_new = math.sqrt( (j + math.sqrt(n)*z1*j2v)**2 + (math.sqrt(n)*z2*j2v)**2 )
-            used_2d = True
         else:
-            # 1D Gaussian with correlation (eq. 27b)
             j_new = j + n*j1v + math.sqrt(n)*y2*j2v
-            used_2d = False
         if j_new < 0.0: j_new = 0.0
         if j_new > 1.0: j_new = 1.0
 
-        # advance phase by n; pericenter if integer crossed
+        # phase advance
         phase_before = phase
         phase = phase + n
-        captured = False
-        if int(math.floor(phase)) > int(math.floor(phase_before)):
-            if j_new < j_min_of_x(x_new):
-                captured = True
 
-        return x_new, j_new, phase, n, captured, used_2d
+        # capture only if we actually hit pericenter on this step
+        captured = False
+        if crossed_peri and (j_new < j_min_of_x(x_new)):
+            captured = True
+
+        return x_new, j_new, phase, n, captured, crossed_peri
 
     @njit(**fastmath)
     def run_stream(n_relax, floors, clones_per_split, x_bins, dx, seed):
@@ -275,12 +265,10 @@ def _build_kernels(use_jit=True):
         t0_used = 0.0
 
         # Diagnostic counters
-        pericross = 0
+        crosses = 0
         caps = 0
         escapes = 0
         g_boundary_sum = 0.0
-        n_2d = 0
-        n_1d = 0
 
         # ḡ snapshots (once per t0): count weighted stars in each x-bin
         g_counts = np.zeros(x_bins.size, dtype=np.float64)
@@ -299,54 +287,41 @@ def _build_kernels(use_jit=True):
 
         while t0_used < n_relax:
             x_prev = x; j_prev = j
-            x, j, phase, n_used, cap, used_2d = step_one(x, j, phase)
-            # advance time
+            x, j, phase, n_used, cap, crossed = step_one(x, j, phase)
             t0_used += (n_used * P_of_x(x_prev)) / T0
-            pericross += 1  # Count steps as proxy for pericenter crossings
-            if used_2d:
-                n_2d += 1
-            else:
-                n_1d += 1
 
-            # Check for escape from cusp (outward diffusion)
-            if x < X_BOUND:
-                # star left the cusp -> replace at reservoir (no capture counted)
-                escapes += 1
-                x = X_BOUND
-                j = math.sqrt(np.random.random())   # isotropic J
-                # phase unchanged (keep age)
-                escaped = True
-            else:
-                escaped = False
+            # 1) capture first
+            if cap:
+                caps += 1
+                b = bin_index(x)            # energy *at capture*
+                captures[b] += w
+                x = X_BOUND                 # replace at reservoir
+                j = math.sqrt(np.random.random())
 
-            if not escaped:
-                # capture at pericenter
-                if cap:
-                    caps += 1
-                    b = bin_index(x)
-                    captures[b] += w
-                    # replace at x_b with isotropic j; keep phase (per paper)
+            else:
+                # 2) outward escape replacement
+                if x < X_BOUND:
+                    escapes += 1
                     x = X_BOUND
-                    j = math.sqrt(np.random.random())
+                    j = math.sqrt(np.random.random())  # keep phase
 
-                # splitting on w=j^2 floors (parent not deleted)
-                w_now = j*j
-                for fi in range(floors.size):
-                    f = floors[fi]
-                    if w_now < f and w >= f:
-                        alpha = 1.0/(1.0 + clones_per_split)
-                        new_w = w*alpha
-                        w = new_w
-                        for k in range(clones_per_split):
-                            if ccount < MAX_CLONES:
-                                cx[ccount] = x
-                                cj[ccount] = j
-                                cph[ccount]= phase
-                                cw[ccount] = new_w
-                                cfloor[ccount] = f
-                                cactive[ccount] = 1
-                                ccount += 1
-                        break
+            # 3) split on w=j^2 floors *after* cap/escape
+            w_now = j*j
+            for fi in range(floors.size):
+                f = floors[fi]
+                if w_now < f and w >= f:
+                    alpha = 1.0/(1.0 + clones_per_split)
+                    w = w * alpha
+                    for k in range(clones_per_split):
+                        if ccount < MAX_CLONES:
+                            cx[ccount] = x
+                            cj[ccount] = j
+                            cph[ccount]= phase
+                            cw[ccount] = w
+                            cfloor[ccount] = f
+                            cactive[ccount] = 1
+                            ccount += 1
+                    break
 
             # step active clones (share time; do not add to t0_used)
             i = 0
@@ -354,50 +329,44 @@ def _build_kernels(use_jit=True):
                 if cactive[i] == 0:
                     i += 1; continue
                 x_c, j_c, ph_c = cx[i], cj[i], cph[i]
-                x_c2, j_c2, ph_c2, n_c, cap_c, used_2d_c = step_one(x_c, j_c, ph_c)
+                x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c)
                 cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
-                if used_2d_c:
-                    n_2d += 1
-                else:
-                    n_1d += 1
 
-                # outward across its floor => remove
-                if j_c2*j_c2 >= cfloor[i]:
-                    cactive[i] = 0; i += 1; continue
+                # 1) capture first
+                if cap_c:
+                    b = bin_index(x_c2)
+                    captures[b] += cw[i]
+                    caps += 1
+                    cactive[i] = 0
+                    i += 1
+                    continue
 
-                # escaped the cusp? -> replace at reservoir (do NOT count a capture)
+                # 2) escape replacement
                 if x_c2 < X_BOUND:
-                    # replace the clone state at reservoir
                     escapes += 1
                     x_c2 = X_BOUND
                     j_c2 = math.sqrt(np.random.random())
-                    # keep phase
                     cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
-                    # (do not mark inactive; keep evolving this clone)
-                    # proceed to possible further splitting below
-                else:
-                    # pericenter-capture?
-                    if cap_c:
-                        b = bin_index(x_c2)
-                        captures[b] += cw[i]
-                        cactive[i] = 0
-                        i += 1
-                        continue
 
-                # further splitting for clone
+                # 3) floor removal last (don't suppress a capture)
+                if j_c2*j_c2 >= cfloor[i]:
+                    cactive[i] = 0
+                    i += 1
+                    continue
+
+                # 4) clone splitting
                 w_c = j_c2*j_c2
                 for fi in range(floors.size):
                     f = floors[fi]
                     if w_c < f and cw[i] >= f:
                         alpha = 1.0/(1.0 + clones_per_split)
-                        new_w = cw[i]*alpha
-                        cw[i] = new_w
+                        cw[i] = cw[i] * alpha
                         for k in range(clones_per_split):
                             if ccount < MAX_CLONES:
                                 cx[ccount] = x_c2
                                 cj[ccount] = j_c2
                                 cph[ccount]= ph_c2
-                                cw[ccount] = new_w
+                                cw[ccount] = cw[i]
                                 cfloor[ccount] = f
                                 cactive[ccount] = 1
                                 ccount += 1
@@ -423,7 +392,7 @@ def _build_kernels(use_jit=True):
 
         # --- return raw tallies; NO normalization here ---
         # captures: counts per x-bin (weighted); g_counts: snapshot weights per x-bin; n_snaps: #snapshots
-        return captures, g_counts, n_snaps
+        return captures, g_counts, n_snaps, crosses, caps
 
     return which_bin, P_of_x, T0, run_stream
 
@@ -432,22 +401,32 @@ def _worker(args):
     try:
         batch_ids, n_relax, floors, clones_per_split, stream_seeds, use_jit, _ = args
         which_bin, P_of_x, T0, run_stream = _build_kernels(use_jit=use_jit)
+
         cap_sum  = np.zeros_like(X_BINS, dtype=np.float64)
         g_sum    = np.zeros_like(X_BINS, dtype=np.float64)
         snap_sum = 0.0
+        peri_sum = 0
+        caps_sum = 0
 
         for sid in batch_ids:
-            cap_i, g_i, n_snaps_i = run_stream(n_relax, floors, clones_per_split, X_BINS, DX, int(stream_seeds[sid]))
-            cap_sum += cap_i
-            g_sum   += g_i
-            snap_sum += float(n_snaps_i)
+            cap_i, g_i, n_i, cross_i, caps_i = run_stream(
+                n_relax, floors, clones_per_split, X_BINS, DX, int(stream_seeds[sid])
+            )
+            # ASSERT: if a stream saw captures, the array must reflect it
+            if caps_i > 0 and not np.any(cap_i > 0):
+                raise RuntimeError("stream captured>0 but capture array all-zero (wiring bug)")
 
-        # return a tuple
-        return cap_sum, g_sum, snap_sum
+            cap_sum  += cap_i
+            g_sum    += g_i
+            snap_sum += float(n_i)
+            peri_sum += int(cross_i)
+            caps_sum += int(caps_i)
+
+        return cap_sum, g_sum, snap_sum, peri_sum, caps_sum
     except Exception as e:
         print(f"Worker error: {e}", file=sys.stderr)
         z = np.zeros_like(X_BINS, dtype=np.float64)
-        return z, z, 0.0
+        return z, z, 0.0, 0, 0
 
 # ---------------- parallel driver ----------------
 def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
@@ -490,6 +469,8 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
     cap_total  = np.zeros_like(X_BINS, dtype=np.float64)
     g_total    = np.zeros_like(X_BINS, dtype=np.float64)
     snap_total = 0.0
+    peri_total = 0
+    caps_total = 0
     try:
         with cf.ProcessPoolExecutor(max_workers=procs) as ex:
             futs = [ex.submit(_worker, (batch, n_relax, floors, clones_per_split, stream_seeds, use_jit, None))
@@ -498,10 +479,12 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
             # Monitor progress
             if show_progress:
                 for i, f in enumerate(cf.as_completed(futs)):
-                    cap_b, g_b, snap_b = f.result()
+                    cap_b, g_b, snap_b, peri_b, caps_b = f.result()
                     cap_total  += cap_b
                     g_total    += g_b
                     snap_total += snap_b
+                    peri_total += peri_b
+                    caps_total += caps_b
                     completed_streams += len(batches[i])
                     
                     # Update progress display
@@ -518,10 +501,12 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
                         last_update = current_time
             else:
                 for f in cf.as_completed(futs):
-                    cap_b, g_b, snap_b = f.result()
+                    cap_b, g_b, snap_b, peri_b, caps_b = f.result()
                     cap_total  += cap_b
                     g_total    += g_b
                     snap_total += snap_b
+                    peri_total += peri_b
+                    caps_total += caps_b
                     
     except KeyboardInterrupt:
         if show_progress:
@@ -532,40 +517,42 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
             elapsed_total = time.time() - start_time
             print(f"\nCompleted {completed_streams}/{n_streams} streams in {elapsed_total:.1f}s", file=sys.stderr)
 
-    # ---- compute FE*(x)*x from raw totals (no per-stream scaling) ----
-    # FE(x) = captures / (n_streams * n_relax * Δx)
-    FE = np.zeros_like(X_BINS, dtype=np.float64)
+    # ---- FE from captures only ----
     denom = float(n_streams) * float(n_relax)
-    for bi in range(X_BINS.size):
-        if DX[bi] > 0.0 and denom > 0.0:
-            FE[bi] = cap_total[bi] / (denom * DX[bi])
+    FE = np.zeros_like(X_BINS)
+    np.divide(cap_total, denom*DX, out=FE, where=(DX>0))
+    FE_x = FE * X_BINS
 
-    FE_x = FE * X_BINS  # what Fig. 3 plots
+    # ---- ḡ(x) for normalization ----
+    gbar = np.zeros_like(X_BINS)
+    if snap_total > 0:
+        tmp = g_total / snap_total
+        np.divide(tmp, DX, out=gbar, where=(DX>0))
 
-    # ---- build global ḡ(x) from snapshots and normalize at boundary ----
-    gbar = np.zeros_like(X_BINS, dtype=np.float64)
-    if snap_total > 0.0:
-        for bi in range(X_BINS.size):
-            if DX[bi] > 0.0:
-                gbar[bi] = (g_total[bi] / snap_total) / DX[bi]
-
-    # find the bin that contains x_b = 0.2 by edges
+    # boundary bin that contains x_b
     norm_idx = 0
-    for i in range(X_EDGES.size - 1):
-        if (X_EDGES[i] <= X_BOUND) and (X_BOUND < X_EDGES[i+1]):
-            norm_idx = i
-            break
+    for i in range(X_EDGES.size-1):
+        if X_EDGES[i] <= X_BOUND < X_EDGES[i+1]:
+            norm_idx = i; break
 
-    scale = 1.0
-    if gbar[norm_idx] > 0.0:
-        scale = 1.0 / gbar[norm_idx]
-
+    scale = 1.0/gbar[norm_idx] if gbar[norm_idx] > 0 else 1.0
     FE_x *= scale
 
-    # Debug normalization info
+    # ---- robust diags + safety guard ----
     print(f"[norm] bin at x_b=0.2 is index {norm_idx} (center {X_BINS[norm_idx]:.3g}), "
-          f"gbar={gbar[norm_idx]:.3e}, scale={scale:.3g}", file=sys.stderr)
-    print(f"[norm] total captures: {cap_total.sum():.0f}, max single bin: {cap_total.max():.0f}", file=sys.stderr)
+          f"gbar={gbar[norm_idx]:.3e}, scale={scale:.2g}", file=sys.stderr)
+    print(f"[norm] total captures (weighted sum over bins): {cap_total.sum():.3f}, "
+          f"max bin: {cap_total.max():.3f}", file=sys.stderr)
+    print(f"[diag] pericenter crossings (total): {peri_total}", file=sys.stderr)
+    print(f"[diag] captures (events, unweighted): {caps_total}", file=sys.stderr)
+
+    # If no capture mass was tallied, do NOT print fake FE
+    if cap_total.sum() <= 0.0:
+        FE_x[:] = 0.0
+
+    # Extra sanity: if caps_total>0 but cap_total is zero, fail fast to catch wiring bugs
+    assert not (caps_total > 0 and cap_total.sum() == 0.0), \
+        "Got capture events but capture histogram is zero — check worker/unpack/return order."
 
     return FE_x
 
