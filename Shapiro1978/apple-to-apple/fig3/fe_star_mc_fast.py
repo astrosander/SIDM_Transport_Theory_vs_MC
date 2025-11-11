@@ -222,8 +222,8 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
         x_new = x - dE
         if x_new < 1e-12: x_new = 1e-12
 
-        # 2-D RW gate: small-j OR large RMS kick vs J
-        use_2d = (j < 0.4) or (math.sqrt(n)*j2v > max(1e-12, j/4.0))
+        # 2-D RW gate: small-j OR large RMS kick vs J (more permissive for empty-loss-cone)
+        use_2d = (j < 0.6) or (math.sqrt(n)*j2v > max(1e-12, j/4.0))
         if use_2d:
             z1 = np.random.normal()
             z2 = np.random.normal()
@@ -355,7 +355,13 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                     b = bin_index(x_c2)
                     captures[b] += cw[i]
                     caps += 1
-                    cactive[i] = 0
+                    # --- creation–annihilation: recycle THIS clone as a fresh birth at the reservoir
+                    cx[i]  = X_BOUND
+                    cj[i]  = math.sqrt(np.random.random())  # isotropic j
+                    cph[i] = ph_c2                           # shares parent time
+                    # Reset its floor to the outermost so it can split again
+                    cfloor[i] = floors[0]                    # (=1.0)
+                    cactive[i] = 1
                     i += 1
                     continue
 
