@@ -290,8 +290,9 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
         return x_new, j_new, phase, n, captured, crossed_peri
 
     @njit(**fastmath)
-    def run_stream(n_relax, floors, clones_per_split, x_bins, dx, seed, cone_gamma_val, warmup_t0, x_init):
+    def run_stream(n_relax, floors, clones_per_split, x_bins, dx, seed, cone_gamma_val, warmup_t0, x_init, collect_gbar=True):
         np.random.seed(seed)
+        SPLIT_HYST = 0.8  # split only when comfortably inside next floor (80% threshold)
 
         # parent (time carrier) - initialize from BW distribution
         x = x_init
@@ -339,13 +340,23 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                 j = math.sqrt(np.random.random())
                 parent_floor_idx = floor_index_for_j2(j*j, floors)
             else:
-                # splitting for parent: split only when entering a new deeper floor
+                # splitting for parent: split only when entering a new deeper floor (with hysteresis)
                 j2_now = j*j
                 target_idx = floor_index_for_j2(j2_now, floors)
                 
                 # If we just crossed deeper floors, process each newly-entered floor once.
+                # Use hysteresis: split only when comfortably inside the next floor (80% threshold)
                 while parent_floor_idx < target_idx:
-                    parent_floor_idx += 1  # we are now in this deeper floor
+                    next_floor_idx = parent_floor_idx + 1
+                    if next_floor_idx < floors.size:
+                        # Check if we're comfortably inside the next floor (hysteresis)
+                        if j2_now >= SPLIT_HYST * floors[next_floor_idx]:
+                            parent_floor_idx = next_floor_idx  # we are now in this deeper floor
+                        else:
+                            break  # not deep enough yet, wait
+                    else:
+                        parent_floor_idx = target_idx  # already at deepest floor
+                        break
 
                     # Split only if we can spawn the full batch.
                     if ccount <= MAX_CLONES - clones_per_split:
@@ -396,12 +407,21 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                     i += 1
                     continue
 
-                # deeper splitting for clone: split only when entering a new deeper floor
+                # deeper splitting for clone: split only when entering a new deeper floor (with hysteresis)
                 j2_c = j_c2 * j_c2
                 target_idx_c = floor_index_for_j2(j2_c, floors)
                 
                 while cfloor_idx[i] < target_idx_c:
-                    cfloor_idx[i] += 1  # deeper floor reached
+                    next_floor_idx_c = cfloor_idx[i] + 1
+                    if next_floor_idx_c < floors.size:
+                        # Check if we're comfortably inside the next floor (hysteresis)
+                        if j2_c >= SPLIT_HYST * floors[next_floor_idx_c]:
+                            cfloor_idx[i] = next_floor_idx_c  # deeper floor reached
+                        else:
+                            break  # not deep enough yet, wait
+                    else:
+                        cfloor_idx[i] = target_idx_c  # already at deepest floor
+                        break
 
                     if ccount <= MAX_CLONES - clones_per_split:
                         alpha = 1.0 / (1.0 + clones_per_split)
@@ -438,10 +458,11 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
             total_t0 += dt0
 
             # time-average occupancy at the *start* of the step for each active object (weights sum ≈ 1)
-            g_time[bin_index(x_prev)] += w * dt0
-            for ii in range(ccount):
-                if cactive[ii]:
-                    g_time[bin_index(cx[ii])] += cw[ii] * dt0
+            if collect_gbar:
+                g_time[bin_index(x_prev)] += w * dt0
+                for ii in range(ccount):
+                    if cactive[ii]:
+                        g_time[bin_index(cx[ii])] += cw[ii] * dt0
 
             # count pericenter crossings
             if crossed: crosses += 1
@@ -466,13 +487,23 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                     j = math.sqrt(np.random.random())  # keep phase
                     parent_floor_idx = floor_index_for_j2(j*j, floors)
                 else:
-                    # 3) split on j^2 floors *after* cap/escape: split only when entering a new deeper floor
+                    # 3) split on j^2 floors *after* cap/escape: split only when entering a new deeper floor (with hysteresis)
                     j2_now = j*j
                     target_idx = floor_index_for_j2(j2_now, floors)
                     
                     # If we just crossed deeper floors, process each newly-entered floor once.
+                    # Use hysteresis: split only when comfortably inside the next floor (80% threshold)
                     while parent_floor_idx < target_idx:
-                        parent_floor_idx += 1  # we are now in this deeper floor
+                        next_floor_idx = parent_floor_idx + 1
+                        if next_floor_idx < floors.size:
+                            # Check if we're comfortably inside the next floor (hysteresis)
+                            if j2_now >= SPLIT_HYST * floors[next_floor_idx]:
+                                parent_floor_idx = next_floor_idx  # we are now in this deeper floor
+                            else:
+                                break  # not deep enough yet, wait
+                        else:
+                            parent_floor_idx = target_idx  # already at deepest floor
+                            break
 
                         # Split only if we can spawn the full batch.
                         if ccount <= MAX_CLONES - clones_per_split:
@@ -535,12 +566,21 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                     i += 1
                     continue
 
-                # 4) clone splitting: split only when entering a new deeper floor
+                # 4) clone splitting: split only when entering a new deeper floor (with hysteresis)
                 j2_c = j_c2 * j_c2
                 target_idx_c = floor_index_for_j2(j2_c, floors)
                 
                 while cfloor_idx[i] < target_idx_c:
-                    cfloor_idx[i] += 1  # deeper floor reached
+                    next_floor_idx_c = cfloor_idx[i] + 1
+                    if next_floor_idx_c < floors.size:
+                        # Check if we're comfortably inside the next floor (hysteresis)
+                        if j2_c >= SPLIT_HYST * floors[next_floor_idx_c]:
+                            cfloor_idx[i] = next_floor_idx_c  # deeper floor reached
+                        else:
+                            break  # not deep enough yet, wait
+                    else:
+                        cfloor_idx[i] = target_idx_c  # already at deepest floor
+                        break
 
                     if ccount <= MAX_CLONES - clones_per_split:
                         alpha = 1.0 / (1.0 + clones_per_split)
@@ -568,7 +608,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
 
 # ---------------- multiprocessing worker (single stream) ----------------
 def _worker_one(args):
-    sid, n_relax, floors, clones_per_split, stream_seeds, use_jit, cone_gamma, warmup_t0 = args
+    sid, n_relax, floors, clones_per_split, stream_seeds, use_jit, cone_gamma, warmup_t0, collect_gbar = args
     which_bin, P_of_x, T0, run_stream = _build_kernels(use_jit=use_jit, cone_gamma=cone_gamma)
     
     # Sample initial x from BW distribution
@@ -577,13 +617,13 @@ def _worker_one(args):
     
     # warmup tiny call to pull kernels from cache
     _ = run_stream(1e-6, floors, clones_per_split, X_BINS, DX,
-                   int(stream_seeds[sid] ^ 0xABCDEF), cone_gamma, 0.0, x_init)
+                   int(stream_seeds[sid] ^ 0xABCDEF), cone_gamma, 0.0, x_init, collect_gbar)
     return run_stream(n_relax, floors, clones_per_split, X_BINS, DX,
-                      int(stream_seeds[sid]), cone_gamma, warmup_t0, x_init)
+                      int(stream_seeds[sid]), cone_gamma, warmup_t0, x_init, collect_gbar)
 
 # ---------------- parallel driver ----------------
 def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
-                 procs=None, use_jit=True, seed=SEED, show_progress=True, cone_gamma=0.25, warmup_t0=2.0, scale_by_gbar=False):
+                 procs=None, use_jit=True, seed=SEED, show_progress=True, cone_gamma=0.25, warmup_t0=2.0, scale_by_gbar=False, collect_gbar=True):
 
     if floors is None:
         floors = np.array([10.0**(-k) for k in range(0, 9)], dtype=np.float64)  # 1 ... 1e-8
@@ -612,7 +652,7 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
     caps_total = 0
     try:
         with cf.ProcessPoolExecutor(max_workers=procs) as ex:
-            futs = [ex.submit(_worker_one, (sid, n_relax, floors, clones_per_split, stream_seeds, use_jit, cone_gamma, warmup_t0))
+            futs = [ex.submit(_worker_one, (sid, n_relax, floors, clones_per_split, stream_seeds, use_jit, cone_gamma, warmup_t0, collect_gbar))
                     for sid in range(n_streams)]
             
             completed = 0
@@ -655,7 +695,7 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
 
     # --- OPTIONAL: compute gbar(x) only for diagnostics (not used to scale FE) ---
     gbar = np.zeros_like(X_BINS)
-    if t0_total > 0.0:
+    if collect_gbar and t0_total > 0.0:
         tmp = gtime_total / t0_total
         np.divide(tmp, DX, out=gbar, where=(DX > 0))
 
@@ -666,8 +706,12 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
             norm_idx = i; break
 
     # Print with scientific notation so tiny numbers are visible
-    print(f"[norm] bin at x_b=0.2 is index {norm_idx} (center {X_BINS[norm_idx]:.3g}), "
-          f"gbar={gbar[norm_idx]:.6e}", file=sys.stderr)
+    if collect_gbar:
+        print(f"[norm] bin at x_b=0.2 is index {norm_idx} (center {X_BINS[norm_idx]:.3g}), "
+              f"gbar={gbar[norm_idx]:.6e}", file=sys.stderr)
+    else:
+        print(f"[norm] bin at x_b=0.2 is index {norm_idx} (center {X_BINS[norm_idx]:.3g}), "
+              f"gbar=skipped (--no-gbar)", file=sys.stderr)
     print(f"[norm] total captures (weighted): {cap_total.sum():.6e}, "
           f"max bin: {cap_total.max():.6e}", file=sys.stderr)
     print(f"[diag] pericenter crossings (total): {peri_total}", file=sys.stderr)
@@ -686,7 +730,7 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
 
     # Optional scaling by gbar for Table-2 comparison (reporting only, doesn't change physics)
     FE_x_out = FE_x.copy()
-    if scale_by_gbar and gbar[norm_idx] > 0:
+    if scale_by_gbar and collect_gbar and gbar[norm_idx] > 0:
         FE_x_out *= 1.0 / gbar[norm_idx]
 
     return FE_x_out
@@ -699,6 +743,7 @@ def main():
         ap.add_argument("--windows", type=float, default=6.0, help="t0 windows per stream (n_relax)")
         ap.add_argument("--procs", type=int, default=None, help="process count (defaults to all cores)")
         ap.add_argument("--floors_min_exp", type=int, default=8, help="min exponent k for floors 10^{-k}")
+        ap.add_argument("--floor-step", type=int, default=1, help="stride for floor exponents (e.g., 2 = every 2 decades)")
         ap.add_argument("--clones", type=int, default=9, help="clones per split")
         ap.add_argument("--nojit", action="store_true", help="disable numba JIT (slow fallback)")
         ap.add_argument("--no-progress", action="store_true", help="disable progress display")
@@ -707,9 +752,11 @@ def main():
         ap.add_argument("--warmup", type=float, default=2.0, help="equilibration time in t0 before tallying")
         ap.add_argument("--scale-by-gbar", action="store_true",
                         help="Scale printed FE*x by 1/gbar(x_b) for Table-2 comparison only (reporting only, doesn't change physics)")
+        ap.add_argument("--no-gbar", action="store_true",
+                        help="Skip gbar(x) occupancy accumulation (faster, but no gbar diagnostics)")
         args = ap.parse_args()
 
-        floors = np.array([10.0**(-k) for k in range(0, args.floors_min_exp+1)], dtype=np.float64)
+        floors = np.array([10.0**(-k) for k in range(0, args.floors_min_exp+1, args.floor_step)], dtype=np.float64)
 
         print(f"Running Monte Carlo simulation with {args.streams} streams...", file=sys.stderr)
         FE = run_parallel(
@@ -723,7 +770,8 @@ def main():
             show_progress=(not args.no_progress),
             cone_gamma=args.cone_gamma,
             warmup_t0=args.warmup,
-            scale_by_gbar=args.scale_by_gbar
+            scale_by_gbar=args.scale_by_gbar,
+            collect_gbar=(not args.no_gbar)
         )
 
         print(f"Simulation completed successfully!", file=sys.stderr)
