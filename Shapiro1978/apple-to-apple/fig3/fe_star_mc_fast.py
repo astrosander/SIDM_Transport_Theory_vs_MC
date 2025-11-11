@@ -608,12 +608,11 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
 
 # ---------------- multiprocessing worker (single stream) ----------------
 def _worker_one(args):
-    sid, n_relax, floors, clones_per_split, stream_seeds, use_jit, cone_gamma, warmup_t0, collect_gbar = args
+    sid, n_relax, floors, clones_per_split, stream_seeds, use_jit, cone_gamma, warmup_t0, collect_gbar, u0 = args
     which_bin, P_of_x, T0, run_stream = _build_kernels(use_jit=use_jit, cone_gamma=cone_gamma)
     
-    # Sample initial x from BW distribution
-    rs = np.random.RandomState(int(stream_seeds[sid]))
-    x_init = sample_x_from_g0(rs.random())
+    # Sample initial x from BW distribution using stratified u value
+    x_init = sample_x_from_g0(u0)
     
     # warmup tiny call to pull kernels from cache
     _ = run_stream(1e-6, floors, clones_per_split, X_BINS, DX,
@@ -639,6 +638,11 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
     # seeds per stream
     rs = np.random.RandomState(seed)
     stream_seeds = rs.randint(1, 2**31-1, size=n_streams, dtype=np.int64)
+    
+    # Stratified reservoir sampling: evenly spaced u values, then shuffled
+    # This reduces variance compared to i.i.d. sampling
+    u_strat = (np.arange(n_streams) + 0.5) / n_streams
+    rs.shuffle(u_strat)  # shuffle to break correlation with stream ID
 
     # Progress tracking
     if show_progress:
@@ -652,7 +656,7 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
     caps_total = 0
     try:
         with cf.ProcessPoolExecutor(max_workers=procs) as ex:
-            futs = [ex.submit(_worker_one, (sid, n_relax, floors, clones_per_split, stream_seeds, use_jit, cone_gamma, warmup_t0, collect_gbar))
+            futs = [ex.submit(_worker_one, (sid, n_relax, floors, clones_per_split, stream_seeds, use_jit, cone_gamma, warmup_t0, collect_gbar, u_strat[sid]))
                     for sid in range(n_streams)]
             
             completed = 0
