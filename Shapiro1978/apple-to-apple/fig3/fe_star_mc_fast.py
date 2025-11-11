@@ -43,6 +43,41 @@ def _edges_from_centers(c):
 X_EDGES = _edges_from_centers(X_BINS)
 DX      = X_EDGES[1:] - X_EDGES[:-1]
 
+# ---- BW II Table 1 -> g0(x)  (user-supplied) ----
+LN1P = np.array([
+    0.00, 0.37, 0.74, 1.11, 1.47, 1.84, 2.21, 2.58, 2.95, 3.32,
+    3.68, 4.05, 4.42, 4.79, 5.16, 5.53, 5.89, 6.26, 6.63, 7.00,
+    7.37, 7.74, 8.11, 8.47, 8.84, 9.21
+], dtype=np.float64)
+G0_TAB = np.array([
+    1.00, 1.30, 1.55, 1.79, 2.03, 2.27, 2.53, 2.82, 3.13, 3.48,
+    3.88, 4.32, 4.83, 5.43, 6.12, 6.94, 7.93, 9.11, 10.55, 12.29,
+    14.36, 16.66, 18.80, 19.71, 15.70, 0.00
+], dtype=np.float64)
+
+# Convert ln(1+x) grid -> x grid
+X_G0 = np.expm1(LN1P)              # x >= 0
+# We'll only use x >= X_BOUND (reservoir) and <= last Fig.3 edge
+XMAX = X_EDGES[-1]
+mask = (X_G0 >= X_BOUND) & (X_G0 <= XMAX) & (G0_TAB > 0)
+XG  = X_G0[mask]
+G0  = G0_TAB[mask]
+
+# Build an inverse-CDF w.r.t. x using trapezoidal integration of g0(x)
+# (g0 is a 1-D isotropized DF here; using dx is the standard choice)
+cdf_x = np.zeros_like(XG)
+cdf_x[1:] = np.cumsum(0.5*(G0[1:] + G0[:-1])*(XG[1:] - XG[:-1]))
+cdf_x /= cdf_x[-1]  # normalize to 1
+
+def sample_x_from_g0(u):
+    # monotone piecewise-linear inverse CDF
+    if u <= 0.0: return XG[0]
+    if u >= 1.0: return XG[-1]
+    i = np.searchsorted(cdf_x, u, side="right")
+    i = max(1, min(i, cdf_x.size-1))
+    t = (u - cdf_x[i-1]) / (cdf_x[i] - cdf_x[i-1] + 1e-30)
+    return XG[i-1] + t * (XG[i] - XG[i-1])
+
 # ------------- Table-1 grids (x, j) and starred coeffs -------------
 X_GRID = np.array([3.36e-1, 3.31e0, 3.27e1, 3.23e2, 3.18e3], dtype=np.float64)
 J_GRID = np.array([1.000, 0.401, 0.161, 0.065, 0.026], dtype=np.float64)  # descending
@@ -245,11 +280,11 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
         return x_new, j_new, phase, n, captured, crossed_peri
 
     @njit(**fastmath)
-    def run_stream(n_relax, floors, clones_per_split, x_bins, dx, seed, cone_gamma_val):
+    def run_stream(n_relax, floors, clones_per_split, x_bins, dx, seed, cone_gamma_val, warmup_t0, x_init):
         np.random.seed(seed)
 
-        # parent (time carrier)
-        x = X_BOUND
+        # parent (time carrier) - initialize from BW distribution
+        x = x_init
         j = math.sqrt(np.random.random())  # isotropic j
         phase = 0.0
         w = 1.0
@@ -264,18 +299,6 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
         cactive = np.zeros(MAX_CLONES, dtype=np.uint8)
         ccount = 0
 
-        captures = np.zeros(x_bins.size, dtype=np.float64)
-        t0_used = 0.0
-
-        # Diagnostic counters
-        crosses = 0
-        caps = 0
-        escapes = 0
-
-        # time-weighted occupancy per x-bin (t0 units)
-        g_time = np.zeros(x_bins.size, dtype=np.float64)
-        total_t0 = 0.0
-
         # helpers
         def bin_index(xv):
             b = 0
@@ -285,6 +308,99 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                 if d < bestd:
                     bestd = d; b = bi
             return b
+
+        # ---------- (1) warm-up: evolve, recycle, split — do NOT tally ----------
+        t0_used = 0.0
+        while t0_used < warmup_t0:
+            x_prev = x; j_prev = j
+            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, cone_gamma_val)
+            dt0 = (n_used * P_of_x(x_prev)) / T0
+            t0_used += dt0
+
+            # capture → escape → floor (parent)
+            if cap:
+                # recycle parent at reservoir (keep weight)
+                x = X_BOUND
+                j = math.sqrt(np.random.random())
+            elif x < X_BOUND:
+                x = X_BOUND
+                j = math.sqrt(np.random.random())
+
+            # splitting for parent
+            w_now = j*j
+            for fi in range(floors.size):
+                f = floors[fi]
+                if w_now < f and w >= f:
+                    alpha = 1.0/(1.0 + clones_per_split)
+                    w = w * alpha
+                    for k in range(clones_per_split):
+                        if ccount >= MAX_CLONES:
+                            break
+                        cx[ccount] = x
+                        cj[ccount] = j
+                        cph[ccount]= phase
+                        cw[ccount] = w
+                        cfloor[ccount] = f
+                        cactive[ccount] = 1
+                        ccount += 1
+                    break
+
+            # evolve clones without tally
+            i = 0
+            while i < ccount:
+                if cactive[i] == 0:
+                    i += 1; continue
+                x_c, j_c, ph_c = cx[i], cj[i], cph[i]
+                x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, cone_gamma_val)
+                cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
+
+                if cap_c:
+                    # recycle clone at reservoir
+                    cx[i]  = X_BOUND
+                    cj[i]  = math.sqrt(np.random.random())
+                    cph[i] = ph_c2
+                    cfloor[i] = floors[0]
+                    cactive[i] = 1
+                    i += 1
+                    continue
+
+                if x_c2 < X_BOUND:
+                    x_c2 = X_BOUND
+                    j_c2 = math.sqrt(np.random.random())
+                    cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
+
+                if j_c2*j_c2 >= cfloor[i]:
+                    cactive[i] = 0
+                    i += 1
+                    continue
+
+                w_c = j_c2*j_c2
+                for fi in range(floors.size):
+                    f = floors[fi]
+                    if w_c < f and cw[i] >= f:
+                        alpha = 1.0/(1.0 + clones_per_split)
+                        cw[i] = cw[i] * alpha
+                        for k in range(clones_per_split):
+                            if ccount >= MAX_CLONES:
+                                break
+                            cx[ccount] = x_c2
+                            cj[ccount] = j_c2
+                            cph[ccount]= ph_c2
+                            cw[ccount] = cw[i]
+                            cfloor[ccount] = f
+                            cactive[ccount] = 1
+                            ccount += 1
+                        break
+                i += 1
+
+        # ---------- (2) zero tallies; start measurement window ----------
+        captures = np.zeros(x_bins.size, dtype=np.float64)
+        t0_used = 0.0
+        crosses = 0
+        caps = 0
+        escapes = 0
+        g_time = np.zeros(x_bins.size, dtype=np.float64)
+        total_t0 = 0.0
 
         while t0_used < n_relax:
             x_prev = x; j_prev = j
@@ -406,17 +522,22 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
 
 # ---------------- multiprocessing worker (single stream) ----------------
 def _worker_one(args):
-    sid, n_relax, floors, clones_per_split, stream_seeds, use_jit, cone_gamma = args
+    sid, n_relax, floors, clones_per_split, stream_seeds, use_jit, cone_gamma, warmup_t0 = args
     which_bin, P_of_x, T0, run_stream = _build_kernels(use_jit=use_jit, cone_gamma=cone_gamma)
+    
+    # Sample initial x from BW distribution
+    rs = np.random.RandomState(int(stream_seeds[sid]))
+    x_init = sample_x_from_g0(rs.random())
+    
     # warmup tiny call to pull kernels from cache
     _ = run_stream(1e-6, floors, clones_per_split, X_BINS, DX,
-                   int(stream_seeds[sid] ^ 0xABCDEF), cone_gamma)
+                   int(stream_seeds[sid] ^ 0xABCDEF), cone_gamma, 0.0, x_init)
     return run_stream(n_relax, floors, clones_per_split, X_BINS, DX,
-                      int(stream_seeds[sid]), cone_gamma)
+                      int(stream_seeds[sid]), cone_gamma, warmup_t0, x_init)
 
 # ---------------- parallel driver ----------------
 def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
-                 procs=None, use_jit=True, seed=SEED, show_progress=True, cone_gamma=0.25):
+                 procs=None, use_jit=True, seed=SEED, show_progress=True, cone_gamma=0.25, warmup_t0=12.0):
 
     if floors is None:
         floors = np.array([10.0**(-k) for k in range(0, 9)], dtype=np.float64)  # 1 ... 1e-8
@@ -445,7 +566,7 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
     caps_total = 0
     try:
         with cf.ProcessPoolExecutor(max_workers=procs) as ex:
-            futs = [ex.submit(_worker_one, (sid, n_relax, floors, clones_per_split, stream_seeds, use_jit, cone_gamma))
+            futs = [ex.submit(_worker_one, (sid, n_relax, floors, clones_per_split, stream_seeds, use_jit, cone_gamma, warmup_t0))
                     for sid in range(n_streams)]
             
             completed = 0
@@ -526,6 +647,7 @@ def main():
         ap.add_argument("--no-progress", action="store_true", help="disable progress display")
         ap.add_argument("--seed", type=int, default=SEED)
         ap.add_argument("--cone_gamma", type=float, default=0.25, help="prefactor in (29d): floor = max(gamma*(j-jmin), 0.10*jmin)")
+        ap.add_argument("--warmup", type=float, default=12.0, help="equilibration time in t0 before tallying")
         args = ap.parse_args()
 
         floors = np.array([10.0**(-k) for k in range(0, args.floors_min_exp+1)], dtype=np.float64)
@@ -540,7 +662,8 @@ def main():
             use_jit=(not args.nojit),
             seed=args.seed,
             show_progress=(not args.no_progress),
-            cone_gamma=args.cone_gamma
+            cone_gamma=args.cone_gamma,
+            warmup_t0=args.warmup
         )
 
         print(f"Simulation completed successfully!", file=sys.stderr)
