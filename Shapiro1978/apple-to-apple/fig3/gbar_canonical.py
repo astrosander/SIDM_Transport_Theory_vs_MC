@@ -11,9 +11,15 @@
 
 import math, os, sys, time, argparse
 import numpy as np
-from multiprocessing import Manager
 import multiprocessing as mp
 import threading
+
+# --- keep threads sane *before* numba or BLAS load ---
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("NUMBA_THREADING_LAYER", "workqueue")
 
 # Optional numba
 try:
@@ -321,6 +327,20 @@ def _ensure_kernels(use_jit, cone_gamma):
         _K_KEY = key
     return _K_CACHE
 
+# Per-process initializer: constrain threads + JIT warmup once
+# Must be at module level for spawn context (can't pickle local functions)
+def _worker_initializer(_cone_gamma, _use_jit, _windows, _warmup):
+    try:
+        import numba as _nb
+        _nb.set_num_threads(1)
+    except Exception:
+        pass
+    # tiny warmup to compile kernels in this process
+    try:
+        run_stream(_windows*1e-6, 0.0, _cone_gamma, _use_jit, 1234567)
+    except Exception:
+        pass
+
 # -------------- Single-stream driver (no clones; just occupancy) --------------
 def run_stream(n_relax_t0, warmup_t0, cone_gamma, use_jit, seed, progress_q=None, hb_dt0=0.5,
                snap_peri_meas=False, capB=0.15, capC=0.60, kappaE=0.20):
@@ -438,7 +458,8 @@ def _worker_chunk(start_idx, count, windows, warmup, cone_gamma, use_jit, seeds,
 
 # -------------- Parallel aggregator --------------
 def run_parallel(streams, windows, warmup, procs, cone_gamma, use_jit, seed, normalize,
-                 hb_dt0=0.5, snap_peri_meas=False, capB=0.15, capC=0.60, kappaE=0.20, chunk=8):
+                 hb_dt0=0.5, snap_peri_meas=False, capB=0.15, capC=0.60, kappaE=0.20, chunk=1,
+                 task_timeout=120.0, max_retries=2):
     import concurrent.futures as cf
     import multiprocessing as mp
     rs = np.random.RandomState(seed)
@@ -458,9 +479,8 @@ def run_parallel(streams, windows, warmup, procs, cone_gamma, use_jit, seed, nor
     except Exception:
         pass
     
-    # Batch several streams per worker to amortize JIT/overhead.
-    # Aim ~2–4 tasks per process outstanding (so for 48 procs, ~100–200 chunks total).
-    CHUNK = chunk
+    # streams per future (1 = best progress; raise to reduce overhead)
+    CHUNK = max(1, int(chunk))
     use_chunks = (CHUNK > 1)
     
     if use_chunks:
@@ -474,8 +494,9 @@ def run_parallel(streams, windows, warmup, procs, cone_gamma, use_jit, seed, nor
     sys.stderr.flush()
     
     # Progress queue + printer thread for per-stream updates
-    # Note: Manager().Queue() is required for ProcessPoolExecutor (mp.Queue() isn't picklable)
-    mgr = Manager()
+    # Use Manager().Queue() for spawn context (can't share plain Queue with spawn)
+    ctx = mp.get_context("spawn")
+    mgr = mp.Manager()
     progress_q = mgr.Queue()
     done = 0
     stop_event = threading.Event()
@@ -559,34 +580,76 @@ def run_parallel(streams, windows, warmup, procs, cone_gamma, use_jit, seed, nor
     t_prn = threading.Thread(target=printer, daemon=True)
     t_prn.start()
     
+    # Submit jobs in epochs; kill/resubmit slow ones
+    jobs = []
+    if use_chunks:
+        for start, count in chunks:
+            jobs.append(("chunk", (start, count)))
+    else:
+        for sid in range(streams):
+            jobs.append(("single", sid))
+    
+    attempt = {i: 0 for i in range(len(jobs))}
+    remaining = set(range(len(jobs)))
+    
     try:
-        # Prefer 'fork' so compiled machine code is inherited (Linux)
-        try:
-            ctx = mp.get_context("fork")
-        except (ValueError, RuntimeError):
-            ctx = mp.get_context()  # fallback (e.g., macOS uses 'spawn')
-        with cf.ProcessPoolExecutor(max_workers=procs, mp_context=ctx) as ex:
-            if use_chunks:
-                futs = {ex.submit(_worker_chunk, start, count, windows, warmup, cone_gamma,
-                                  use_jit, seeds, progress_q, hb_dt0,
-                                  snap_peri_meas, capB, capC, kappaE): (start, count)
-                        for start, count in chunks}
-            else:
-                # Per-stream tasks (rare after chunking enabled)
-                futs = {ex.submit(_worker_one, sid, windows, warmup, cone_gamma, use_jit,
-                                  seeds[sid], progress_q, hb_dt0,
-                                  snap_peri_meas, capB, capC, kappaE): sid
-                        for sid in range(streams)}
-            
-            for f in cf.as_completed(futs):
-                if use_chunks:
-                    g_chunk, t_chunk = f.result()
-                    gsum += g_chunk.astype(np.float64)
-                    t0sum += t_chunk
-                else:
-                    g_one, t_one = f.result()
-                    gsum += g_one.astype(np.float64)
-                    t0sum += t_one
+        while remaining:
+            with cf.ProcessPoolExecutor(max_workers=procs,
+                                        mp_context=ctx,
+                                        initializer=_worker_initializer,
+                                        initargs=(cone_gamma, use_jit, windows, warmup)) as ex:
+                fut2id = {}
+                start_time = {}
+                for jid in list(remaining):
+                    if attempt[jid] > max_retries:
+                        # give up on the pathological straggler (don't block the whole run)
+                        remaining.remove(jid)
+                        continue
+                    kind, payload = jobs[jid]
+                    if kind == "chunk":
+                        start, count = payload
+                        fut = ex.submit(_worker_chunk, start, count, windows, warmup, cone_gamma,
+                                       use_jit, seeds, progress_q, hb_dt0,
+                                       snap_peri_meas, capB, capC, kappaE)
+                    else:
+                        sid = payload
+                        fut = ex.submit(_worker_one, sid, windows, warmup, cone_gamma, use_jit,
+                                       seeds[sid], progress_q, hb_dt0,
+                                       snap_peri_meas, capB, capC, kappaE)
+                    fut2id[fut] = jid
+                    start_time[fut] = time.time()
+                
+                pending = set(fut2id.keys())
+                while pending:
+                    done_set, pending = cf.wait(pending, timeout=1.0, return_when=cf.FIRST_COMPLETED)
+                    # collect finished
+                    for f in done_set:
+                        jid = fut2id[f]
+                        try:
+                            g_part, t_part = f.result()
+                            gsum += g_part.astype(np.float64)
+                            t0sum += t_part
+                        except Exception:
+                            # count as a failed attempt
+                            attempt[jid] += 1
+                            continue
+                        # success
+                        if jid in remaining:
+                            remaining.remove(jid)
+                    # timeout check
+                    now = time.time()
+                    to_resubmit = []
+                    for f in list(pending):
+                        if now - start_time[f] > task_timeout:
+                            jid = fut2id[f]
+                            attempt[jid] += 1
+                            to_resubmit.append(f)
+                    # drop timed out futures this epoch; they'll be retried with a fresh pool
+                    for f in to_resubmit:
+                        pending.discard(f)
+                        if fut2id[f] in remaining:
+                            # will be resubmitted in next epoch
+                            pass
     finally:
         # Stop printer thread
         stop_event.set()
@@ -633,13 +696,21 @@ def main():
     ap.add_argument("--normalize", action="store_true", help="scale so ḡ(x≈0.225)=1 (filled circles)")
     ap.add_argument("--plot", type=str, default="", help="optional output PNG path to plot filled circles")
     ap.add_argument("--hb", type=float, default=0.5, help="heartbeat interval in t0 per worker (default 0.5)")
-    ap.add_argument("--chunk", type=int, default=8, help="streams per task (1 = per-stream tasks; default 8)")
+    ap.add_argument("--chunk", type=int, default=1, help="streams per task (1–4 recommended)")
+    ap.add_argument("--task-timeout", type=float, default=120.0, help="seconds before a task is killed and retried")
+    ap.add_argument("--max-retries", type=int, default=2, help="max resubmits for a slow task")
     ap.add_argument("--snap-peri-meas", action="store_true",
                     help="during measurement, still snap steps to pericenter (slower; off by default)")
     ap.add_argument("--capB", type=float, default=0.15, help="(29b) factor during measurement (default 0.15; warm-up uses 0.10)")
     ap.add_argument("--capC", type=float, default=0.60, help="(29c) factor during measurement (default 0.60; warm-up uses 0.40)")
     ap.add_argument("--kappaE", type=float, default=0.20, help="(29e) energy-step cap during measurement (default 0.20; warm-up uses 0.10)")
     args = ap.parse_args()
+
+    # ensure spawn (safe with numba)
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
 
     gbar = run_parallel(
         streams=args.streams,
@@ -653,7 +724,9 @@ def main():
         hb_dt0=args.hb,
         snap_peri_meas=args.snap_peri_meas,
         capB=args.capB, capC=args.capC, kappaE=args.kappaE,
-        chunk=args.chunk
+        chunk=args.chunk,
+        task_timeout=args.task_timeout,
+        max_retries=args.max_retries
     )
 
     # Print table
