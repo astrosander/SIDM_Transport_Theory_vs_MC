@@ -92,10 +92,10 @@ ZETA2 = np.array([  # ζ*²
 ], dtype=np.float64)
 
 # ---------------- kernels (Numba or pure python) ----------------
-def _build_kernels(use_jit=True):
+def _build_kernels(use_jit=True, cone_gamma=0.25):
     nb_njit = (lambda *a, **k: (lambda f: f))
     njit = nb.njit if (use_jit and HAVE_NUMBA) else nb_njit
-    fastmath = dict(fastmath=True, nogil=True, cache=False) if (use_jit and HAVE_NUMBA) else {}
+    fastmath = dict(fastmath=True, nogil=True, cache=True) if (use_jit and HAVE_NUMBA) else {}
 
     @njit(**fastmath)
     def j_min_of_x(x):
@@ -161,33 +161,34 @@ def _build_kernels(use_jit=True):
         return e1, e2v, j1v, j2v, z2v
 
     @njit(**fastmath)
-    def pick_n(x, j, e2v, j2v):
+    def pick_n(x, j, e2v, j2v, cone_gamma_val):
         jmin = j_min_of_x(x)
         nmax = 1e30
-
-        # (29a)  sqrt(n)*e2 <= 0.15*|E|  (x = -E)
+        
+        # (29a) energy rms limit
         if e2v > 0.0:
             v = (0.15*abs(x) / max(e2v, 1e-30))**2
             if v < nmax: nmax = v
 
         if j2v > 0.0:
-            # (29b)  |ΔJ|_rms <= 0.10   (ABSOLUTE cap; do NOT divide by j)
+            # (29b) absolute angular rms limit
             v = (0.10 / j2v)**2
             if v < nmax: nmax = v
 
-            # (29c)  |ΔJ|_rms <= 0.40*(1.0075 − j)   (linear distance to circular)
-            v = (0.40 * max(1.0075 - j, 0.0) / j2v)**2
+            # (29c) distance to circular
+            v = (0.40 * max(1.0 - j, 0.0) / j2v)**2
             if v < nmax: nmax = v
 
-            # (29d)  |ΔJ|_rms <= max(|0.25*j − jmin|, 0.10*jmin)
-            floor = max(abs(0.25*j - jmin), 0.10 * jmin)
+            # (29d) distance to loss cone (CORRECT FORM)
+            # rms cap by max( gamma*(j - jmin), 0.10*jmin )
+            gap = cone_gamma_val * (j - jmin)
+            floor = max(gap, 0.10 * jmin)
             if floor > 0.0:
                 v = (floor / j2v)**2
                 if v < nmax: nmax = v
 
-        # choose n; tiny safety floor to avoid zero
+        # choose n (fraction of an orbit); no artificial 0.5 cap
         n = nmax if nmax > 1e-8 else 1e-8
-        # if n > 0.5: n = 0.5     # REMOVED: let limiter rules decide
         return n
 
     @njit(**fastmath)
@@ -204,9 +205,9 @@ def _build_kernels(use_jit=True):
         return y1, y2
 
     @njit(**fastmath)
-    def step_one(x, j, phase):
+    def step_one(x, j, phase, cone_gamma_val):
         e1, e2v, j1v, j2v, z2v = bilinear_coeffs(x, j)
-        n_raw = pick_n(x, j, e2v, j2v)
+        n_raw = pick_n(x, j, e2v, j2v, cone_gamma_val)
 
         # land exactly on next pericenter if we'd cross it
         next_int = math.floor(phase) + 1.0
@@ -244,7 +245,7 @@ def _build_kernels(use_jit=True):
         return x_new, j_new, phase, n, captured, crossed_peri
 
     @njit(**fastmath)
-    def run_stream(n_relax, floors, clones_per_split, x_bins, dx, seed):
+    def run_stream(n_relax, floors, clones_per_split, x_bins, dx, seed, cone_gamma_val):
         np.random.seed(seed)
 
         # parent (time carrier)
@@ -254,7 +255,7 @@ def _build_kernels(use_jit=True):
         w = 1.0
 
         # clone pool
-        MAX_CLONES = 2048
+        MAX_CLONES = 512
         cx  = np.zeros(MAX_CLONES, dtype=np.float64)
         cj  = np.zeros(MAX_CLONES, dtype=np.float64)
         cph = np.zeros(MAX_CLONES, dtype=np.float64)
@@ -287,7 +288,7 @@ def _build_kernels(use_jit=True):
 
         while t0_used < n_relax:
             x_prev = x; j_prev = j
-            x, j, phase, n_used, cap, crossed = step_one(x, j, phase)
+            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, cone_gamma_val)
             
             # dt0 (this step) in t0 units from the *parent's* previous state
             dt0 = (n_used * P_of_x(x_prev)) / T0
@@ -326,14 +327,15 @@ def _build_kernels(use_jit=True):
                     alpha = 1.0/(1.0 + clones_per_split)
                     w = w * alpha
                     for k in range(clones_per_split):
-                        if ccount < MAX_CLONES:
-                            cx[ccount] = x
-                            cj[ccount] = j
-                            cph[ccount]= phase
-                            cw[ccount] = w
-                            cfloor[ccount] = f
-                            cactive[ccount] = 1
-                            ccount += 1
+                        if ccount >= MAX_CLONES:
+                            break
+                        cx[ccount] = x
+                        cj[ccount] = j
+                        cph[ccount]= phase
+                        cw[ccount] = w
+                        cfloor[ccount] = f
+                        cactive[ccount] = 1
+                        ccount += 1
                     break
 
             # step active clones (share time; do not add to t0_used)
@@ -342,7 +344,7 @@ def _build_kernels(use_jit=True):
                 if cactive[i] == 0:
                     i += 1; continue
                 x_c, j_c, ph_c = cx[i], cj[i], cph[i]
-                x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c)
+                x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, cone_gamma_val)
                 cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
 
                 # count pericenter crossings
@@ -378,14 +380,15 @@ def _build_kernels(use_jit=True):
                         alpha = 1.0/(1.0 + clones_per_split)
                         cw[i] = cw[i] * alpha
                         for k in range(clones_per_split):
-                            if ccount < MAX_CLONES:
-                                cx[ccount] = x_c2
-                                cj[ccount] = j_c2
-                                cph[ccount]= ph_c2
-                                cw[ccount] = cw[i]
-                                cfloor[ccount] = f
-                                cactive[ccount] = 1
-                                ccount += 1
+                            if ccount >= MAX_CLONES:
+                                break
+                            cx[ccount] = x_c2
+                            cj[ccount] = j_c2
+                            cph[ccount]= ph_c2
+                            cw[ccount] = cw[i]
+                            cfloor[ccount] = f
+                            cactive[ccount] = 1
+                            ccount += 1
                         break
                 i += 1
 
@@ -395,41 +398,19 @@ def _build_kernels(use_jit=True):
 
     return which_bin, P_of_x, T0, run_stream
 
-# ---------------- multiprocessing worker ----------------
-def _worker(args):
-    try:
-        batch_ids, n_relax, floors, clones_per_split, stream_seeds, use_jit, _ = args
-        which_bin, P_of_x, T0, run_stream = _build_kernels(use_jit=use_jit)
-
-        cap_sum  = np.zeros_like(X_BINS, dtype=np.float64)
-        gtime_sum= np.zeros_like(X_BINS, dtype=np.float64)
-        t0_sum   = 0.0
-        peri_sum = 0
-        caps_sum = 0
-
-        for sid in batch_ids:
-            cap_i, gtime_i, t0_i, cross_i, caps_i = run_stream(
-                n_relax, floors, clones_per_split, X_BINS, DX, int(stream_seeds[sid])
-            )
-            # ASSERT: if a stream saw captures, the array must reflect it
-            if caps_i > 0 and not np.any(cap_i > 0):
-                raise RuntimeError("stream captured>0 but capture array all-zero (wiring bug)")
-
-            cap_sum  += cap_i
-            gtime_sum+= gtime_i
-            t0_sum   += float(t0_i)
-            peri_sum += int(cross_i)
-            caps_sum += int(caps_i)
-
-        return cap_sum, gtime_sum, t0_sum, peri_sum, caps_sum
-    except Exception as e:
-        print(f"Worker error: {e}", file=sys.stderr)
-        z = np.zeros_like(X_BINS, dtype=np.float64)
-        return z, z, 0.0, 0, 0
+# ---------------- multiprocessing worker (single stream) ----------------
+def _worker_one(args):
+    sid, n_relax, floors, clones_per_split, stream_seeds, use_jit, cone_gamma = args
+    which_bin, P_of_x, T0, run_stream = _build_kernels(use_jit=use_jit, cone_gamma=cone_gamma)
+    # warmup tiny call to pull kernels from cache
+    _ = run_stream(1e-6, floors, clones_per_split, X_BINS, DX,
+                   int(stream_seeds[sid] ^ 0xABCDEF), cone_gamma)
+    return run_stream(n_relax, floors, clones_per_split, X_BINS, DX,
+                      int(stream_seeds[sid]), cone_gamma)
 
 # ---------------- parallel driver ----------------
 def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
-                 procs=None, use_jit=True, seed=SEED, show_progress=True):
+                 procs=None, use_jit=True, seed=SEED, show_progress=True, cone_gamma=0.25):
 
     if floors is None:
         floors = np.array([10.0**(-k) for k in range(0, 9)], dtype=np.float64)  # 1 ... 1e-8
@@ -446,23 +427,9 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
     rs = np.random.RandomState(seed)
     stream_seeds = rs.randint(1, 2**31-1, size=n_streams, dtype=np.int64)
 
-    # split indices
-    batch_sizes = [n_streams // procs] * procs
-    for i in range(n_streams % procs):
-        batch_sizes[i] += 1
-    batches = []
-    idx = 0
-    for bsz in batch_sizes:
-        if bsz > 0:
-            batches.append(tuple(range(idx, idx+bsz)))
-        idx += bsz
-
     # Progress tracking
     if show_progress:
-        completed_streams = 0
         start_time = time.time()
-        last_update = start_time
-        
         print(f"Starting {n_streams} streams across {procs} processes...", file=sys.stderr)
 
     cap_total  = np.zeros_like(X_BINS, dtype=np.float64)
@@ -472,49 +439,35 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
     caps_total = 0
     try:
         with cf.ProcessPoolExecutor(max_workers=procs) as ex:
-            futs = [ex.submit(_worker, (batch, n_relax, floors, clones_per_split, stream_seeds, use_jit, None))
-                    for batch in batches if len(batch)>0]
+            futs = [ex.submit(_worker_one, (sid, n_relax, floors, clones_per_split, stream_seeds, use_jit, cone_gamma))
+                    for sid in range(n_streams)]
             
-            # Monitor progress
-            if show_progress:
-                for i, f in enumerate(cf.as_completed(futs)):
-                    cap_b, gtime_b, t0_b, peri_b, caps_b = f.result()
-                    cap_total  += cap_b
-                    gtime_total+= gtime_b
-                    t0_total   += t0_b
-                    peri_total += peri_b
-                    caps_total += caps_b
-                    completed_streams += len(batches[i])
-                    
-                    # Update progress display
-                    current_time = time.time()
-                    if current_time - last_update >= 1.0:  # Update every second
-                        elapsed = current_time - start_time
-                        rate = completed_streams / elapsed if elapsed > 0 else 0
-                        eta = (n_streams - completed_streams) / rate if rate > 0 else 0
-                        
-                        progress_pct = (completed_streams / n_streams) * 100
-                        print(f"\rProgress: {completed_streams:4d}/{n_streams} ({progress_pct:5.1f}%) | "
-                              f"Rate: {rate:5.1f} streams/s | ETA: {eta:5.0f}s", 
-                              end="", flush=True, file=sys.stderr)
-                        last_update = current_time
-            else:
-                for f in cf.as_completed(futs):
-                    cap_b, gtime_b, t0_b, peri_b, caps_b = f.result()
-                    cap_total  += cap_b
-                    gtime_total+= gtime_b
-                    t0_total   += t0_b
-                    peri_total += peri_b
-                    caps_total += caps_b
+            completed = 0
+            for f in cf.as_completed(futs):
+                cap_b, gtime_b, t0_b, peri_b, caps_b = f.result()
+                cap_total  += cap_b
+                gtime_total+= gtime_b
+                t0_total   += t0_b
+                peri_total += peri_b
+                caps_total += caps_b
+                completed += 1
+                
+                if show_progress:
+                    elapsed = time.time() - start_time
+                    rate = completed / max(elapsed, 1e-9)
+                    eta = (n_streams - completed) / max(rate, 1e-9)
+                    print(f"\rProgress: {completed}/{n_streams} ({100*completed/n_streams:5.1f}%) | "
+                          f"Rate: {rate:5.1f} streams/s | ETA: {eta:5.0f}s",
+                          end="", flush=True, file=sys.stderr)
                     
     except KeyboardInterrupt:
         if show_progress:
-            print(f"\nSimulation interrupted after {completed_streams}/{n_streams} streams", file=sys.stderr)
+            print(f"\nSimulation interrupted after {completed}/{n_streams} streams", file=sys.stderr)
         raise
     finally:
         if show_progress:
             elapsed_total = time.time() - start_time
-            print(f"\nCompleted {completed_streams}/{n_streams} streams in {elapsed_total:.1f}s", file=sys.stderr)
+            print(f"\nCompleted {completed}/{n_streams} streams in {elapsed_total:.1f}s", file=sys.stderr)
 
     # ---- FE from capture histogram ----
     denom = float(n_streams) * float(n_relax)
@@ -566,6 +519,7 @@ def main():
         ap.add_argument("--nojit", action="store_true", help="disable numba JIT (slow fallback)")
         ap.add_argument("--no-progress", action="store_true", help="disable progress display")
         ap.add_argument("--seed", type=int, default=SEED)
+        ap.add_argument("--cone_gamma", type=float, default=0.25, help="prefactor in (29d): floor = max(gamma*(j-jmin), 0.10*jmin)")
         args = ap.parse_args()
 
         floors = np.array([10.0**(-k) for k in range(0, args.floors_min_exp+1)], dtype=np.float64)
@@ -579,7 +533,8 @@ def main():
             procs=args.procs,
             use_jit=(not args.nojit),
             seed=args.seed,
-            show_progress=(not args.no_progress)
+            show_progress=(not args.no_progress),
+            cone_gamma=args.cone_gamma
         )
 
         print(f"Simulation completed successfully!", file=sys.stderr)
