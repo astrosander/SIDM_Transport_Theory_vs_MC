@@ -247,7 +247,70 @@ def _build_kernels(use_jit=True, cone_gamma=1.0):
     def T0_val():
         return T0
 
-    return j_min_of_x, P_of_x, T0_val, bin_of, step_one
+    # -------- JIT full per-stream loop (warm-up + measurement) --------
+    @njit(**fast)
+    def run_stream_jit(n_relax_t0, warmup_t0, cone_gamma_val, seed,
+                       snap_peri_meas, capB, capC, kappaE,
+                       X_EDGES_local, X_BINS_local):
+        # local handles so numba sees shapes
+        np.random.seed(seed)
+        T0loc = T0_val()
+        g_time = np.zeros(X_BINS_local.size, dtype=np.float32)
+
+        # init at reservoir
+        x = X_BOUND
+        j = math.sqrt(np.random.random())
+        w = 1.0
+        ph = 0.0
+
+        # warm-up (captures enabled so the system equilibrates)
+        t0_used = 0.0
+        while t0_used < warmup_t0:
+            x_prev = x
+            x, j, ph, n_used, cap, crossed = step_one(x, j, ph, cone_gamma_val,
+                                                      disable_capture=False, snap_peri=True,
+                                                      capB=0.10, capC=0.40, kappaE=0.10)
+            t0_used += (n_used * P_of_x(x_prev)) / T0loc
+            if cap or (x < X_BOUND):
+                x = X_BOUND
+                j = math.sqrt(np.random.random())
+
+        # measurement (disable capture, use relaxed parameters)
+        t0_used = 0.0
+        total_t0 = 0.0
+        while t0_used < n_relax_t0:
+            x_prev = x
+            x, j, ph, n_used, cap, crossed = step_one(x, j, ph, cone_gamma_val,
+                                                      disable_capture=True,
+                                                      snap_peri=snap_peri_meas,
+                                                      capB=capB, capC=capC, kappaE=kappaE)
+            dt0 = (n_used * P_of_x(x_prev)) / T0loc
+            t0_used += dt0
+            total_t0 += dt0
+
+            # adaptive time deposition (looser threshold for speed)
+            xp = x_prev if x_prev > 1e-12 else 1e-12
+            xn = x if x > 1e-12 else 1e-12
+            dlogx = abs(math.log(xn / xp))
+            if dlogx <= 0.50:  # looser threshold; measurement is smooth in log x
+                xm = math.sqrt(xp * xn)
+                b = bin_of(xm, X_EDGES_local)
+                g_time[b] += w * dt0
+            else:
+                nsub = min(3, 1 + int(dlogx / 0.50))  # at most 3 substeps
+                ratio = xn / xp
+                for k in range(nsub):
+                    xm = xp * (ratio ** ((k + 0.5) / nsub))
+                    b = bin_of(xm, X_EDGES_local)
+                    g_time[b] += w * (dt0 / nsub)
+
+            if x < X_BOUND:
+                x = X_BOUND
+                j = math.sqrt(np.random.random())
+
+        return g_time, total_t0
+
+    return j_min_of_x, P_of_x, T0_val, bin_of, step_one, run_stream_jit
 
 def _ensure_kernels(use_jit, cone_gamma):
     """Build kernels once per process and cache them."""
@@ -334,16 +397,17 @@ def run_stream(n_relax_t0, warmup_t0, cone_gamma, use_jit, seed, progress_q=None
 # -------------- Per-stream worker (for frequent progress updates) --------------
 def _worker_one(stream_idx, windows, warmup, cone_gamma, use_jit, seed, progress_q=None,
                 hb_dt0=0.5, snap_peri_meas=False, capB=0.15, capC=0.60, kappaE=0.20):
-    """Run exactly one stream (kept for CHUNK=1)."""
+    """Run exactly one stream (JIT)."""
     # ensure kernels compiled once at process start
-    _ensure_kernels(use_jit, cone_gamma)
-    g, t = run_stream(windows, warmup, cone_gamma, use_jit, int(seed),
-                      progress_q=progress_q, hb_dt0=hb_dt0,
-                      snap_peri_meas=snap_peri_meas, capB=capB, capC=capC, kappaE=kappaE)
-    # top off any fractional remainder to reach +1.0 exactly
+    j_min_of_x, P_of_x, T0_val, bin_of, step_one, run_stream_jit = _ensure_kernels(use_jit, cone_gamma)
+    # Use jitted version for full loop (no Python↔Numba overhead)
+    g, t = run_stream_jit(windows, warmup, cone_gamma, int(seed),
+                          snap_peri_meas, capB, capC, kappaE,
+                          X_EDGES, X_BINS)
+    # Progress ping (simplified - jitted loop doesn't support heartbeats, but that's fine)
     if progress_q is not None:
         try:
-            progress_q.put_nowait(1.0)  # harmless if we already sent ~1.0 in heartbeats
+            progress_q.put_nowait(1.0)
         except Exception:
             pass
     return g, t
@@ -353,27 +417,28 @@ def _worker_chunk(start_idx, count, windows, warmup, cone_gamma, use_jit, seeds,
                   hb_dt0=0.5, snap_peri_meas=False, capB=0.15, capC=0.60, kappaE=0.20):
     """Run count streams starting from start_idx, aggregate results."""
     # compile kernels ONCE for the whole chunk
-    _ensure_kernels(use_jit, cone_gamma)
+    j_min_of_x, P_of_x, T0_val, bin_of, step_one, run_stream_jit = _ensure_kernels(use_jit, cone_gamma)
     gsum = np.zeros_like(X_BINS, dtype=np.float32)
     t0sum = 0.0
     for i in range(count):
         idx = start_idx + i
-        g, t = run_stream(windows, warmup, cone_gamma, use_jit, int(seeds[idx]),
-                          progress_q=progress_q, hb_dt0=hb_dt0,
-                          snap_peri_meas=snap_peri_meas, capB=capB, capC=capC, kappaE=kappaE)
+        # Use jitted version for full loop (no Python↔Numba overhead)
+        g, t = run_stream_jit(windows, warmup, cone_gamma, int(seeds[idx]),
+                             snap_peri_meas, capB, capC, kappaE,
+                             X_EDGES, X_BINS)
         gsum += g
         t0sum += t
-        # top off any fractional remainder to reach +1.0 exactly
+        # Progress ping per stream
         if progress_q is not None:
             try:
-                progress_q.put_nowait(1.0)  # harmless if we already sent ~1.0 in heartbeats
+                progress_q.put_nowait(1.0)
             except Exception:
                 pass
     return gsum, t0sum
 
 # -------------- Parallel aggregator --------------
 def run_parallel(streams, windows, warmup, procs, cone_gamma, use_jit, seed, normalize,
-                 hb_dt0=0.5, snap_peri_meas=False, capB=0.15, capC=0.60, kappaE=0.20):
+                 hb_dt0=0.5, snap_peri_meas=False, capB=0.15, capC=0.60, kappaE=0.20, chunk=8):
     import concurrent.futures as cf
     import multiprocessing as mp
     rs = np.random.RandomState(seed)
@@ -394,9 +459,9 @@ def run_parallel(streams, windows, warmup, procs, cone_gamma, use_jit, seed, nor
         pass
     
     # Batch several streams per worker to amortize JIT/overhead.
-    # Aim ~8–16 tasks per process.
-    CHUNK = max(8, streams // max(1, procs * 8))
-    use_chunks = True
+    # Aim ~2–4 tasks per process outstanding (so for 48 procs, ~100–200 chunks total).
+    CHUNK = chunk
+    use_chunks = (CHUNK > 1)
     
     if use_chunks:
         chunks = []
@@ -568,6 +633,7 @@ def main():
     ap.add_argument("--normalize", action="store_true", help="scale so ḡ(x≈0.225)=1 (filled circles)")
     ap.add_argument("--plot", type=str, default="", help="optional output PNG path to plot filled circles")
     ap.add_argument("--hb", type=float, default=0.5, help="heartbeat interval in t0 per worker (default 0.5)")
+    ap.add_argument("--chunk", type=int, default=8, help="streams per task (1 = per-stream tasks; default 8)")
     ap.add_argument("--snap-peri-meas", action="store_true",
                     help="during measurement, still snap steps to pericenter (slower; off by default)")
     ap.add_argument("--capB", type=float, default=0.15, help="(29b) factor during measurement (default 0.15; warm-up uses 0.10)")
@@ -586,7 +652,8 @@ def main():
         normalize=args.normalize,
         hb_dt0=args.hb,
         snap_peri_meas=args.snap_peri_meas,
-        capB=args.capB, capC=args.capC, kappaE=args.kappaE
+        capB=args.capB, capC=args.capC, kappaE=args.kappaE,
+        chunk=args.chunk
     )
 
     # Print table
