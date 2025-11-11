@@ -63,6 +63,50 @@ new_data_y = np.array([
     9.579539e-05, 1.555108e-04, 0.000000e+00, 0.000000e+00, 0.000000e+00
 ], dtype=float)
 
+# ---- Data from four runs ----
+run1 = np.array([
+    [0.225,0.000000e+00],[0.303,1.000590e-03],[0.495,2.714267e-03],[1.04,5.184111e-03],
+    [1.26,4.384712e-03],[1.62,2.186703e-02],[2.35,2.875843e-02],[5,8.892460e-02],
+    [7.2,1.182511e-01],[8.94,1.465482e-01],[12.1,1.666774e-01],[19.7,1.126482e-01],
+    [41.6,5.163395e-02],[50.3,4.219078e-02],[64.6,3.155535e-02],[93.6,1.781566e-02],
+    [198,2.339926e-02],[287,1.079163e-02],[356,1.107759e-02],[480,6.997449e-03],
+    [784,3.741057e-03],[1.65e3,2.024366e-03],[2e3,0.000000e+00],[2.57e3,0.000000e+00],[3.73e3,0.000000e+00]
+])
+run2 = np.array([
+    [0.225,0.000000e+00],[0.303,0.000000e+00],[0.495,2.691134e-03],[1.04,4.883582e-03],
+    [1.26,5.827685e-03],[1.62,2.220318e-02],[2.35,3.242589e-02],[5,6.313616e-02],
+    [7.2,1.303366e-01],[8.94,1.582560e-01],[12.1,1.923832e-01],[19.7,1.078610e-01],
+    [41.6,5.603471e-02],[50.3,4.653395e-02],[64.6,4.279424e-02],[93.6,2.226958e-02],
+    [198,1.533055e-02],[287,1.471586e-02],[356,4.747538e-03],[480,0.000000e+00],
+    [784,1.870528e-03],[1.65e3,1.012183e-03],[2e3,0.000000e+00],[2.57e3,0.000000e+00],[3.73e3,0.000000e+00]
+])
+run3 = np.array([
+    [0.225,0.000000e+00],[0.303,1.235296e-05],[0.495,1.928318e-03],[1.04,7.025773e-03],
+    [1.26,1.492679e-02],[1.62,1.408434e-02],[2.35,3.781186e-02],[5,7.779861e-02],
+    [7.2,1.094286e-01],[8.94,1.557634e-01],[12.1,1.579445e-01],[19.7,1.236441e-01],
+    [41.6,6.222329e-02],[50.3,4.529305e-02],[64.6,3.803933e-02],[93.6,3.162280e-02],
+    [198,1.452368e-02],[287,5.886346e-03],[356,5.275042e-03],[480,1.999271e-03],
+    [784,2.494038e-03],[1.65e3,2.024366e-03],[2e3,0.000000e+00],[2.57e3,0.000000e+00],[3.73e3,0.000000e+00]
+])
+run4 = np.array([
+    [0.225,0.000000e+00],[0.303,2.223534e-04],[0.495,3.247182e-04],[1.04,2.028565e-03],
+    [1.26,7.826884e-03],[1.62,1.766613e-02],[2.35,3.218485e-02],[5,8.553480e-02],
+    [7.2,1.177405e-01],[8.94,1.872764e-01],[12.1,1.392343e-01],[19.7,1.106196e-01],
+    [41.6,5.997290e-02],[50.3,5.211803e-02],[64.6,4.870187e-02],[93.6,2.538732e-02],
+    [198,1.828908e-02],[287,5.886346e-03],[356,3.165025e-03],[480,5.997813e-03],
+    [784,2.494038e-03],[1.65e3,1.012183e-03],[2e3,0.000000e+00],[2.57e3,0.000000e+00],[3.73e3,0.000000e+00]
+])
+
+# ---- Combine four runs and compute mean ± std ----
+runs = [run1, run2, run3, run4]
+x_mc = run1[:, 0]  # X values (should match new_data_x)
+y_all = np.array([r[:, 1] for r in runs])
+y_all[y_all <= 0] = np.nan  # Treat zeros as NaN for statistics
+
+# Compute mean ± std
+y_mean = np.nanmean(y_all, axis=0)
+y_std = np.nanstd(y_all, axis=0)
+
 FE_x     = Fstar * x_vals
 FE_x_err = Fstar_err * x_vals
 
@@ -111,6 +155,7 @@ pd.DataFrame({"x": x_vals, "gbar": gbar, "gbar_err": gbar_err}).to_csv("/mnt/dat
 pd.DataFrame({"x": x_vals, "Fstar": Fstar, "Fstar_err": Fstar_err, "FE_x": FE_x, "FE_x_err": FE_x_err}).to_csv("/mnt/data/figure3_FEx.csv", index=False)
 pd.DataFrame({"x": new_data_x, "y": new_data_y}).to_csv("/mnt/data/figure3_new_data.csv", index=False)
 pd.DataFrame({"x": X_line, "g0": g0_line}).to_csv("/mnt/data/figure3_g0_curve.csv", index=False)
+pd.DataFrame({"x": x_mc, "y_mean": y_mean, "y_std": y_std}).to_csv("/mnt/data/figure3_mc_mean_std.csv", index=False)
 
 # ---- Plot ----
 plt.figure(figsize=(6,5), dpi=140)
@@ -136,10 +181,11 @@ plt.errorbar(x_vals[small], FE_x[small], yerr=FE_x_err[small],
 plt.errorbar(x_vals[large], FE_x[large], yerr=FE_x_err[large],
              fmt="s", mfc="none", markersize=5, capsize=2, label="large-error points")
 
-# Plot new data alongside F_E^*\cdot X
-mask_new = new_data_y > 0  # Only plot non-zero values
-plt.scatter(new_data_x[mask_new], new_data_y[mask_new], 
-            s=30, marker="^", label="$F_E^*\cdot X$ (MC)", alpha=0.7, color="red")
+# Plot MC data with mean ± std error bars
+mask_mc = ~np.isnan(y_mean) & (y_mean > 0)  # Only plot non-zero, non-NaN values
+plt.errorbar(x_mc[mask_mc], y_mean[mask_mc], yerr=y_std[mask_mc],
+             fmt="^", markersize=5, capsize=3, capthick=1.5,
+             label=r"$F_E^*\cdot X$ (MC, mean ± std)", alpha=0.8, color="red", elinewidth=1.5)
 
 # plt.annotate(r"$x_{\rm crit}=10$", xy=(10, 1e-1), xytext=(12, 2e-1),
 #              arrowprops=dict(arrowstyle="->", lw=1))
