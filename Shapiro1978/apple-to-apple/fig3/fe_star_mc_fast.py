@@ -250,6 +250,16 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
         return k
 
     @njit(**fastmath)
+    def target_floor_with_hysteresis(j2, floors, current_idx, split_hyst=0.8):
+        # Return the target floor index with hysteresis: only advance if j2 is comfortably
+        # inside the next floor (j2 < split_hyst * floor_value)
+        # This reduces split/unsplit churn at floor boundaries
+        k = current_idx
+        while (k + 1) < floors.size and j2 < split_hyst * floors[k + 1]:
+            k += 1
+        return k
+
+    @njit(**fastmath)
     def step_one(x, j, phase, cone_gamma_val):
         e1, e2v, j1v, j2v, z2v = bilinear_coeffs(x, j)
         n_raw = pick_n(x, j, e2v, j2v, cone_gamma_val)
@@ -342,21 +352,11 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
             else:
                 # splitting for parent: split only when entering a new deeper floor (with hysteresis)
                 j2_now = j*j
-                target_idx = floor_index_for_j2(j2_now, floors)
+                target_idx = target_floor_with_hysteresis(j2_now, floors, parent_floor_idx, SPLIT_HYST)
                 
                 # If we just crossed deeper floors, process each newly-entered floor once.
-                # Use hysteresis: split only when comfortably inside the next floor (80% threshold)
                 while parent_floor_idx < target_idx:
-                    next_floor_idx = parent_floor_idx + 1
-                    if next_floor_idx < floors.size:
-                        # Check if we're comfortably inside the next floor (hysteresis)
-                        if j2_now >= SPLIT_HYST * floors[next_floor_idx]:
-                            parent_floor_idx = next_floor_idx  # we are now in this deeper floor
-                        else:
-                            break  # not deep enough yet, wait
-                    else:
-                        parent_floor_idx = target_idx  # already at deepest floor
-                        break
+                    parent_floor_idx += 1  # we are now in this deeper floor
 
                     # Split only if we can spawn the full batch.
                     if ccount <= MAX_CLONES - clones_per_split:
@@ -409,19 +409,10 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
 
                 # deeper splitting for clone: split only when entering a new deeper floor (with hysteresis)
                 j2_c = j_c2 * j_c2
-                target_idx_c = floor_index_for_j2(j2_c, floors)
+                target_idx_c = target_floor_with_hysteresis(j2_c, floors, cfloor_idx[i], SPLIT_HYST)
                 
                 while cfloor_idx[i] < target_idx_c:
-                    next_floor_idx_c = cfloor_idx[i] + 1
-                    if next_floor_idx_c < floors.size:
-                        # Check if we're comfortably inside the next floor (hysteresis)
-                        if j2_c >= SPLIT_HYST * floors[next_floor_idx_c]:
-                            cfloor_idx[i] = next_floor_idx_c  # deeper floor reached
-                        else:
-                            break  # not deep enough yet, wait
-                    else:
-                        cfloor_idx[i] = target_idx_c  # already at deepest floor
-                        break
+                    cfloor_idx[i] += 1  # deeper floor reached
 
                     if ccount <= MAX_CLONES - clones_per_split:
                         alpha = 1.0 / (1.0 + clones_per_split)
@@ -489,21 +480,11 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                 else:
                     # 3) split on j^2 floors *after* cap/escape: split only when entering a new deeper floor (with hysteresis)
                     j2_now = j*j
-                    target_idx = floor_index_for_j2(j2_now, floors)
+                    target_idx = target_floor_with_hysteresis(j2_now, floors, parent_floor_idx, SPLIT_HYST)
                     
                     # If we just crossed deeper floors, process each newly-entered floor once.
-                    # Use hysteresis: split only when comfortably inside the next floor (80% threshold)
                     while parent_floor_idx < target_idx:
-                        next_floor_idx = parent_floor_idx + 1
-                        if next_floor_idx < floors.size:
-                            # Check if we're comfortably inside the next floor (hysteresis)
-                            if j2_now >= SPLIT_HYST * floors[next_floor_idx]:
-                                parent_floor_idx = next_floor_idx  # we are now in this deeper floor
-                            else:
-                                break  # not deep enough yet, wait
-                        else:
-                            parent_floor_idx = target_idx  # already at deepest floor
-                            break
+                        parent_floor_idx += 1  # we are now in this deeper floor
 
                         # Split only if we can spawn the full batch.
                         if ccount <= MAX_CLONES - clones_per_split:
@@ -568,19 +549,10 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
 
                 # 4) clone splitting: split only when entering a new deeper floor (with hysteresis)
                 j2_c = j_c2 * j_c2
-                target_idx_c = floor_index_for_j2(j2_c, floors)
+                target_idx_c = target_floor_with_hysteresis(j2_c, floors, cfloor_idx[i], SPLIT_HYST)
                 
                 while cfloor_idx[i] < target_idx_c:
-                    next_floor_idx_c = cfloor_idx[i] + 1
-                    if next_floor_idx_c < floors.size:
-                        # Check if we're comfortably inside the next floor (hysteresis)
-                        if j2_c >= SPLIT_HYST * floors[next_floor_idx_c]:
-                            cfloor_idx[i] = next_floor_idx_c  # deeper floor reached
-                        else:
-                            break  # not deep enough yet, wait
-                    else:
-                        cfloor_idx[i] = target_idx_c  # already at deepest floor
-                        break
+                    cfloor_idx[i] += 1  # deeper floor reached
 
                     if ccount <= MAX_CLONES - clones_per_split:
                         alpha = 1.0 / (1.0 + clones_per_split)
