@@ -187,6 +187,7 @@ def _build_kernels(use_jit=True):
 
         # choose n; tiny safety floor to avoid zero
         n = nmax if nmax > 1e-8 else 1e-8
+        # if n > 0.5: n = 0.5     # REMOVED: let limiter rules decide
         return n
 
     @njit(**fastmath)
@@ -220,8 +221,9 @@ def _build_kernels(use_jit=True):
         x_new = x - dE
         if x_new < 1e-12: x_new = 1e-12
 
-        # J update: 2-D RW if step large vs J *and* j small
-        if (math.sqrt(n)*j2v > max(1e-12, j/4.0)) and (j < 0.4):
+        # 2-D RW gate: small-j OR large RMS kick vs J
+        use_2d = (j < 0.4) or (math.sqrt(n)*j2v > max(1e-12, j/4.0))
+        if use_2d:
             z1 = np.random.normal()
             z2 = np.random.normal()
             j_new = math.sqrt( (j + math.sqrt(n)*z1*j2v)**2 + (math.sqrt(n)*z2*j2v)**2 )
@@ -290,6 +292,9 @@ def _build_kernels(use_jit=True):
             x, j, phase, n_used, cap, crossed = step_one(x, j, phase)
             t0_used += (n_used * P_of_x(x_prev)) / T0
 
+            # count pericenter crossings
+            if crossed: crosses += 1
+
             # 1) capture first
             if cap:
                 caps += 1
@@ -331,6 +336,9 @@ def _build_kernels(use_jit=True):
                 x_c, j_c, ph_c = cx[i], cj[i], cph[i]
                 x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c)
                 cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
+
+                # count pericenter crossings
+                if crossed_c: crosses += 1
 
                 # 1) capture first
                 if cap_c:
@@ -563,7 +571,7 @@ def main():
         ap.add_argument("--streams", type=int, default=400, help="number of non-clone streams")
         ap.add_argument("--windows", type=float, default=6.0, help="t0 windows per stream (n_relax)")
         ap.add_argument("--procs", type=int, default=None, help="process count (defaults to all cores)")
-        ap.add_argument("--floors_min_exp", type=int, default=8, help="min exponent k for floors 10^{-k}")
+        ap.add_argument("--floors_min_exp", type=int, default=10, help="min exponent k for floors 10^{-k}")
         ap.add_argument("--clones", type=int, default=9, help="clones per split")
         ap.add_argument("--nojit", action="store_true", help="disable numba JIT (slow fallback)")
         ap.add_argument("--no-progress", action="store_true", help="disable progress display")
