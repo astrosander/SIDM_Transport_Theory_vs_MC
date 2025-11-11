@@ -301,7 +301,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
         parent_floor_idx = floor_index_for_j2(j*j, floors)  # -1 if above floors[0]
 
         # clone pool (use floor indices, not floor values)
-        MAX_CLONES = 512
+        MAX_CLONES = 2048
         cx  = np.zeros(MAX_CLONES, dtype=np.float64)
         cj  = np.zeros(MAX_CLONES, dtype=np.float64)
         cph = np.zeros(MAX_CLONES, dtype=np.float64)
@@ -388,12 +388,13 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                     cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
                     cfloor_idx[i] = floor_index_for_j2(j_c2*j_c2, floors)
 
-                # outward across its own floor -> remove
-                if cfloor_idx[i] >= 0:
-                    if j_c2*j_c2 >= floors[cfloor_idx[i]]:
-                        cactive[i] = 0
-                        i += 1
-                        continue
+                # outward across its own floor -> remove (conserve mass: return weight to parent)
+                if cfloor_idx[i] >= 0 and j_c2*j_c2 >= floors[cfloor_idx[i]]:
+                    w += cw[i]  # return clone weight to parent before deleting
+                    cw[i] = 0.0
+                    cactive[i] = 0
+                    i += 1
+                    continue
 
                 # deeper splitting for clone: split only when entering a new deeper floor
                 j2_c = j_c2 * j_c2
@@ -526,12 +527,13 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                     cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
                     cfloor_idx[i] = floor_index_for_j2(j_c2*j_c2, floors)
 
-                # 3) floor removal last (don't suppress a capture): outward across its own floor -> remove
-                if cfloor_idx[i] >= 0:
-                    if j_c2*j_c2 >= floors[cfloor_idx[i]]:
-                        cactive[i] = 0
-                        i += 1
-                        continue
+                # 3) floor removal last (don't suppress a capture): outward across its own floor -> remove (conserve mass: return weight to parent)
+                if cfloor_idx[i] >= 0 and j_c2*j_c2 >= floors[cfloor_idx[i]]:
+                    w += cw[i]  # return clone weight to parent before deleting
+                    cw[i] = 0.0
+                    cactive[i] = 0
+                    i += 1
+                    continue
 
                 # 4) clone splitting: split only when entering a new deeper floor
                 j2_c = j_c2 * j_c2
@@ -581,7 +583,7 @@ def _worker_one(args):
 
 # ---------------- parallel driver ----------------
 def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
-                 procs=None, use_jit=True, seed=SEED, show_progress=True, cone_gamma=0.25, warmup_t0=12.0):
+                 procs=None, use_jit=True, seed=SEED, show_progress=True, cone_gamma=0.25, warmup_t0=2.0, scale_by_gbar=False):
 
     if floors is None:
         floors = np.array([10.0**(-k) for k in range(0, 9)], dtype=np.float64)  # 1 ... 1e-8
@@ -682,7 +684,12 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
     assert not (caps_total > 0 and cap_total.sum() == 0.0), \
         "Got capture events but capture histogram is zero — check worker/unpack/return order."
 
-    return FE_x
+    # Optional scaling by gbar for Table-2 comparison (reporting only, doesn't change physics)
+    FE_x_out = FE_x.copy()
+    if scale_by_gbar and gbar[norm_idx] > 0:
+        FE_x_out *= 1.0 / gbar[norm_idx]
+
+    return FE_x_out
 
 # ---------------- CLI ----------------
 def main():
@@ -691,13 +698,15 @@ def main():
         ap.add_argument("--streams", type=int, default=400, help="number of non-clone streams")
         ap.add_argument("--windows", type=float, default=6.0, help="t0 windows per stream (n_relax)")
         ap.add_argument("--procs", type=int, default=None, help="process count (defaults to all cores)")
-        ap.add_argument("--floors_min_exp", type=int, default=10, help="min exponent k for floors 10^{-k}")
+        ap.add_argument("--floors_min_exp", type=int, default=8, help="min exponent k for floors 10^{-k}")
         ap.add_argument("--clones", type=int, default=9, help="clones per split")
         ap.add_argument("--nojit", action="store_true", help="disable numba JIT (slow fallback)")
         ap.add_argument("--no-progress", action="store_true", help="disable progress display")
         ap.add_argument("--seed", type=int, default=SEED)
         ap.add_argument("--cone_gamma", type=float, default=0.25, help="prefactor in (29d): floor = max(gamma*(j-jmin), 0.10*jmin)")
-        ap.add_argument("--warmup", type=float, default=12.0, help="equilibration time in t0 before tallying")
+        ap.add_argument("--warmup", type=float, default=2.0, help="equilibration time in t0 before tallying")
+        ap.add_argument("--scale-by-gbar", action="store_true",
+                        help="Scale printed FE*x by 1/gbar(x_b) for Table-2 comparison only (reporting only, doesn't change physics)")
         args = ap.parse_args()
 
         floors = np.array([10.0**(-k) for k in range(0, args.floors_min_exp+1)], dtype=np.float64)
@@ -713,7 +722,8 @@ def main():
             seed=args.seed,
             show_progress=(not args.no_progress),
             cone_gamma=args.cone_gamma,
-            warmup_t0=args.warmup
+            warmup_t0=args.warmup,
+            scale_by_gbar=args.scale_by_gbar
         )
 
         print(f"Simulation completed successfully!", file=sys.stderr)
