@@ -594,7 +594,7 @@ def _worker_one(args):
 
 # ---------------- parallel driver ----------------
 def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
-                 procs=None, use_jit=True, seed=SEED, show_progress=True, cone_gamma=0.25, warmup_t0=2.0, scale_by_gbar=False, collect_gbar=True):
+                 procs=None, use_jit=True, seed=SEED, show_progress=True, cone_gamma=0.25, warmup_t0=2.0, scale_by_gbar=False, collect_gbar=True, replicates=1):
 
     if floors is None:
         floors = np.array([10.0**(-k) for k in range(0, 9)], dtype=np.float64)  # 1 ... 1e-8
@@ -607,66 +607,88 @@ def run_parallel(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
     import concurrent.futures as cf
     import multiprocessing as mp
 
-    # seeds per stream
     rs = np.random.RandomState(seed)
-    stream_seeds = rs.randint(1, 2**31-1, size=n_streams, dtype=np.int64)
-    
-    # Stratified reservoir sampling: evenly spaced u values, then shuffled
-    # This reduces variance compared to i.i.d. sampling
-    u_strat = (np.arange(n_streams) + 0.5) / n_streams
-    rs.shuffle(u_strat)  # shuffle to break correlation with stream ID
 
     # Progress tracking
     if show_progress:
         start_time = time.time()
-        print(f"Starting {n_streams} streams across {procs} processes...", file=sys.stderr)
+        if replicates > 1:
+            print(f"Starting {replicates} replicates × {n_streams} streams across {procs} processes...", file=sys.stderr)
+        else:
+            print(f"Starting {n_streams} streams across {procs} processes...", file=sys.stderr)
 
     cap_total  = np.zeros_like(X_BINS, dtype=np.float64)
     gtime_total= np.zeros_like(X_BINS, dtype=np.float64)
     t0_total   = 0.0
     peri_total = 0
     caps_total = 0
+    total_streams_completed = 0
+    zero_count_streams = 0
+    max_ccount = 0
+    
     try:
-        with cf.ProcessPoolExecutor(max_workers=procs) as ex:
-            futs = [ex.submit(_worker_one, (sid, n_relax, floors, clones_per_split, stream_seeds, use_jit, cone_gamma, warmup_t0, collect_gbar, u_strat[sid]))
-                    for sid in range(n_streams)]
+        for rep in range(replicates):
+            # Fresh seeds & stratified u each replicate
+            stream_seeds = rs.randint(1, 2**31-1, size=n_streams, dtype=np.int64)
+            u_strat = (np.arange(n_streams) + 0.5) / n_streams
+            rs.shuffle(u_strat)  # shuffle to break correlation with stream ID
             
-            completed = 0
-            zero_count_streams = 0
-            max_ccount = 0
-            for f in cf.as_completed(futs):
-                cap_b, gtime_b, t0_b, peri_b, caps_b, did_count_b, ccount_b = f.result()
-                cap_total  += cap_b
-                gtime_total+= gtime_b
-                t0_total   += t0_b
-                peri_total += peri_b
-                caps_total += caps_b
-                if did_count_b == 0.0:
-                    zero_count_streams += 1
-                if ccount_b > max_ccount:
-                    max_ccount = ccount_b
-                completed += 1
+            if show_progress and replicates > 1:
+                print(f"Replicate {rep+1}/{replicates}...", file=sys.stderr)
+            
+            with cf.ProcessPoolExecutor(max_workers=procs) as ex:
+                futs = [ex.submit(_worker_one, (sid, n_relax, floors, clones_per_split, stream_seeds, use_jit, cone_gamma, warmup_t0, collect_gbar, u_strat[sid]))
+                        for sid in range(n_streams)]
                 
-                if show_progress:
-                    elapsed = time.time() - start_time
-                    rate = completed / max(elapsed, 1e-9)
-                    eta = (n_streams - completed) / max(rate, 1e-9)
-                    print(f"\rProgress: {completed}/{n_streams} ({100*completed/n_streams:5.1f}%) | "
-                          f"Rate: {rate:5.1f} streams/s | ETA: {eta:5.0f}s",
-                          end="", flush=True, file=sys.stderr)
+                completed = 0
+                for f in cf.as_completed(futs):
+                    cap_b, gtime_b, t0_b, peri_b, caps_b, did_count_b, ccount_b = f.result()
+                    cap_total  += cap_b
+                    gtime_total+= gtime_b
+                    t0_total   += t0_b
+                    peri_total += peri_b
+                    caps_total += caps_b
+                    if did_count_b == 0.0:
+                        zero_count_streams += 1
+                    if ccount_b > max_ccount:
+                        max_ccount = ccount_b
+                    completed += 1
+                    total_streams_completed += 1
+                    
+                    if show_progress:
+                        elapsed = time.time() - start_time
+                        if replicates > 1:
+                            total_expected = replicates * n_streams
+                            rate = total_streams_completed / max(elapsed, 1e-9)
+                            eta = (total_expected - total_streams_completed) / max(rate, 1e-9)
+                            print(f"\rProgress: rep {rep+1}/{replicates}, {completed}/{n_streams} streams | "
+                                  f"Total: {total_streams_completed}/{total_expected} ({100*total_streams_completed/total_expected:5.1f}%) | "
+                                  f"Rate: {rate:5.1f} streams/s | ETA: {eta:5.0f}s",
+                                  end="", flush=True, file=sys.stderr)
+                        else:
+                            rate = completed / max(elapsed, 1e-9)
+                            eta = (n_streams - completed) / max(rate, 1e-9)
+                            print(f"\rProgress: {completed}/{n_streams} ({100*completed/n_streams:5.1f}%) | "
+                                  f"Rate: {rate:5.1f} streams/s | ETA: {eta:5.0f}s",
+                                  end="", flush=True, file=sys.stderr)
                     
     except KeyboardInterrupt:
         if show_progress:
-            print(f"\nSimulation interrupted after {completed}/{n_streams} streams", file=sys.stderr)
+            print(f"\nSimulation interrupted after {total_streams_completed} total streams", file=sys.stderr)
         raise
     finally:
         if show_progress:
             elapsed_total = time.time() - start_time
-            print(f"\nCompleted {completed}/{n_streams} streams in {elapsed_total:.1f}s", file=sys.stderr)
+            if replicates > 1:
+                print(f"\nCompleted {replicates} replicates ({total_streams_completed} total streams) in {elapsed_total:.1f}s", file=sys.stderr)
+            else:
+                print(f"\nCompleted {total_streams_completed}/{n_streams} streams in {elapsed_total:.1f}s", file=sys.stderr)
 
     # --- FE*(x) from weighted capture counts (no extra scaling by gbar) ---
+    # Normalize by total streams across all replicates
+    total_streams = replicates * n_streams
     FE = np.zeros_like(X_BINS)
-    np.divide(cap_total, (n_streams * n_relax) * DX, out=FE, where=(DX > 0))
+    np.divide(cap_total, (total_streams * n_relax) * DX, out=FE, where=(DX > 0))
     FE_x = FE * X_BINS
 
     # --- OPTIONAL: compute gbar(x) only for diagnostics (not used to scale FE) ---
@@ -730,6 +752,8 @@ def main():
                         help="Scale printed FE*x by 1/gbar(x_b) for Table-2 comparison only (reporting only, doesn't change physics)")
         ap.add_argument("--no-gbar", action="store_true",
                         help="Skip gbar(x) occupancy accumulation (faster, but no gbar diagnostics)")
+        ap.add_argument("--replicates", type=int, default=1,
+                        help="Repeat the whole measurement K times and accumulate raw tallies (reduces variance by ~√K)")
         args = ap.parse_args()
 
         floors = np.array([10.0**(-k) for k in range(0, args.floors_min_exp+1, args.floor_step)], dtype=np.float64)
@@ -747,7 +771,8 @@ def main():
             cone_gamma=args.cone_gamma,
             warmup_t0=args.warmup,
             scale_by_gbar=args.scale_by_gbar,
-            collect_gbar=(not args.no_gbar)
+            collect_gbar=(not args.no_gbar),
+            replicates=args.replicates
         )
 
         print(f"Simulation completed successfully!", file=sys.stderr)
