@@ -169,16 +169,17 @@ def _build_kernels(use_jit=True, cone_gamma=1.0):
         return e1, e2v, j1v, j2v, z2v
 
     @njit(**fast)
-    def pick_n(x, j, e2v, j2v, cone_gamma_val, disable_capture=False):
+    def pick_n(x, j, e2v, j2v, cone_gamma_val, disable_capture=False,
+               capB=0.10, capC=0.40, kappaE=0.10):
         jmin = j_min_of_x(x)
         nmax = 1e30
         if e2v > 0.0:  # (29a)
             v = (0.15*abs(x)/max(e2v,1e-30))**2
             if v < nmax: nmax = v
         if j2v > 0.0:
-            v = (0.10/j2v)**2                 # (29b)
+            v = (capB/j2v)**2                 # (29b)
             if v < nmax: nmax = v
-            v = (0.40*max(1.0-j,0.0)/j2v)**2  # (29c)
+            v = (capC*max(1.0-j,0.0)/j2v)**2  # (29c)
             if v < nmax: nmax = v
             # (29d) Skip when measuring gbar (no capture during measurement)
             if not disable_capture:
@@ -186,8 +187,8 @@ def _build_kernels(use_jit=True, cone_gamma=1.0):
                 if floor > 0.0:
                     v = (floor/j2v)**2
                     if v < nmax: nmax = v
-        # (29e) practical energy-step cap (relaxed when capture disabled)
-        kappa = 0.10 if disable_capture else 0.07
+        # (29e) practical energy-step cap
+        kappa = kappaE if disable_capture else 0.07
         if e2v > 0.0:
             v = (kappa*abs(x)/max(e2v,1e-30))**2
             if v < nmax: nmax = v
@@ -205,13 +206,19 @@ def _build_kernels(use_jit=True, cone_gamma=1.0):
         return y1, y2
 
     @njit(**fast)
-    def step_one(x, j, phase, cone_gamma_val, disable_capture=False):
+    def step_one(x, j, phase, cone_gamma_val, disable_capture=False, snap_peri=True,
+                 capB=0.10, capC=0.40, kappaE=0.10):
         # Return: x2, j2, phase2, n_used, captured?, crossed_pericenter?
         e1, e2v, j1v, j2v, z2v = bilinear_coeffs(x, j)
-        n_raw = pick_n(x, j, e2v, j2v, cone_gamma_val, disable_capture)
-        next_int = math.floor(phase) + 1.0
-        crossed = (phase + n_raw >= next_int)
-        n = next_int - phase if crossed else n_raw
+        n_raw = pick_n(x, j, e2v, j2v, cone_gamma_val, disable_capture, capB, capC, kappaE)
+        if snap_peri:
+            next_int = math.floor(phase) + 1.0
+            crossed = (phase + n_raw >= next_int)
+            n = next_int - phase if crossed else n_raw
+        else:
+            # Don't truncate to pericenter; just note if a crossing happened (diagnostic only).
+            n = n_raw
+            crossed = (math.floor(phase) != math.floor(phase + n))
 
         y1, y2 = correlated_normals(e2v, j2v, z2v)
         dE = n*e1 + math.sqrt(n)*y1*e2v
@@ -229,7 +236,7 @@ def _build_kernels(use_jit=True, cone_gamma=1.0):
         if j2 > 1.0: j2 = 1.0
 
         phase2 = phase + n
-        # Disable capture during ḡ measurement to avoid loss-cone depletion
+        # Disable capture during ḡ measurement
         if disable_capture:
             captured = False
         else:
@@ -252,7 +259,8 @@ def _ensure_kernels(use_jit, cone_gamma):
     return _K_CACHE
 
 # -------------- Single-stream driver (no clones; just occupancy) --------------
-def run_stream(n_relax_t0, warmup_t0, cone_gamma, use_jit, seed, progress_q=None, hb_dt0=0.5):
+def run_stream(n_relax_t0, warmup_t0, cone_gamma, use_jit, seed, progress_q=None, hb_dt0=0.5,
+               snap_peri_meas=False, capB=0.15, capC=0.60, kappaE=0.20):
     # Build kernels once per process, then reuse
     j_min_of_x, P_of_x, T0_val, bin_of, step_one = _ensure_kernels(use_jit, cone_gamma)
     T0 = T0_val()
@@ -268,7 +276,10 @@ def run_stream(n_relax_t0, warmup_t0, cone_gamma, use_jit, seed, progress_q=None
     t0_used = 0.0
     while t0_used < warmup_t0:
         x_prev = x
-        x, j, ph, n_used, cap, crossed = step_one(x, j, ph, cone_gamma)
+        # Keep original pericenter snapping and strict caps in warm-up
+        x, j, ph, n_used, cap, crossed = step_one(x, j, ph, cone_gamma,
+                                                  disable_capture=False, snap_peri=True,
+                                                  capB=0.10, capC=0.40, kappaE=0.10)
         t0_used += (n_used * P_of_x(x_prev)) / T0
         if cap or (x < X_BOUND):
             # replacement at reservoir; keep phase (age)
@@ -283,7 +294,10 @@ def run_stream(n_relax_t0, warmup_t0, cone_gamma, use_jit, seed, progress_q=None
     since_hb = 0.0
     while t0_used < n_relax_t0:
         x_prev = x
-        x, j, ph, n_used, cap, crossed = step_one(x, j, ph, cone_gamma, disable_capture=True)
+        x, j, ph, n_used, cap, crossed = step_one(x, j, ph, cone_gamma,
+                                                  disable_capture=True,
+                                                  snap_peri=snap_peri_meas,
+                                                  capB=capB, capC=capC, kappaE=kappaE)
         dt0 = (n_used * P_of_x(x_prev)) / T0
         t0_used += dt0
         total_t0 += dt0
@@ -291,12 +305,12 @@ def run_stream(n_relax_t0, warmup_t0, cone_gamma, use_jit, seed, progress_q=None
 
         # Adaptive coarse time deposition: midpoint for small moves, substep only for large
         dlogx = abs(math.log(max(x, 1e-12) / max(x_prev, 1e-12)))
-        if dlogx <= 0.35:  # slightly looser; fewer substeps, same accuracy for ḡ
+        if dlogx <= 0.50:  # looser threshold; measurement is smooth in log x
             xm = math.sqrt(x_prev * x)
             g_time[bin_of(xm, X_EDGES)] += w * dt0
         else:
-            # At most 4 substeps for very large moves
-            nsub = min(4, 1 + int(dlogx / 0.35))
+            # At most 3 substeps for very large moves
+            nsub = min(3, 1 + int(dlogx / 0.50))
             ratio = max(x, 1e-12) / max(x_prev, 1e-12)
             for k in range(nsub):
                 xm = x_prev * (ratio ** ((k + 0.5) / nsub))
@@ -318,12 +332,14 @@ def run_stream(n_relax_t0, warmup_t0, cone_gamma, use_jit, seed, progress_q=None
     return g_time, total_t0
 
 # -------------- Per-stream worker (for frequent progress updates) --------------
-def _worker_one(stream_idx, windows, warmup, cone_gamma, use_jit, seed, progress_q=None, hb_dt0=0.5):
+def _worker_one(stream_idx, windows, warmup, cone_gamma, use_jit, seed, progress_q=None,
+                hb_dt0=0.5, snap_peri_meas=False, capB=0.15, capC=0.60, kappaE=0.20):
     """Run exactly one stream (kept for CHUNK=1)."""
     # ensure kernels compiled once at process start
     _ensure_kernels(use_jit, cone_gamma)
     g, t = run_stream(windows, warmup, cone_gamma, use_jit, int(seed),
-                      progress_q=progress_q, hb_dt0=hb_dt0)
+                      progress_q=progress_q, hb_dt0=hb_dt0,
+                      snap_peri_meas=snap_peri_meas, capB=capB, capC=capC, kappaE=kappaE)
     # top off any fractional remainder to reach +1.0 exactly
     if progress_q is not None:
         try:
@@ -333,7 +349,8 @@ def _worker_one(stream_idx, windows, warmup, cone_gamma, use_jit, seed, progress
     return g, t
 
 # -------------- Chunked worker (for reduced overhead when needed) --------------
-def _worker_chunk(start_idx, count, windows, warmup, cone_gamma, use_jit, seeds, progress_q=None, hb_dt0=0.5):
+def _worker_chunk(start_idx, count, windows, warmup, cone_gamma, use_jit, seeds, progress_q=None,
+                  hb_dt0=0.5, snap_peri_meas=False, capB=0.15, capC=0.60, kappaE=0.20):
     """Run count streams starting from start_idx, aggregate results."""
     # compile kernels ONCE for the whole chunk
     _ensure_kernels(use_jit, cone_gamma)
@@ -342,7 +359,8 @@ def _worker_chunk(start_idx, count, windows, warmup, cone_gamma, use_jit, seeds,
     for i in range(count):
         idx = start_idx + i
         g, t = run_stream(windows, warmup, cone_gamma, use_jit, int(seeds[idx]),
-                          progress_q=progress_q, hb_dt0=hb_dt0)
+                          progress_q=progress_q, hb_dt0=hb_dt0,
+                          snap_peri_meas=snap_peri_meas, capB=capB, capC=capC, kappaE=kappaE)
         gsum += g
         t0sum += t
         # top off any fractional remainder to reach +1.0 exactly
@@ -354,7 +372,8 @@ def _worker_chunk(start_idx, count, windows, warmup, cone_gamma, use_jit, seeds,
     return gsum, t0sum
 
 # -------------- Parallel aggregator --------------
-def run_parallel(streams, windows, warmup, procs, cone_gamma, use_jit, seed, normalize, hb_dt0=0.5):
+def run_parallel(streams, windows, warmup, procs, cone_gamma, use_jit, seed, normalize,
+                 hb_dt0=0.5, snap_peri_meas=False, capB=0.15, capC=0.60, kappaE=0.20):
     import concurrent.futures as cf
     import multiprocessing as mp
     rs = np.random.RandomState(seed)
@@ -484,12 +503,14 @@ def run_parallel(streams, windows, warmup, procs, cone_gamma, use_jit, seed, nor
         with cf.ProcessPoolExecutor(max_workers=procs, mp_context=ctx) as ex:
             if use_chunks:
                 futs = {ex.submit(_worker_chunk, start, count, windows, warmup, cone_gamma,
-                                  use_jit, seeds, progress_q, hb_dt0): (start, count)
+                                  use_jit, seeds, progress_q, hb_dt0,
+                                  snap_peri_meas, capB, capC, kappaE): (start, count)
                         for start, count in chunks}
             else:
                 # Per-stream tasks (rare after chunking enabled)
                 futs = {ex.submit(_worker_one, sid, windows, warmup, cone_gamma, use_jit,
-                                  seeds[sid], progress_q, hb_dt0): sid
+                                  seeds[sid], progress_q, hb_dt0,
+                                  snap_peri_meas, capB, capC, kappaE): sid
                         for sid in range(streams)}
             
             for f in cf.as_completed(futs):
@@ -547,6 +568,11 @@ def main():
     ap.add_argument("--normalize", action="store_true", help="scale so ḡ(x≈0.225)=1 (filled circles)")
     ap.add_argument("--plot", type=str, default="", help="optional output PNG path to plot filled circles")
     ap.add_argument("--hb", type=float, default=0.5, help="heartbeat interval in t0 per worker (default 0.5)")
+    ap.add_argument("--snap-peri-meas", action="store_true",
+                    help="during measurement, still snap steps to pericenter (slower; off by default)")
+    ap.add_argument("--capB", type=float, default=0.15, help="(29b) factor during measurement (default 0.15; warm-up uses 0.10)")
+    ap.add_argument("--capC", type=float, default=0.60, help="(29c) factor during measurement (default 0.60; warm-up uses 0.40)")
+    ap.add_argument("--kappaE", type=float, default=0.20, help="(29e) energy-step cap during measurement (default 0.20; warm-up uses 0.10)")
     args = ap.parse_args()
 
     gbar = run_parallel(
@@ -558,7 +584,9 @@ def main():
         use_jit=(not args.nojit),
         seed=args.seed,
         normalize=args.normalize,
-        hb_dt0=args.hb
+        hb_dt0=args.hb,
+        snap_peri_meas=args.snap_peri_meas,
+        capB=args.capB, capC=args.capC, kappaE=args.kappaE
     )
 
     # Print table
