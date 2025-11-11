@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+# Stable MC for isotropized ḡ(x) — canonical case (x_D=1e4, P*=0.005)
+# - Constant-population SMC each step (exactly N=--pop stars, equal weights)
+# - Time deposition: add w*DT to current log-x bin; divide by total time
+# - No per-block renormalization to g0; optional final normalize to ḡ(0.225)=1
+# - One LUT from BWII g0; errors from block averages (no distortions)
+import math, argparse, numpy as np
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from scipy.integrate import cumulative_trapezoid
+
+SEED = 7
+rng  = np.random.default_rng(SEED)
+
+# Canonical parameters
+X_D    = 1.0e4
+P_STAR = 5.0e-3
+X_BOUND = 0.20   # canonical outer reservoir (x_b ≈ 0.2)
+
+# Bins (log-uniform) for ḡ; first-center close to 0.225
+XBINS = np.logspace(-1, 4, 60)
+XCEN  = np.sqrt(XBINS[:-1]*XBINS[1:])
+DLNX  = np.log(XBINS[1:]/XBINS[:-1])
+
+# ---------- BWII g0(x) ----------
+_ln1p = np.array([
+    0.00, 0.37, 0.74, 1.11, 1.47, 1.84, 2.21, 2.58, 2.95, 3.32,
+    3.68, 4.05, 4.42, 4.79, 5.16, 5.53, 5.89, 6.26, 6.63, 7.00,
+    7.37, 7.74, 8.11, 8.47, 8.84, 9.21
+], float)
+_g0tab = np.array([
+    1.00, 1.30, 1.55, 1.79, 2.03, 2.27, 2.53, 2.82, 3.13, 3.48,
+    3.88, 4.32, 4.83, 5.43, 6.12, 6.94, 7.93, 9.11, 10.55, 12.29,
+    14.36, 16.66, 18.80, 19.71, 15.70, 0.00
+], float)
+_Xg0 = np.exp(_ln1p) - 1.0
+mask = (_g0tab > 0) & (_Xg0 > 0)
+_lx, _lg = np.log10(_Xg0[mask]), np.log10(_g0tab[mask])
+_slope   = np.diff(_lg)/np.diff(_lx)
+def g0_interp(x):
+    x = np.asarray(x)
+    lx = np.log10(np.clip(x, 1e-12, X_D))
+    y  = np.empty_like(lx)
+    left  = lx < _lx[0]
+    right = lx > _lx[-1]
+    mid   = ~(left|right)
+    y[left]  = _lg[0]  + _slope[0]*(lx[left]  - _lx[0])
+    y[right] = _lg[-1] + _slope[-1]*(lx[right] - _lx[-1])
+    idx = np.clip(np.searchsorted(_lx, lx[mid]) - 1, 0, len(_slope)-1)
+    y[mid] = _lg[idx] + _slope[idx]*(lx[mid] - _lx[idx])
+    out = 10.0**y
+    # gentle taper to zero near X_D
+    x_last = _Xg0[mask][-1]
+    tmask  = (x >= x_last) & (x <= X_D)
+    if tmask.any():
+        g_start = out[tmask][0]
+        out[tmask] = np.maximum(g_start * (1 - (x[tmask]-x_last)/(X_D-x_last)), 1e-16)
+    return out
+
+# ---------- Kepler helpers for capture phase check ----------
+def j_min_exact(x):
+    val = 2.0*x/X_D - (x*x)/(X_D*X_D)
+    return math.sqrt(max(0.0, min(1.0, val)))
+def Ptilde(x):              # ∝ x^{-3/2}, only for pericenter counting
+    return max(1e-3, x**(-1.5))
+
+# ---------- θ-quadrature (12-pt) ----------
+def th_nodes(n=12):
+    t, w = np.polynomial.legendre.leggauss(n)
+    th = 0.25*np.pi*(t + 1.0)
+    wt = 0.25*np.pi*w
+    s, c = np.sin(th), np.cos(th)
+    return th, wt, s, c
+TH, WT, S, C = th_nodes(12)
+
+# ---------- Appendix A fast kernels ----------
+def _z123(x, j, xp, xap, xp2):
+    inv_x1 = 1.0/max(xp2, xap) - 1.0/max(xp, 1e-12)
+    inv_x2 = 1.0/min(xp2, xap) - 1.0/max(xp, 1e-12)
+    inv_x3 = 1.0/max(x,  1e-12) - 1.0/max(xp, 1e-12)
+    x1 = 1.0/max(inv_x1, 1e-16)
+    x2 = 1.0/max(inv_x2, 1e-16)
+    x3 = 1.0/max(inv_x3, 1e-16)
+    z1 = 1.0 + (xp/x1)*(S*S)
+    z2 = 1.0 - (x2/x1)*(S*S)
+    z3 = 1.0 - (x3/x1)*(S*S)
+    return x1, x2, x3, z1, z2, z3
+def pericenter_xp(x, j):
+    e = math.sqrt(max(0.0, 1.0 - j*j))
+    return 2.0*x / max(1e-12, 1.0 - e)
+def apocenter_xap(x, j):
+    e = math.sqrt(max(0.0, 1.0 - j*j))
+    return 2.0*x / (1.0 + e)
+
+def I1(xp2):  return 0.25*np.pi/(xp2**1.5)
+def I4(xp2):  return 0.25*np.pi/(xp2**0.5)
+def I2(x,j,xp,xap,xp2):
+    x1,x2,x3,z1,z2,z3 = _z123(x,j,xp,xap,xp2)
+    pref = math.sqrt((xp2*x3)/(x*x*xp*x2))
+    integ= z1*np.sqrt(np.clip(z2,0,None))/np.sqrt(np.clip(z3,1e-20,None))
+    return pref*np.sum(integ*WT)
+def I3(x,j,xp,xap,xp2):
+    x1,x2,x3,z1,z2,z3 = _z123(x,j,xp,xap,xp2)
+    pref = math.sqrt((xp2*x2*x3)/(x*x*x1*xp*xp))
+    integ= (C*C)*z1/np.sqrt(np.clip(z2,1e-20,None))/np.sqrt(np.clip(z3,1e-20,None))
+    return pref*np.sum(integ*WT)
+def I6(x,j,xp,xap,xp2):
+    x1,x2,x3,z1,z2,z3 = _z123(x,j,xp,xap,xp2)
+    pref = math.sqrt((xp2*x2*x3)/(x*x*(x1**3)))
+    integ= (C**4)*z1/np.sqrt(np.clip(z2,1e-20,None))/np.sqrt(np.clip(z3,1e-20,None))
+    return pref*np.sum(integ*WT)
+def I7(x,j,xp):
+    x1 = 1.0/(1.0/max(x,1e-12) - 1.0/max(xp,1e-12))
+    z1 = 1.0 + (xp/x1)*(S*S)
+    pref= math.sqrt(1.0/(x*(xp**3)))
+    return pref*np.sum(z1*WT)
+def I9(x,j,xp,xap,xp2):
+    x1,x2,x3,z1,z2,z3 = _z123(x,j,xp,xap,xp2)
+    pref = math.sqrt((xp2*x2*x3)/(x*(xp**3)*(x1**2)))
+    integ= (C*C)*(z1**3)/np.sqrt(np.clip(z2,1e-20,None))/np.sqrt(np.clip(z3,1e-20,None))
+    return pref*np.sum(integ*WT)
+def I10(x,j,xp,xap,xp2):
+    x1,x2,x3,z1,z2,z3 = _z123(x,j,xp,xap,xp2)
+    pref = math.sqrt(((xp2**3)*(x3**3))/(x*(xp**3)*(x2**3)))
+    integ= (z1**3)*(z2**1.5)/np.power(np.clip(z3,1e-20,None),1.5)
+    return pref*np.sum(integ*WT)
+def I11(x,j,xp,xap,xp2):
+    x1,x2,x3,z1,z2,z3 = _z123(x,j,xp,xap,xp2)
+    pref = math.sqrt(((xp2**3)*(x2**3))/(x*(xp**3)*(x1**3)))
+    integ= (C**4)*(z1**3)/np.sqrt(np.clip(z2,1e-20,None))/np.power(np.clip(z3,1e-20,None),1.5)
+    return pref*np.sum(integ*WT)
+def I12(x,j,xp,xap,xp2):
+    x1,x2,x3,z1,z2,z3 = _z123(x,j,xp,xap,xp2)
+    pref = math.sqrt((4*(xp2**2)*(x3**3))/((x**2)*(xp**4)*x1*x2))
+    integ= (S*S)*(C*C)*(z1**2)*np.sqrt(np.clip(z2,0,None))/np.power(np.clip(z3,1e-20,None),1.5)
+    return pref*np.sum(integ*WT)
+def I13(x,j,xp,xap,xp2):
+    x1,x2,x3,z1,z2,z3 = _z123(x,j,xp,xap,xp2)
+    pref = math.sqrt((4*(xp2**3)*(x3**5))/((x**4)*(xp**4)*(x1**4)*(x2**3)))
+    integ= (C*C)*(S*S)*(z1**3)*(z2**1.5)/np.power(np.clip(z3,1e-20,None),2.5)
+    return pref*np.sum(integ*WT)
+def I14(x,j,xp,xap,xp2):
+    x1,x2,x3,z1,z2,z3 = _z123(x,j,xp,xap,xp2)
+    pref = math.sqrt((4*(xp2**3)*(x3**5))/((x**4)*(xp**4)*(x1**6)*x2))
+    integ= (C**4)*(S*S)*(z1**3)/np.sqrt(np.clip(z2,1e-20,None))/np.power(np.clip(z3,1e-20,None),2.5)
+    return pref*np.sum(integ*WT)
+def I15(x,j,xp,xap,xp2):
+    x1,x2,x3,z1,z2,z3 = _z123(x,j,xp,xap,xp2)
+    pref = math.sqrt(((xp2**3)*(x3**3))/((x**4)*(xp**4)*(x2**3)))
+    integ= (z1)*(z2**1.5)/np.power(np.clip(z3,1e-20,None),1.5)
+    return pref*np.sum(integ*WT)
+def I16(x,j,xp,xap,xp2):
+    x1,x2,x3,z1,z2,z3 = _z123(x,j,xp,xap,xp2)
+    pref = math.sqrt(((xp2**3)*x2*(x3**3))/((x**4)*(xp**2)*(x1**4)))
+    integ= (C**4)*z1/np.sqrt(np.clip(z2,1e-20,None))/np.power(np.clip(z3,1e-20,None),1.5)
+    return pref*np.sum(integ*WT)
+
+# ---------- background + moments ----------
+class Background:
+    def __init__(self, xs, gs):
+        self.xg = np.logspace(-3, 4, 400)
+        lx = np.log(self.xg)
+        glog = np.log(np.clip(np.interp(lx, np.log(xs), np.log(np.clip(gs,1e-16,None))), 1e-16, None))
+        # mild smoothing
+        k = 7
+        ker = np.exp(-0.5*((np.arange(-k,k+1)/2.0)**2)); ker /= ker.sum()
+        glog = np.convolve(glog, ker, mode='same')
+        self.gg = np.exp(glog)
+        self.Mm32 = cumulative_trapezoid(self.gg * self.xg**(-1.5), self.xg, initial=0.0)
+        self.Mm12 = cumulative_trapezoid(self.gg * self.xg**(-0.5), self.xg, initial=0.0)
+    def g(self, x):
+        x = np.asarray(x)
+        idx = np.clip(np.searchsorted(self.xg, x)-1, 0, len(self.xg)-2)
+        x0,x1 = self.xg[idx], self.xg[idx+1]
+        g0,g1 = self.gg[idx], self.gg[idx+1]
+        t = (x - x0)/np.maximum(x1-x0, 1e-30)
+        return np.maximum(g0*(1-t)+g1*t, 1e-16)
+    def moment(self, x, which):
+        M = self.Mm32 if which=='m32' else self.Mm12
+        x = np.asarray(x)
+        idx = np.clip(np.searchsorted(self.xg, x)-1, 0, len(self.xg)-2)
+        x0,x1 = self.xg[idx], self.xg[idx+1]
+        m0,m1 = M[idx], M[idx+1]
+        t = (x - x0)/np.maximum(x1-x0, 1e-30)
+        return m0*(1-t)+m1*t
+
+# tiny x′-quadrature
+T12,W12 = np.polynomial.legendre.leggauss(12)
+def _int_region(fun_tuple, x, j, xp, xap, bg: Background):
+    val = 0.0
+    # (1) x'<x
+    if fun_tuple[0] is I1:
+        val += np.pi*0.25 * bg.moment(x, 'm32')
+    elif fun_tuple[0] is I4:
+        val += np.pi*0.25 * bg.moment(x, 'm12')
+    else:
+        lo,hi = 1e-4,x
+        if hi>lo*(1+1e-10):
+            llo,lhi = math.log(lo),math.log(hi)
+            lxs = 0.5*(lhi-llo)*T12 + 0.5*(lhi+llo)
+            xs  = np.exp(lxs); jac = 0.5*(lhi-llo)*xs
+            vals= np.array([fun_tuple[0](x,j,xp,xap,xp2)*bg.g(xp2) for xp2 in xs])
+            val+= float(np.sum(vals*jac*W12))
+    # (2) x≤x'<x_ap
+    lo,hi = x, min(apocenter_xap(x,j), X_D)
+    if hi>lo*(1+1e-10):
+        llo,lhi = math.log(lo),math.log(hi)
+        lxs = 0.5*(lhi-llo)*T12 + 0.5*(lhi+llo)
+        xs  = np.exp(lxs); jac = 0.5*(lhi-llo)*xs
+        vals= np.array([fun_tuple[1](x,j,xp,xap,xp2)*bg.g(xp2) for xp2 in xs])
+        val+= float(np.sum(vals*jac*W12))
+    # (3) x_ap≤x'≤x_p
+    lo,hi = max(apocenter_xap(x,j), x*(1+1e-12)), min(pericenter_xp(x,j), X_D)
+    if hi>lo*(1+1e-10):
+        llo,lhi = math.log(lo),math.log(hi)
+        lxs = 0.5*(lhi-llo)*T12 + 0.5*(lhi+llo)
+        xs  = np.exp(lxs); jac = 0.5*(lhi-llo)*xs
+        vals= np.array([fun_tuple[2](x,j,xp,xap,xp2)*bg.g(xp2) for xp2 in xs])
+        val+= float(np.sum(vals*jac*W12))
+    return val
+
+def orbital_perturbations(x, j, bg: Background):
+    xp, xap = pericenter_xp(x,j), apocenter_xap(x,j)
+    e1 = 3.0*np.sqrt(2*np.pi)*P_STAR * _int_region((lambda *a: I1(a[-1]), I2, I3), x,j,xp,xap,bg)
+    e2 = 4.0*np.sqrt(2*np.pi)*P_STAR * _int_region((lambda *a: I4(a[-1]), I6, I6), x,j,xp,xap,bg)
+    e2 = max(e2, 0.0)
+    if j>0.95:
+        j1 = np.sqrt(2*np.pi)*(x*P_STAR/max(j,1e-10)) * _int_region(
+            (lambda *a: 2*I7(x,j,xp),
+             lambda *a: 6*I12(x,j,xp,xap,a[-1])-9*I9(x,j,xp,xap,a[-1])-I10(x,j,xp,xap,a[-1]),
+             lambda *a: 6*I12(x,j,xp,xap,a[-1])-9*I9(x,j,xp,xap,a[-1])-I11(x,j,xp,xap,a[-1])), x,j,xp,xap,bg)
+        j2 = max(e2/(2*x), 0.0)
+        z2 = min(e2*j2, e2*j2+1e-22)
+        return e1, e2, j1, j2, max(z2,0.0)
+    if j<0.05:
+        j1 = np.sqrt(2*np.pi)*(x*P_STAR/max(j,1e-10)) * _int_region(
+            (lambda *a: 2*I7(x,j,xp),
+             lambda *a: 6*I12(x,j,xp,xap,a[-1])-9*I9(x,j,xp,xap,a[-1])-I10(x,j,xp,xap,a[-1]),
+             lambda *a: 6*I12(x,j,xp,xap,a[-1])-9*I9(x,j,xp,xap,a[-1])-I11(x,j,xp,xap,a[-1])), x,j,xp,xap,bg)
+        j2 = math.sqrt(max(2*j*j1, 0.0))
+        z2 = min(e2*j2, e2*j2+1e-22)
+        return e1, e2, j1, j2, max(z2,0.0)
+    j1 = np.sqrt(2*np.pi)*(x*P_STAR/max(j,1e-10)) * _int_region(
+        (lambda *a: 2*I7(x,j,xp),
+         lambda *a: 3*I12(x,j,xp,xap,a[-1])+4*I10(x,j,xp,xap,a[-1])-3*I13(x,j,xp,xap,a[-1]),
+         lambda *a: 3*I12(x,j,xp,xap,a[-1])+4*I11(x,j,xp,xap,a[-1])-3*I14(x,j,xp,xap,a[-1])), x,j,xp,xap,bg)
+    j2 = max(j1*0.0 + np.sqrt(2*np.pi)*x*P_STAR * 0.0, 0.0)  # conservative (j2 from general form below)
+    j2 = np.sqrt(2*np.pi)*x*P_STAR * _int_region(
+        (lambda *a: 4*I7(x,j,xp),
+         lambda *a: 3*I12(x,j,xp,xap,a[-1])+4*I10(x,j,xp,xap,a[-1])-3*I13(x,j,xp,xap,a[-1]),
+         lambda *a: 3*I12(x,j,xp,xap,a[-1])+4*I11(x,j,xp,xap,a[-1])-3*I14(x,j,xp,xap,a[-1])), x,j,xp,xap,bg)
+    j2 = max(j2, 0.0)
+    z2 = 2*np.sqrt(2*np.pi)*(j**2)*P_STAR * _int_region(
+        (lambda *a: I1(a[-1]), I15, I16), x,j,xp,xap,bg)
+    z2 = max(min(z2, e2*j2+1e-22), 0.0)
+    return e1, e2, j1, j2, z2
+
+# ---------- coefficient LUT ----------
+def precompute_LUT(nx, nj, bg: Background):
+    Xg = np.logspace(-3, 4, nx)
+    Jg = np.linspace(0.0, 1.0, nj)
+    E1 = np.zeros((nx, nj)); E2 = np.zeros_like(E1)
+    J1 = np.zeros_like(E1);   J2 = np.zeros_like(E1)
+    Z2 = np.zeros_like(E1)
+    print(f"Precomputing LUT {nx}x{nj} ...")
+    for ix,x in enumerate(Xg):
+        for ij,j in enumerate(Jg):
+            e1,e2,j1,j2,z2 = orbital_perturbations(x,j,bg)
+            E1[ix,ij]=e1; E2[ix,ij]=e2; J1[ix,ij]=j1; J2[ix,ij]=j2; Z2[ix,ij]=z2
+    return dict(x=Xg, j=Jg, e1=E1, e2=E2, j1=J1, j2=J2, z2=Z2)
+
+def _interp2(bx, by, gx, gy, A):
+    ix = np.clip(np.searchsorted(gx, bx) - 1, 0, len(gx)-2)
+    iy = np.clip(np.searchsorted(gy, by) - 1, 0, len(gy)-2)
+    x0,x1 = gx[ix], gx[ix+1]; y0,y1 = gy[iy], gy[iy+1]
+    tx = (bx - x0)/max(x1-x0,1e-30)
+    ty = (by - y0)/max(y1-y0,1e-30)
+    a00 = A[ix,iy]; a10 = A[ix+1,iy]; a01 = A[ix,iy+1]; a11 = A[ix+1,iy+1]
+    return (1-tx)*(1-ty)*a00 + tx*(1-ty)*a10 + (1-tx)*ty*a01 + tx*ty*a11
+
+def coeff_from_LUT(x, j, L):
+    e1 = _interp2(x,j,L['x'],L['j'],L['e1'])
+    e2 = _interp2(x,j,L['x'],L['j'],L['e2'])
+    j1 = _interp2(x,j,L['x'],L['j'],L['j1'])
+    j2 = _interp2(x,j,L['x'],L['j'],L['j2'])
+    z2 = _interp2(x,j,L['x'],L['j'],L['z2'])
+    e2 = max(e2, 0.0); j2 = max(j2, 0.0)
+    z2 = max(min(z2, e2*j2+1e-22), 0.0)
+    # asymptotes
+    if j>0.95 and e2>0: j2=max(e2/(2*x),0.0); z2=min(e2*j2, e2*j2+1e-22)
+    if j<0.05 and j1>0: j2=math.sqrt(max(2*j*j1,0.0))
+    z2 = max(min(z2, e2*j2+1e-22),0.0)
+    return e1,e2,j1,j2,z2
+
+# ---------- MC ----------
+@dataclass
+class Star:
+    x: float; j: float; phase: float=0.0
+
+def sample_initial(n):
+    # Start from the outer reservoir (canonical) and isotropic in j
+    xs = np.full(n, X_BOUND, dtype=float)
+    js = np.sqrt(rng.random(n))  # p(j)=2j
+    return [Star(float(xs[i]), float(js[i]), 0.0) for i in range(n)]
+
+def bidx(x):
+    return int(np.clip(np.searchsorted(XBINS, x)-1, 0, len(XCEN)-1))
+
+def mc_step(s: Star, L, DT):
+    e1,e2,j1,j2,z2 = coeff_from_LUT(s.x, s.j, L)
+    # correlated Gaussian kick
+    muE, muJ = e1*DT, j1*DT
+    sE2, sJ2, sEZ = e2*DT, j2*DT, z2*DT
+    a = math.sqrt(max(sE2, 0.0) + 1e-30)
+    c0 = math.sqrt(max(sJ2, 0.0) + 1e-30)
+    rho = np.clip(sEZ/(a*c0), -0.999, 0.999)
+    z1,z2n = rng.standard_normal(), rng.standard_normal()
+    dE = muE + a*z1  # ΔE over DT
+    dJ = muJ + rho*c0*z1 + c0*math.sqrt(max(1-rho*rho,0.0))*z2n
+    # bounded step (Shapiro 29a–c style, conservative)
+    max_dx = 0.15*max(s.x, 1e-6)
+    jmin   = j_min_exact(s.x)
+    max_dj = min(0.10, 0.40*max(0.0, 1.0 - s.j), max(0.25*abs(s.j - jmin), 0.10*max(jmin,1e-8)))
+    # apply the energy clamp (we forgot to use max_dx before)
+    s.x = float(np.clip(s.x - np.clip(dE, -max_dx, max_dx), 1e-4, X_D))
+    dj  = np.clip(dJ, -max_dj, max_dj)
+    s.j = float(np.clip(s.j + dj, 0.0, 1.0))
+    # capture at pericenter crossings (diagnostic; we replace immediately)
+    captured=False
+    prev = int(s.phase); s.phase += DT/max(Ptilde(s.x),1e-6)
+    if int(s.phase)>prev and (s.j <= j_min_exact(s.x)): captured=True
+    if captured:
+        # re-inject from the outer reservoir (canonical)
+        s.x = X_BOUND
+        s.j = float(np.sqrt(rng.random()))
+        s.phase = 0.0
+    return captured
+
+def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05):
+    # constant-population SMC with equal weights => total weight = pop
+    stars = sample_initial(pop)
+    gtime_blocks = [np.zeros_like(XCEN) for _ in range(blocks)]
+    t0_blocks    = np.zeros(blocks, float)
+    block_edges  = np.linspace(0, steps, blocks+1, dtype=int)
+    last_print = 0
+    for k in range(steps):
+        # deposit time for each star (equal weights)
+        blk = int(np.searchsorted(block_edges, k, side='right') - 1)
+        for s in stars:
+            gtime_blocks[blk][bidx(s.x)] += DT
+        t0_blocks[blk] += pop*DT
+
+        # advance all stars one step
+        for s in stars:
+            mc_step(s, LUT, DT)
+
+        # constant-pop systematic resampling (keep exactly pop)
+        # here weights are uniform so this is a no-op; placeholder in case you extend
+        # progress
+        p = (k+1)/steps
+        if p - last_print >= progress_every:
+            print(f"Progress: {100*p:5.1f}% ({k+1}/{steps})", flush=True)
+            last_print = p
+    # per-block spectra (no per-block renorm)
+    g_list = []
+    for b in range(blocks):
+        g_b = (gtime_blocks[b] / max(t0_blocks[b], 1e-30)) / DLNX
+        g_list.append(g_b)
+    g_arr  = np.stack(g_list, axis=0)
+    g_mean = np.mean(g_arr, axis=0)
+    # report standard error of the mean across blocks
+    nb = g_arr.shape[0]
+    g_var = np.var(g_arr, axis=0, ddof=1) if nb > 1 else np.zeros_like(g_mean)
+    g_err = np.sqrt(np.maximum(g_var/nb, 0.0))
+    return g_mean, g_err
+
+# ---------- CLI ----------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--steps", type=int, default=2000)
+    ap.add_argument("--dt", type=float, default=None, help="if None, dt = 6/steps (one 6 t0 iteration)")
+    ap.add_argument("--lut-x", type=int, default=40)
+    ap.add_argument("--lut-j", type=int, default=28)
+    ap.add_argument("--pop",   type=int, default=256)
+    ap.add_argument("--blocks",type=int, default=8)
+    ap.add_argument("--normalize-225", action="store_true")
+    ap.add_argument("--out", type=str, default="")
+    args = ap.parse_args()
+
+    DT = (6.0/args.steps) if args.dt is None else float(args.dt)
+
+    # LUT from BWII g0 (single iteration for stability + speed)
+    xgrid = np.logspace(-3, 4, 400)
+    bg0 = Background(xs=xgrid, gs=g0_interp(xgrid))
+    LUT = precompute_LUT(args.lut_x, args.lut_j, bg0)
+
+    g_mean, g_err = run_once(args.steps, DT, args.pop, LUT, blocks=args.blocks)
+
+    if args.normalize_225:
+        # normalize so ḡ at bin closest to 0.225 equals 1
+        idx_225 = int(np.argmin(np.abs(XCEN - 0.225)))
+        s = g_mean[idx_225] if g_mean[idx_225] > 0 else 1.0
+        g_mean /= s; g_err /= s
+
+    # write CSV
+    arr = np.column_stack([XCEN, g_mean, g_err])
+    np.savetxt("gbar_table.csv", arr, delimiter=",", header="x,gbar,gbar_err", comments="")
+    print("Wrote gbar_table.csv")
+
+    # plot
+    if args.out:
+        xcurve = np.logspace(-1, 4, 600)
+        g0c    = g0_interp(xcurve)
+        plt.figure(figsize=(6.2,6), dpi=140)
+        plt.xscale("log"); plt.yscale("log")
+        plt.xlim(1e-1, 1e4)
+        ymin = max(np.min(g_mean[g_mean>0])*0.6, 1e-4)
+        plt.ylim(ymin, max(np.max(g_mean)*2, 1e0))
+        plt.plot(xcurve, g0c, lw=2, label=r"$g_0$ (BW II)")
+        plt.errorbar(XCEN, g_mean, yerr=g_err, fmt="o", ms=4, capsize=2, label=r"$\bar g$")
+        plt.xlabel(r"$x$")
+        plt.ylabel(r"$\bar g(x)$")
+        plt.legend(loc="best", fontsize=9)
+        plt.tight_layout()
+        plt.savefig(args.out)
+        print(f"Wrote {args.out}")
+
+if __name__ == "__main__":
+    main()
