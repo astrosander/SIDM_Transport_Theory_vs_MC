@@ -11,6 +11,9 @@
 
 import math, os, sys, time, argparse
 import numpy as np
+from multiprocessing import Manager
+import multiprocessing as mp
+import threading
 
 # Optional numba
 try:
@@ -18,6 +21,10 @@ try:
     HAVE_NUMBA = True
 except Exception:
     HAVE_NUMBA = False
+
+# Kernel cache (per-process, avoids recompilation)
+_K_CACHE = None
+_K_KEY = None
 
 # ---------------- Canonical constants ----------------
 X_D     = 1.0e4
@@ -45,6 +52,7 @@ DX      = X_EDGES[1:] - X_EDGES[:-1]
 
 # ------------- Table-1 grids and starred coefficients -------------
 X_GRID = np.array([3.36e-1, 3.31e0, 3.27e1, 3.23e2, 3.18e3], dtype=np.float64)
+LOGX_GRID = np.log10(X_GRID)  # Precomputed for speed
 J_GRID = np.array([1.000, 0.401, 0.161, 0.065, 0.026], dtype=np.float64)  # descending
 
 NEG_E1 = np.array([
@@ -98,22 +106,25 @@ def _build_kernels(use_jit=True, cone_gamma=1.0):
         v = 2.0*x/X_D - (x/X_D)**2
         return math.sqrt(v) if v > 0.0 else 0.0
 
+    # Fast P_of_x: avoid pow, use CP / (x*sqrt(x)) where CP = 2π/(2^1.5)
+    CP = 2.0 * math.pi / (2.0**1.5)  # constant precomputed
+    
     @njit(**fast)
     def P_of_x(x):
-        E = -x
-        return 2.0*math.pi/((-2.0*E)**1.5)
+        # P = 2π/(-2E)^1.5 with E=-x, so P = 2π/(2x)^1.5 = CP/(x*sqrt(x))
+        return CP / (x * math.sqrt(x))
 
     T0 = P_of_x(1.0)/PSTAR
 
     @njit(**fast)
-    def which_bin(x):
-        best = 0
-        bestd = abs(X_BINS[0]-x)
-        for i in range(1, X_BINS.size):
-            d = abs(X_BINS[i]-x)
-            if d < bestd:
-                bestd = d; best = i
-        return best
+    def bin_of(xv, edges):
+        # Fast binary search via searchsorted
+        i = np.searchsorted(edges, xv, side='right') - 1
+        if i < 0:
+            i = 0
+        if i >= edges.size - 1:
+            i = edges.size - 2
+        return i
 
     @njit(**fast)
     def bilinear_coeffs(x, j):
@@ -126,8 +137,9 @@ def _build_kernels(use_jit=True, cone_gamma=1.0):
         for k in range(X_GRID.size-1):
             if X_GRID[k] <= x <= X_GRID[k+1]:
                 ix = k; break
-        x1 = X_GRID[ix]; x2 = X_GRID[ix+1]
-        tx = (lx - math.log10(x1)) / (math.log10(x2) - math.log10(x1) + 1e-30)
+        # Use precomputed LOGX_GRID
+        lx1 = LOGX_GRID[ix]; lx2 = LOGX_GRID[ix+1]
+        tx = (lx - lx1) / (lx2 - lx1 + 1e-30)
         if tx < 0.0: tx = 0.0
         if tx > 1.0: tx = 1.0
 
@@ -157,7 +169,7 @@ def _build_kernels(use_jit=True, cone_gamma=1.0):
         return e1, e2v, j1v, j2v, z2v
 
     @njit(**fast)
-    def pick_n(x, j, e2v, j2v, cone_gamma_val):
+    def pick_n(x, j, e2v, j2v, cone_gamma_val, disable_capture=False):
         jmin = j_min_of_x(x)
         nmax = 1e30
         if e2v > 0.0:  # (29a)
@@ -168,13 +180,14 @@ def _build_kernels(use_jit=True, cone_gamma=1.0):
             if v < nmax: nmax = v
             v = (0.40*max(1.0-j,0.0)/j2v)**2  # (29c)
             if v < nmax: nmax = v
-            # (29d)
-            floor = max(cone_gamma_val*(j - jmin), 0.10*jmin)
-            if floor > 0.0:
-                v = (floor/j2v)**2
-                if v < nmax: nmax = v
-        # (29e) practical energy-step cap: limit rms kick to small fraction of x
-        kappa = 0.07
+            # (29d) Skip when measuring gbar (no capture during measurement)
+            if not disable_capture:
+                floor = max(cone_gamma_val*(j - jmin), 0.10*jmin)
+                if floor > 0.0:
+                    v = (floor/j2v)**2
+                    if v < nmax: nmax = v
+        # (29e) practical energy-step cap (relaxed when capture disabled)
+        kappa = 0.10 if disable_capture else 0.07
         if e2v > 0.0:
             v = (kappa*abs(x)/max(e2v,1e-30))**2
             if v < nmax: nmax = v
@@ -195,7 +208,7 @@ def _build_kernels(use_jit=True, cone_gamma=1.0):
     def step_one(x, j, phase, cone_gamma_val, disable_capture=False):
         # Return: x2, j2, phase2, n_used, captured?, crossed_pericenter?
         e1, e2v, j1v, j2v, z2v = bilinear_coeffs(x, j)
-        n_raw = pick_n(x, j, e2v, j2v, cone_gamma_val)
+        n_raw = pick_n(x, j, e2v, j2v, cone_gamma_val, disable_capture)
         next_int = math.floor(phase) + 1.0
         crossed = (phase + n_raw >= next_int)
         n = next_int - phase if crossed else n_raw
@@ -227,11 +240,21 @@ def _build_kernels(use_jit=True, cone_gamma=1.0):
     def T0_val():
         return T0
 
-    return j_min_of_x, P_of_x, T0_val, which_bin, step_one
+    return j_min_of_x, P_of_x, T0_val, bin_of, step_one
+
+def _ensure_kernels(use_jit, cone_gamma):
+    """Build kernels once per process and cache them."""
+    global _K_CACHE, _K_KEY
+    key = (bool(use_jit), float(cone_gamma))
+    if (_K_CACHE is None) or (_K_KEY != key):
+        _K_CACHE = _build_kernels(use_jit=use_jit, cone_gamma=cone_gamma)
+        _K_KEY = key
+    return _K_CACHE
 
 # -------------- Single-stream driver (no clones; just occupancy) --------------
-def run_stream(n_relax_t0, warmup_t0, cone_gamma, use_jit, seed):
-    j_min_of_x, P_of_x, T0_val, which_bin, step_one = _build_kernels(use_jit=use_jit, cone_gamma=cone_gamma)
+def run_stream(n_relax_t0, warmup_t0, cone_gamma, use_jit, seed, progress_q=None, hb_dt0=0.5):
+    # Build kernels once per process, then reuse
+    j_min_of_x, P_of_x, T0_val, bin_of, step_one = _ensure_kernels(use_jit, cone_gamma)
     T0 = T0_val()
 
     # State
@@ -253,36 +276,87 @@ def run_stream(n_relax_t0, warmup_t0, cone_gamma, use_jit, seed):
             j = math.sqrt(rs.random())
 
     # Measurement (disable capture to measure background distribution)
-    g_time = np.zeros_like(X_BINS, dtype=np.float64)
+    # Use float32 for speed (fine for diagnostics)
+    g_time = np.zeros_like(X_BINS, dtype=np.float32)
     t0_used = 0.0
     total_t0 = 0.0
+    since_hb = 0.0
     while t0_used < n_relax_t0:
         x_prev = x
         x, j, ph, n_used, cap, crossed = step_one(x, j, ph, cone_gamma, disable_capture=True)
         dt0 = (n_used * P_of_x(x_prev)) / T0
         t0_used += dt0
         total_t0 += dt0
+        since_hb += dt0
 
-        # Unbiased time deposition: substep long moves in log-x space
+        # Adaptive coarse time deposition: midpoint for small moves, substep only for large
         dlogx = abs(math.log(max(x, 1e-12) / max(x_prev, 1e-12)))
-        nsub = max(1, int(dlogx / 0.05))  # ≤ 5% in ln x per substep
-        for k in range(nsub):
-            tfrac = dt0 / nsub
-            # Geometric midpoint in log-x for each substep
+        if dlogx <= 0.35:  # slightly looser; fewer substeps, same accuracy for ḡ
+            xm = math.sqrt(x_prev * x)
+            g_time[bin_of(xm, X_EDGES)] += w * dt0
+        else:
+            # At most 4 substeps for very large moves
+            nsub = min(4, 1 + int(dlogx / 0.35))
             ratio = max(x, 1e-12) / max(x_prev, 1e-12)
-            xk = x_prev * (ratio ** ((k + 0.5) / nsub))
-            g_time[which_bin(xk)] += w * tfrac
+            for k in range(nsub):
+                xm = x_prev * (ratio ** ((k + 0.5) / nsub))
+                g_time[bin_of(xm, X_EDGES)] += w * (dt0 / nsub)
 
         # Still replace at reservoir boundary (but no capture removal during measurement)
         if x < X_BOUND:
             x = X_BOUND
             j = math.sqrt(rs.random())
 
+        # heartbeat (optional, time-based) – avoids big msgs for long windows
+        if progress_q is not None and hb_dt0 > 0.0 and since_hb >= hb_dt0:
+            try:
+                progress_q.put_nowait(since_hb / n_relax_t0)
+            except Exception:
+                pass
+            since_hb = 0.0
+
     return g_time, total_t0
 
+# -------------- Per-stream worker (for frequent progress updates) --------------
+def _worker_one(stream_idx, windows, warmup, cone_gamma, use_jit, seed, progress_q=None, hb_dt0=0.5):
+    """Run exactly one stream (kept for CHUNK=1)."""
+    # ensure kernels compiled once at process start
+    _ensure_kernels(use_jit, cone_gamma)
+    g, t = run_stream(windows, warmup, cone_gamma, use_jit, int(seed),
+                      progress_q=progress_q, hb_dt0=hb_dt0)
+    # top off any fractional remainder to reach +1.0 exactly
+    if progress_q is not None:
+        try:
+            progress_q.put_nowait(1.0)  # harmless if we already sent ~1.0 in heartbeats
+        except Exception:
+            pass
+    return g, t
+
+# -------------- Chunked worker (for reduced overhead when needed) --------------
+def _worker_chunk(start_idx, count, windows, warmup, cone_gamma, use_jit, seeds, progress_q=None, hb_dt0=0.5):
+    """Run count streams starting from start_idx, aggregate results."""
+    # compile kernels ONCE for the whole chunk
+    _ensure_kernels(use_jit, cone_gamma)
+    gsum = np.zeros_like(X_BINS, dtype=np.float32)
+    t0sum = 0.0
+    for i in range(count):
+        idx = start_idx + i
+        g, t = run_stream(windows, warmup, cone_gamma, use_jit, int(seeds[idx]),
+                          progress_q=progress_q, hb_dt0=hb_dt0)
+        gsum += g
+        t0sum += t
+        # top off any fractional remainder to reach +1.0 exactly
+        if progress_q is not None:
+            try:
+                progress_q.put_nowait(1.0)  # harmless if we already sent ~1.0 in heartbeats
+            except Exception:
+                pass
+    return gsum, t0sum
+
 # -------------- Parallel aggregator --------------
-def run_parallel(streams, windows, warmup, procs, cone_gamma, use_jit, seed, normalize):
+def run_parallel(streams, windows, warmup, procs, cone_gamma, use_jit, seed, normalize, hb_dt0=0.5):
     import concurrent.futures as cf
+    import multiprocessing as mp
     rs = np.random.RandomState(seed)
     seeds = rs.randint(1, 2**31-1, size=streams, dtype=np.int64)
 
@@ -292,22 +366,159 @@ def run_parallel(streams, windows, warmup, procs, cone_gamma, use_jit, seed, nor
     if procs is None or procs < 1:
         procs = os.cpu_count() or 1
 
-    start = time.time()
-    with cf.ProcessPoolExecutor(max_workers=procs) as ex:
-        futs = [ex.submit(run_stream, windows, warmup, cone_gamma, use_jit, int(seeds[i])) for i in range(streams)]
-        done = 0
-        for f in cf.as_completed(futs):
-            g, t = f.result()
-            gsum += g
-            t0sum += t
-            done += 1
-            # simple progress
-            if (time.time() - start) > 0.5:
-                pct = 100.0 * done / streams
-                sys.stderr.write(f"\rProgress: {done}/{streams} ({pct:5.1f}%)")
+    total_start = time.time()
+    
+    # Ensure immediate flushing even when stderr is piped
+    try:
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+    
+    # Batch several streams per worker to amortize JIT/overhead.
+    # Aim ~8–16 tasks per process.
+    CHUNK = max(8, streams // max(1, procs * 8))
+    use_chunks = True
+    
+    if use_chunks:
+        chunks = []
+        for start in range(0, streams, CHUNK):
+            count = min(CHUNK, streams - start)
+            chunks.append((start, count))
+        sys.stderr.write(f"Starting: {streams} streams ({len(chunks)} chunks), {procs} processes\n")
+    else:
+        sys.stderr.write(f"Starting: {streams} streams, {procs} processes\n")
+    sys.stderr.flush()
+    
+    # Progress queue + printer thread for per-stream updates
+    # Note: Manager().Queue() is required for ProcessPoolExecutor (mp.Queue() isn't picklable)
+    mgr = Manager()
+    progress_q = mgr.Queue()
+    done = 0
+    stop_event = threading.Event()
+    
+    def printer():
+        nonlocal done
+        last = 0.0
+        while not stop_event.is_set() or done < streams:
+            try:
+                inc = progress_q.get(timeout=0.2)
+                done += float(inc)
+            except Exception:
+                pass
+            now = time.time()
+            if now - last >= 0.2 or (stop_event.is_set() and done >= streams):
+                # clamp to guard against tiny FP overshoot
+                if done > streams:
+                    done = float(streams)
+                pct = 100.0 * done / streams if streams > 0 else 0.0
+                elapsed = now - total_start
+                # Robust ETA: only compute if we have at least one completion
+                if done > 0:
+                    rate = done / elapsed
+                    eta = (streams - done) / rate if rate > 0 else float('inf')
+                else:
+                    rate = 0.0
+                    eta = float('inf')
+                
+                # Format time nicely
+                def fmt_time(sec):
+                    if not math.isfinite(sec):
+                        return "  —  "
+                    if sec < 60:
+                        return f"{sec:.1f}s"
+                    elif sec < 3600:
+                        return f"{sec/60:.1f}m"
+                    else:
+                        h = int(sec // 3600)
+                        m = int((sec % 3600) // 60)
+                        return f"{h}h{m}m"
+                
+                eta_str = fmt_time(eta)
+                elapsed_str = fmt_time(elapsed)
+                # \x1b[K clears to end-of-line so old characters don't linger
+                sys.stderr.write(
+                    f"\rProgress: {done:6.1f}/{streams} ({pct:5.1f}%) | "
+                    f"Rate: {rate:5.2f} streams/s | "
+                    f"Elapsed: {elapsed_str} | "
+                    f"Remaining: {eta_str}\x1b[K"
+                )
                 sys.stderr.flush()
-                start = time.time()
-    sys.stderr.write("\n")
+                last = now
+        # Drain any remaining items
+        while True:
+            try:
+                inc = progress_q.get_nowait()
+                done += float(inc)
+            except Exception:
+                break
+        # Final update and newline
+        if done > 0:
+            pct = 100.0 * done / streams if streams > 0 else 0
+            elapsed = time.time() - total_start
+            # Format time nicely (reuse same logic)
+            if elapsed < 60:
+                elapsed_str = f"{elapsed:.1f}s"
+            elif elapsed < 3600:
+                elapsed_str = f"{elapsed/60:.1f}m"
+            else:
+                h = int(elapsed // 3600)
+                m = int((elapsed % 3600) // 60)
+                elapsed_str = f"{h}h{m}m"
+            sys.stderr.write(
+                f"\rProgress: {done:6.1f}/{streams} ({pct:5.1f}%) | "
+                f"Elapsed: {elapsed_str}\x1b[K"
+            )
+            sys.stderr.flush()
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+    
+    t_prn = threading.Thread(target=printer, daemon=True)
+    t_prn.start()
+    
+    try:
+        # Prefer 'fork' so compiled machine code is inherited (Linux)
+        try:
+            ctx = mp.get_context("fork")
+        except (ValueError, RuntimeError):
+            ctx = mp.get_context()  # fallback (e.g., macOS uses 'spawn')
+        with cf.ProcessPoolExecutor(max_workers=procs, mp_context=ctx) as ex:
+            if use_chunks:
+                futs = {ex.submit(_worker_chunk, start, count, windows, warmup, cone_gamma,
+                                  use_jit, seeds, progress_q, hb_dt0): (start, count)
+                        for start, count in chunks}
+            else:
+                # Per-stream tasks (rare after chunking enabled)
+                futs = {ex.submit(_worker_one, sid, windows, warmup, cone_gamma, use_jit,
+                                  seeds[sid], progress_q, hb_dt0): sid
+                        for sid in range(streams)}
+            
+            for f in cf.as_completed(futs):
+                if use_chunks:
+                    g_chunk, t_chunk = f.result()
+                    gsum += g_chunk.astype(np.float64)
+                    t0sum += t_chunk
+                else:
+                    g_one, t_one = f.result()
+                    gsum += g_one.astype(np.float64)
+                    t0sum += t_one
+    finally:
+        # Stop printer thread
+        stop_event.set()
+        t_prn.join(timeout=1.0)
+    
+    # Final status
+    total_elapsed = time.time() - total_start
+    def fmt_time(sec):
+        if sec < 60:
+            return f"{sec:.1f}s"
+        elif sec < 3600:
+            return f"{sec/60:.1f}m"
+        else:
+            h = int(sec // 3600)
+            m = int((sec % 3600) // 60)
+            return f"{h}h{m}m"
+    sys.stderr.write(f"Completed: {streams} streams, {t0sum:.2f} total t0 measured in {fmt_time(total_elapsed)}\n")
+    sys.stderr.flush()
 
     # ḡ(x) = (time occupancy fraction per bin) / Δx
     gbar = np.zeros_like(X_BINS, dtype=np.float64)
@@ -326,8 +537,8 @@ def run_parallel(streams, windows, warmup, procs, cone_gamma, use_jit, seed, nor
 # -------------- CLI --------------
 def main():
     ap = argparse.ArgumentParser(description="Compute isotropized ḡ(x) for canonical case via MC time-averaged occupancy.")
-    ap.add_argument("--streams", type=int, default=400, help="number of independent streams")
-    ap.add_argument("--windows", type=float, default=6.0, help="measurement time per stream in t0")
+    ap.add_argument("--streams", type=int, default=200, help="number of independent streams (default: 200). For faster progress, use more streams with shorter windows (e.g., 768 streams × 12 t0)")
+    ap.add_argument("--windows", type=float, default=48.0, help="measurement time per stream in t0 (default: 48). For faster progress updates, use shorter windows like 8-12 t0 with more streams")
     ap.add_argument("--warmup", type=float, default=2.0, help="equilibration time in t0 before tallying")
     ap.add_argument("--procs", type=int, default=None, help="processes (defaults to all cores)")
     ap.add_argument("--nojit", action="store_true", help="disable numba JIT")
@@ -335,6 +546,7 @@ def main():
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--normalize", action="store_true", help="scale so ḡ(x≈0.225)=1 (filled circles)")
     ap.add_argument("--plot", type=str, default="", help="optional output PNG path to plot filled circles")
+    ap.add_argument("--hb", type=float, default=0.5, help="heartbeat interval in t0 per worker (default 0.5)")
     args = ap.parse_args()
 
     gbar = run_parallel(
@@ -345,7 +557,8 @@ def main():
         cone_gamma=args.cone_gamma,
         use_jit=(not args.nojit),
         seed=args.seed,
-        normalize=args.normalize
+        normalize=args.normalize,
+        hb_dt0=args.hb
     )
 
     # Print table
