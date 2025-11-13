@@ -9,8 +9,8 @@ import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from scipy.integrate import cumulative_trapezoid
 
-SEED = 7
-rng  = np.random.default_rng(SEED)
+# Global RNG (will be initialized in main() with user-specified seed)
+rng = None
 
 # Canonical parameters
 X_D    = 1.0e4
@@ -388,7 +388,7 @@ def mc_step(s: Star, L, DT, disable_capture=False):
     return captured
 
 def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05, disable_capture=False,
-             X_FLOORS=None, n_clones=0):
+             X_FLOORS=None, n_clones=0, per_dlnx=True):
     # constant-population SMC with equal weights => total weight = pop
     stars = sample_initial(pop)
     
@@ -474,12 +474,17 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05, disable_capture
             print(f"Progress: {100*p:5.1f}% ({k+1}/{steps})", flush=True)
             last_print = p
     # per-block spectra (no per-block renorm)
-    # ḡ(x) = (time occupancy fraction per bin) / Δx on Fig. 3 bins
+    # ḡ(x): choose per-Δln x (paper-like) or per-Δx (diagnostic)
     g_list = []
     bin_widths = X_EDGES[1:] - X_EDGES[:-1]
+    dlnx = DLNX  # already computed: log(X_EDGES[1:]) - log(X_EDGES[:-1])
     for b in range(blocks):
         tmp = gtime_blocks[b] / max(t0_blocks[b], 1e-30)
-        g_b = np.divide(tmp, bin_widths, out=np.zeros_like(tmp), where=(bin_widths > 0))
+        # Use per-Δln x for paper-like normalization (default), per-Δx for diagnostic
+        if per_dlnx:
+            g_b = np.divide(tmp, dlnx, out=np.zeros_like(tmp), where=(dlnx > 0))
+        else:
+            g_b = np.divide(tmp, bin_widths, out=np.zeros_like(tmp), where=(bin_widths > 0))
         g_list.append(g_b)
     g_arr  = np.stack(g_list, axis=0)
     g_mean = np.mean(g_arr, axis=0)
@@ -500,11 +505,20 @@ def main():
     ap.add_argument("--blocks",type=int, default=8)
     ap.add_argument("--normalize-225", action="store_true")
     ap.add_argument("--out", type=str, default="")
-    ap.add_argument("--disable-capture", action="store_true", help="disable capture during measurement (recommended for ḡ)")
+    ap.add_argument("--disable-capture", action="store_true", help="disable capture during measurement (for tail diagnostics only; keep OFF for paper-like central curve)")
     ap.add_argument("--floors", type=int, default=0, help="number of log-x floors for importance scheme (0=off)")
     ap.add_argument("--clones", type=int, default=0, help="number of clones per split (0=off, set to 2 to enable)")
     ap.add_argument("--xmax-floor", type=float, default=80.0, help="top of the floor ladder")
+    ap.add_argument("--bin-locked-floors", action="store_true", help="use Fig. 3 bin centers as floor rungs (more stable)")
+    # Default to per-Δln x (paper-like); use --no-per-dlnx to switch to per-Δx
+    ap.add_argument("--no-per-dlnx", dest="per_dlnx", action="store_false", default=True,
+                    help="use per-Δx normalization instead of per-Δln x (diagnostic mode). Default is per-Δln x (paper-like).")
+    ap.add_argument("--seed", type=int, default=7, help="random seed for reproducibility")
     args = ap.parse_args()
+
+    # Initialize global RNG with user-specified seed
+    global rng
+    rng = np.random.default_rng(args.seed)
 
     DT = (6.0/args.steps) if args.dt is None else float(args.dt)
 
@@ -516,13 +530,40 @@ def main():
     # Optional: build floors for importance scheme
     X_FLOORS = None
     if args.floors > 0 and args.clones > 0:
-        X_FLOORS = np.geomspace(X_BOUND*(1+1e-9), args.xmax_floor, args.floors)
-        print(f"Using {args.floors} log-x floors from {X_BOUND:.3f} to {args.xmax_floor:.1f}, clones={args.clones}")
+        if args.bin_locked_floors:
+            # Bin-locked: use Fig. 3 centers (and midpoints) as floor rungs
+            # Filter to centers >= X_BOUND and <= xmax_floor
+            valid_centers = X_F3[(X_F3 >= X_BOUND) & (X_F3 <= args.xmax_floor)]
+            if len(valid_centers) > 0:
+                # Add midpoints between consecutive centers for denser coverage
+                floors_list = [valid_centers[0]]
+                for i in range(len(valid_centers) - 1):
+                    mid = math.sqrt(valid_centers[i] * valid_centers[i+1])
+                    if mid > floors_list[-1] * 1.01:  # avoid duplicates
+                        floors_list.append(mid)
+                    floors_list.append(valid_centers[i+1])
+                X_FLOORS = np.array(floors_list)
+                # Limit to requested number if specified
+                if args.floors > 0 and len(X_FLOORS) > args.floors:
+                    # Take evenly spaced subset
+                    indices = np.linspace(0, len(X_FLOORS)-1, args.floors, dtype=int)
+                    X_FLOORS = X_FLOORS[indices]
+                print(f"Using {len(X_FLOORS)} bin-locked floors (from Fig. 3 centers), clones={args.clones}")
+            else:
+                # Fallback to geometric if no valid centers
+                X_FLOORS = np.geomspace(X_BOUND*(1+1e-9), args.xmax_floor, args.floors)
+                print(f"Using {args.floors} log-x floors from {X_BOUND:.3f} to {args.xmax_floor:.1f}, clones={args.clones}")
+        else:
+            # Geometric spacing (default)
+            X_FLOORS = np.geomspace(X_BOUND*(1+1e-9), args.xmax_floor, args.floors)
+            print(f"Using {args.floors} log-x floors from {X_BOUND:.3f} to {args.xmax_floor:.1f}, clones={args.clones}")
 
-    # (C) measure ḡ with capture disabled to preserve deep tail
+    # (C) measure ḡ with capture disabled to preserve deep tail (for diagnostics only)
+    # For paper-like central curve, keep capture ON (don't pass --disable-capture)
     g_mean, g_err = run_once(args.steps, DT, args.pop, LUT, blocks=args.blocks, 
                              disable_capture=args.disable_capture,
-                             X_FLOORS=X_FLOORS, n_clones=args.clones)
+                             X_FLOORS=X_FLOORS, n_clones=args.clones,
+                             per_dlnx=args.per_dlnx)
 
     if args.normalize_225:
         # normalize so ḡ at bin closest to 0.225 equals 1
