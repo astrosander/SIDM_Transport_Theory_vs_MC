@@ -397,10 +397,12 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05, disable_capture
     clones = []  # list of dicts: {x,j,w,phase,floor_idx}
     if use_clones:
         # Convert stars to dict format for clone tracking
-        parents = [dict(x=s.x, j=s.j, w=1.0, phase=s.phase, floor_idx=-1) for s in stars]
+        parents = [dict(x=s.x, j=s.j, w=1.0, phase=s.phase, floor_idx=-1, x_prev=s.x) for s in stars]
         stars = None  # will reconstruct from parents each step
     else:
         parents = None
+        # Track previous x for path deposition
+        x_prev = [s.x for s in stars]
     
     gtime_blocks = [np.zeros_like(XCEN) for _ in range(blocks)]
     t0_blocks    = np.zeros(blocks, float)
@@ -412,26 +414,15 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05, disable_capture
             active = parents + [c for c in clones if c.get('active', True)]
             stars = [Star(x=obj['x'], j=obj['j'], phase=obj['phase']) for obj in active]
             weights = [obj['w'] for obj in active]
+            x_prev_list = [obj.get('x_prev', obj['x']) for obj in active]
         else:
             weights = [1.0] * len(stars)
         
-        # deposit time for each object (with weights)
-        # (A) Boundary-safe deposition: never deposit below the reservoir
-        blk = int(np.searchsorted(block_edges, k, side='right') - 1)
-        total_w = 0.0
-        for i, s in enumerate(stars):
-            x_deposit = max(s.x, X_BOUND)  # clamp to reservoir
-            # if x_deposit falls exactly at X_BOUND, nudge inside the first Fig. 3 bin
-            x_deposit = max(x_deposit, X_BOUND*(1.0 + 1e-12))
-            w_deposit = weights[i] * DT
-            gtime_blocks[blk][bidx(x_deposit)] += w_deposit
-            total_w += weights[i]
-        t0_blocks[blk] += total_w * DT
-
-        # advance all objects one step
+        # advance all objects one step first, then deposit along the path
         if use_clones:
             # Evolve parents first
             for p in parents:
+                p['x_prev'] = p['x']  # save previous position for path deposition
                 s = Star(x=p['x'], j=p['j'], phase=p['phase'])
                 mc_step(s, LUT, DT, disable_capture=disable_capture)
                 p['x'] = s.x; p['j'] = s.j; p['phase'] = s.phase
@@ -441,12 +432,15 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05, disable_capture
                     p['j'] = float(np.sqrt(rng.random()))
                 # check for splits
                 new_clones = maybe_split(p, X_FLOORS, n_clones)
+                for nc in new_clones:
+                    nc['x_prev'] = nc['x']  # initialize x_prev for new clones
                 clones.extend(new_clones)
             
             # Evolve active clones (they share the parent's dt0)
             for c in clones:
                 if not c.get('active', True):
                     continue
+                c['x_prev'] = c['x']  # save previous position for path deposition
                 s = Star(x=c['x'], j=c['j'], phase=c['phase'])
                 mc_step(s, LUT, DT, disable_capture=disable_capture)
                 c['x'] = s.x; c['j'] = s.j; c['phase'] = s.phase
@@ -460,11 +454,73 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05, disable_capture
                 else:
                     # check for further splits
                     new_clones = maybe_split(c, X_FLOORS, n_clones)
+                    for nc in new_clones:
+                        nc['x_prev'] = nc['x']  # initialize x_prev for new clones
                     clones.extend(new_clones)
         else:
-            # standard evolution
-            for s in stars:
+            # standard evolution - step forward, then deposit along path
+            x_prev_saved = x_prev.copy()  # save old positions before stepping
+            for i, s in enumerate(stars):
                 mc_step(s, LUT, DT, disable_capture=disable_capture)
+                x_prev[i] = s.x  # update for next iteration
+        
+        # deposit time along the path (unbiased time-weighted deposition)
+        # Deposit from previous position (before step) to new position (after step)
+        # (A) Boundary-safe path deposition: never deposit below the reservoir
+        blk = int(np.searchsorted(block_edges, k, side='right') - 1)
+        total_w = 0.0
+        if use_clones:
+            # For clones, x_prev was saved before step, current x is after step
+            active = parents + [c for c in clones if c.get('active', True)]
+            for i, obj in enumerate(active):
+                x0 = max(obj.get('x_prev', obj['x']), X_BOUND)
+                x1 = max(obj['x'], X_BOUND)
+                w = obj['w']
+                dt0 = DT
+                # deposit along log path
+                dlog = abs(math.log(max(x1, 1e-12) / max(x0, 1e-12)))
+                if dlog <= 0.25:
+                    xm = math.sqrt(x0 * x1)
+                    xm = max(xm, X_BOUND * (1.0 + 1e-12))
+                    k_idx = bidx(xm)
+                    if 0 <= k_idx < len(XCEN):
+                        gtime_blocks[blk][k_idx] += w * dt0
+                else:
+                    nsub = min(8, 1 + int(dlog / 0.25))
+                    ratio = max(x1, 1e-12) / max(x0, 1e-12)
+                    for u in range(nsub):
+                        xm = x0 * (ratio ** ((u + 0.5) / nsub))
+                        xm = max(xm, X_BOUND * (1.0 + 1e-12))
+                        k_idx = bidx(xm)
+                        if 0 <= k_idx < len(XCEN):
+                            gtime_blocks[blk][k_idx] += w * (dt0 / nsub)
+                total_w += w
+        else:
+            # For standard stars, use saved old positions and current positions
+            for i, s in enumerate(stars):
+                x0 = max(x_prev_saved[i], X_BOUND)  # position before step
+                x1 = max(s.x, X_BOUND)  # position after step
+                w = weights[i]
+                dt0 = DT
+                # deposit along log path
+                dlog = abs(math.log(max(x1, 1e-12) / max(x0, 1e-12)))
+                if dlog <= 0.25:
+                    xm = math.sqrt(x0 * x1)
+                    xm = max(xm, X_BOUND * (1.0 + 1e-12))
+                    k_idx = bidx(xm)
+                    if 0 <= k_idx < len(XCEN):
+                        gtime_blocks[blk][k_idx] += w * dt0
+                else:
+                    nsub = min(8, 1 + int(dlog / 0.25))
+                    ratio = max(x1, 1e-12) / max(x0, 1e-12)
+                    for u in range(nsub):
+                        xm = x0 * (ratio ** ((u + 0.5) / nsub))
+                        xm = max(xm, X_BOUND * (1.0 + 1e-12))
+                        k_idx = bidx(xm)
+                        if 0 <= k_idx < len(XCEN):
+                            gtime_blocks[blk][k_idx] += w * (dt0 / nsub)
+                total_w += w
+        t0_blocks[blk] += total_w * DT
 
         # constant-pop systematic resampling (keep exactly pop)
         # here weights are uniform so this is a no-op; placeholder in case you extend
