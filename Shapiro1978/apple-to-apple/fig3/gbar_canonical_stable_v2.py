@@ -306,7 +306,7 @@ def sample_initial(n):
 def bidx(x):
     return int(np.clip(np.searchsorted(XBINS, x)-1, 0, len(XCEN)-1))
 
-def mc_step(s: Star, L, DT):
+def mc_step(s: Star, L, DT, disable_capture=False):
     e1,e2,j1,j2,z2 = coeff_from_LUT(s.x, s.j, L)
     # correlated Gaussian kick
     muE, muJ = e1*DT, j1*DT
@@ -325,18 +325,23 @@ def mc_step(s: Star, L, DT):
     s.x = float(np.clip(s.x - np.clip(dE, -max_dx, max_dx), 1e-4, X_D))
     dj  = np.clip(dJ, -max_dj, max_dj)
     s.j = float(np.clip(s.j + dj, 0.0, 1.0))
+    # enforce reservoir boundary (B)
+    if s.x < X_BOUND:
+        s.x = X_BOUND
+        s.j = float(np.sqrt(rng.random()))  # isotropic j
     # capture at pericenter crossings (diagnostic; we replace immediately)
     captured=False
-    prev = int(s.phase); s.phase += DT/max(Ptilde(s.x),1e-6)
-    if int(s.phase)>prev and (s.j <= j_min_exact(s.x)): captured=True
-    if captured:
-        # re-inject from the outer reservoir (canonical)
-        s.x = X_BOUND
-        s.j = float(np.sqrt(rng.random()))
-        s.phase = 0.0
+    if not disable_capture:
+        prev = int(s.phase); s.phase += DT/max(Ptilde(s.x),1e-6)
+        if int(s.phase)>prev and (s.j <= j_min_exact(s.x)): captured=True
+        if captured:
+            # re-inject from the outer reservoir (canonical)
+            s.x = X_BOUND
+            s.j = float(np.sqrt(rng.random()))
+            s.phase = 0.0
     return captured
 
-def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05):
+def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05, disable_capture=False):
     # constant-population SMC with equal weights => total weight = pop
     stars = sample_initial(pop)
     gtime_blocks = [np.zeros_like(XCEN) for _ in range(blocks)]
@@ -345,14 +350,16 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05):
     last_print = 0
     for k in range(steps):
         # deposit time for each star (equal weights)
+        # (A) clamp to reservoir before depositing
         blk = int(np.searchsorted(block_edges, k, side='right') - 1)
         for s in stars:
-            gtime_blocks[blk][bidx(s.x)] += DT
+            x_deposit = max(s.x, X_BOUND)  # clamp to reservoir
+            gtime_blocks[blk][bidx(x_deposit)] += DT
         t0_blocks[blk] += pop*DT
 
         # advance all stars one step
         for s in stars:
-            mc_step(s, LUT, DT)
+            mc_step(s, LUT, DT, disable_capture=disable_capture)
 
         # constant-pop systematic resampling (keep exactly pop)
         # here weights are uniform so this is a no-op; placeholder in case you extend
@@ -385,6 +392,7 @@ def main():
     ap.add_argument("--blocks",type=int, default=8)
     ap.add_argument("--normalize-225", action="store_true")
     ap.add_argument("--out", type=str, default="")
+    ap.add_argument("--disable-capture", action="store_true", help="disable capture during measurement (recommended for ḡ)")
     args = ap.parse_args()
 
     DT = (6.0/args.steps) if args.dt is None else float(args.dt)
@@ -394,7 +402,8 @@ def main():
     bg0 = Background(xs=xgrid, gs=g0_interp(xgrid))
     LUT = precompute_LUT(args.lut_x, args.lut_j, bg0)
 
-    g_mean, g_err = run_once(args.steps, DT, args.pop, LUT, blocks=args.blocks)
+    # (C) measure ḡ with capture disabled to preserve deep tail
+    g_mean, g_err = run_once(args.steps, DT, args.pop, LUT, blocks=args.blocks, disable_capture=args.disable_capture)
 
     if args.normalize_225:
         # normalize so ḡ at bin closest to 0.225 equals 1
