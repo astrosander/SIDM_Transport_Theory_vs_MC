@@ -17,10 +17,26 @@ X_D    = 1.0e4
 P_STAR = 5.0e-3
 X_BOUND = 0.20   # canonical outer reservoir (x_b ≈ 0.2)
 
-# Bins (log-uniform) for ḡ; first-center close to 0.225
-XBINS = np.logspace(-1, 4, 60)
-XCEN  = np.sqrt(XBINS[:-1]*XBINS[1:])
-DLNX  = np.log(XBINS[1:]/XBINS[:-1])
+# Fig. 3 bin centers from the paper (same list used for FE* runs)
+X_F3 = np.array([
+    0.225, 0.303, 0.495, 1.04, 1.26, 1.62, 2.35, 5.00, 7.20, 8.94,
+    12.1, 19.7, 41.6, 50.3, 64.6, 93.6, 198., 287., 356., 480.,
+    784., 1650., 2000., 2570., 3730.
+], dtype=float)
+
+def _edges_from_centers(c):
+    e = np.empty(c.size + 1, dtype=c.dtype)
+    for i in range(1, c.size):
+        e[i] = math.sqrt(c[i-1]*c[i])
+    e[0]  = c[0]**2 / e[1]
+    e[-1] = c[-1]**2 / e[-2]
+    return e
+
+X_EDGES = _edges_from_centers(X_F3)
+DLNX = np.log(X_EDGES[1:] / X_EDGES[:-1])
+XCEN = X_F3.copy()
+# Keep XBINS for backward compatibility in bidx (will update bidx to use X_EDGES)
+XBINS = X_EDGES.copy()
 
 # ---------- BWII g0(x) ----------
 _ln1p = np.array([
@@ -304,7 +320,37 @@ def sample_initial(n):
     return [Star(float(xs[i]), float(js[i]), 0.0) for i in range(n)]
 
 def bidx(x):
-    return int(np.clip(np.searchsorted(XBINS, x)-1, 0, len(XCEN)-1))
+    # Find bin index for x using Fig. 3 edges
+    return int(np.clip(np.searchsorted(X_EDGES, x, side='right')-1, 0, len(XCEN)-1))
+
+# ---------- Optional importance scheme (log-x floors) ----------
+def floor_idx_for(x, X_FLOORS):
+    """Return deepest floor index k with x >= X_FLOORS[k], or -1 if x < X_FLOORS[0]"""
+    if X_FLOORS is None or len(X_FLOORS) == 0:
+        return -1
+    k = -1
+    for i, xf in enumerate(X_FLOORS):
+        if x >= xf:
+            k = i
+    return k
+
+def maybe_split(obj, X_FLOORS, n_clones):
+    """Split object when crossing into a deeper floor (one-time per floor)"""
+    if X_FLOORS is None or n_clones <= 0:
+        return []
+    k_now = floor_idx_for(obj['x'], X_FLOORS)
+    new_clones = []
+    while obj['floor_idx'] < k_now:
+        obj['floor_idx'] += 1
+        # one-time split on entering this deeper floor
+        new_w = obj['w'] / (1.0 + n_clones)
+        obj['w'] = new_w
+        for _ in range(n_clones):
+            new_clones.append(dict(
+                x=obj['x'], j=obj['j'], w=new_w,
+                phase=obj['phase'], floor_idx=obj['floor_idx']
+            ))
+    return new_clones
 
 def mc_step(s: Star, L, DT, disable_capture=False):
     e1,e2,j1,j2,z2 = coeff_from_LUT(s.x, s.j, L)
@@ -341,25 +387,84 @@ def mc_step(s: Star, L, DT, disable_capture=False):
             s.phase = 0.0
     return captured
 
-def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05, disable_capture=False):
+def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05, disable_capture=False,
+             X_FLOORS=None, n_clones=0):
     # constant-population SMC with equal weights => total weight = pop
     stars = sample_initial(pop)
+    
+    # Optional: importance scheme with clones
+    use_clones = (X_FLOORS is not None and n_clones > 0)
+    clones = []  # list of dicts: {x,j,w,phase,floor_idx}
+    if use_clones:
+        # Convert stars to dict format for clone tracking
+        parents = [dict(x=s.x, j=s.j, w=1.0, phase=s.phase, floor_idx=-1) for s in stars]
+        stars = None  # will reconstruct from parents each step
+    else:
+        parents = None
+    
     gtime_blocks = [np.zeros_like(XCEN) for _ in range(blocks)]
     t0_blocks    = np.zeros(blocks, float)
     block_edges  = np.linspace(0, steps, blocks+1, dtype=int)
     last_print = 0
     for k in range(steps):
-        # deposit time for each star (equal weights)
-        # (A) clamp to reservoir before depositing
+        if use_clones:
+            # Reconstruct Star objects from parents and active clones
+            active = parents + [c for c in clones if c.get('active', True)]
+            stars = [Star(x=obj['x'], j=obj['j'], phase=obj['phase']) for obj in active]
+            weights = [obj['w'] for obj in active]
+        else:
+            weights = [1.0] * len(stars)
+        
+        # deposit time for each object (with weights)
+        # (A) Boundary-safe deposition: never deposit below the reservoir
         blk = int(np.searchsorted(block_edges, k, side='right') - 1)
-        for s in stars:
+        total_w = 0.0
+        for i, s in enumerate(stars):
             x_deposit = max(s.x, X_BOUND)  # clamp to reservoir
-            gtime_blocks[blk][bidx(x_deposit)] += DT
-        t0_blocks[blk] += pop*DT
+            # if x_deposit falls exactly at X_BOUND, nudge inside the first Fig. 3 bin
+            x_deposit = max(x_deposit, X_BOUND*(1.0 + 1e-12))
+            w_deposit = weights[i] * DT
+            gtime_blocks[blk][bidx(x_deposit)] += w_deposit
+            total_w += weights[i]
+        t0_blocks[blk] += total_w * DT
 
-        # advance all stars one step
-        for s in stars:
-            mc_step(s, LUT, DT, disable_capture=disable_capture)
+        # advance all objects one step
+        if use_clones:
+            # Evolve parents first
+            for p in parents:
+                s = Star(x=p['x'], j=p['j'], phase=p['phase'])
+                mc_step(s, LUT, DT, disable_capture=disable_capture)
+                p['x'] = s.x; p['j'] = s.j; p['phase'] = s.phase
+                # enforce reservoir boundary
+                if p['x'] < X_BOUND:
+                    p['x'] = X_BOUND
+                    p['j'] = float(np.sqrt(rng.random()))
+                # check for splits
+                new_clones = maybe_split(p, X_FLOORS, n_clones)
+                clones.extend(new_clones)
+            
+            # Evolve active clones (they share the parent's dt0)
+            for c in clones:
+                if not c.get('active', True):
+                    continue
+                s = Star(x=c['x'], j=c['j'], phase=c['phase'])
+                mc_step(s, LUT, DT, disable_capture=disable_capture)
+                c['x'] = s.x; c['j'] = s.j; c['phase'] = s.phase
+                # enforce reservoir boundary
+                if c['x'] < X_BOUND:
+                    c['x'] = X_BOUND
+                    c['j'] = float(np.sqrt(rng.random()))
+                # remove if drifts outward across its floor
+                if c['floor_idx'] >= 0 and c['x'] < X_FLOORS[c['floor_idx']]:
+                    c['active'] = False
+                else:
+                    # check for further splits
+                    new_clones = maybe_split(c, X_FLOORS, n_clones)
+                    clones.extend(new_clones)
+        else:
+            # standard evolution
+            for s in stars:
+                mc_step(s, LUT, DT, disable_capture=disable_capture)
 
         # constant-pop systematic resampling (keep exactly pop)
         # here weights are uniform so this is a no-op; placeholder in case you extend
@@ -369,9 +474,12 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05, disable_capture
             print(f"Progress: {100*p:5.1f}% ({k+1}/{steps})", flush=True)
             last_print = p
     # per-block spectra (no per-block renorm)
+    # ḡ(x) = (time occupancy fraction per bin) / Δx on Fig. 3 bins
     g_list = []
+    bin_widths = X_EDGES[1:] - X_EDGES[:-1]
     for b in range(blocks):
-        g_b = (gtime_blocks[b] / max(t0_blocks[b], 1e-30)) / DLNX
+        tmp = gtime_blocks[b] / max(t0_blocks[b], 1e-30)
+        g_b = np.divide(tmp, bin_widths, out=np.zeros_like(tmp), where=(bin_widths > 0))
         g_list.append(g_b)
     g_arr  = np.stack(g_list, axis=0)
     g_mean = np.mean(g_arr, axis=0)
@@ -393,6 +501,9 @@ def main():
     ap.add_argument("--normalize-225", action="store_true")
     ap.add_argument("--out", type=str, default="")
     ap.add_argument("--disable-capture", action="store_true", help="disable capture during measurement (recommended for ḡ)")
+    ap.add_argument("--floors", type=int, default=0, help="number of log-x floors for importance scheme (0=off)")
+    ap.add_argument("--clones", type=int, default=0, help="number of clones per split (0=off, set to 2 to enable)")
+    ap.add_argument("--xmax-floor", type=float, default=80.0, help="top of the floor ladder")
     args = ap.parse_args()
 
     DT = (6.0/args.steps) if args.dt is None else float(args.dt)
@@ -402,8 +513,16 @@ def main():
     bg0 = Background(xs=xgrid, gs=g0_interp(xgrid))
     LUT = precompute_LUT(args.lut_x, args.lut_j, bg0)
 
+    # Optional: build floors for importance scheme
+    X_FLOORS = None
+    if args.floors > 0 and args.clones > 0:
+        X_FLOORS = np.geomspace(X_BOUND*(1+1e-9), args.xmax_floor, args.floors)
+        print(f"Using {args.floors} log-x floors from {X_BOUND:.3f} to {args.xmax_floor:.1f}, clones={args.clones}")
+
     # (C) measure ḡ with capture disabled to preserve deep tail
-    g_mean, g_err = run_once(args.steps, DT, args.pop, LUT, blocks=args.blocks, disable_capture=args.disable_capture)
+    g_mean, g_err = run_once(args.steps, DT, args.pop, LUT, blocks=args.blocks, 
+                             disable_capture=args.disable_capture,
+                             X_FLOORS=X_FLOORS, n_clones=args.clones)
 
     if args.normalize_225:
         # normalize so ḡ at bin closest to 0.225 equals 1
