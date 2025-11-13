@@ -171,6 +171,16 @@ def I16(x,j,xp,xap,xp2):
     integ= (C**4)*z1/np.sqrt(np.clip(z2,1e-20,None))/np.power(np.clip(z3,1e-20,None),1.5)
     return pref*np.sum(integ*WT)
 
+# ---------- smoothing helper for background update ----------
+def smooth_log(xs, ys, k=7):
+    """Smooth in log-space using Gaussian kernel"""
+    lx = np.log(xs)
+    ly = np.log(np.clip(ys, 1e-16, None))
+    ker = np.exp(-0.5 * ((np.arange(-k, k+1) / 2.0)**2))
+    ker /= ker.sum()
+    ly_s = np.convolve(ly, ker, mode='same')
+    return np.exp(ly_s)
+
 # ---------- background + moments ----------
 class Background:
     def __init__(self, xs, gs):
@@ -569,6 +579,8 @@ def main():
     # Default to per-Δln x (paper-like); use --no-per-dlnx to switch to per-Δx
     ap.add_argument("--no-per-dlnx", dest="per_dlnx", action="store_false", default=True,
                     help="use per-Δx normalization instead of per-Δln x (diagnostic mode). Default is per-Δln x (paper-like).")
+    ap.add_argument("--background-update", action="store_true",
+                    help="enable 2-pass background update (paper's method): smooth measured ḡ, rebuild LUT, remeasure")
     ap.add_argument("--seed", type=int, default=7, help="random seed for reproducibility")
     args = ap.parse_args()
 
@@ -622,11 +634,41 @@ def main():
         print("Using per-Δln x normalization (paper-like)")
     else:
         print("Using per-Δx normalization (diagnostic mode)")
+    
+    # Pass 1: measure with initial g0 background
+    print("Pass 1: Measuring with g0 background...")
     g_mean, g_err = run_once(args.steps, DT, args.pop, LUT, blocks=args.blocks, 
                              disable_capture=args.disable_capture,
                              X_FLOORS=X_FLOORS, n_clones=args.clones,
                              per_dlnx=use_per_dlnx)
-
+    
+    # Optional: background update (paper's 2-pass method)
+    if args.background_update:
+        print("Updating background from measured ḡ...")
+        # Smooth the measured ḡ in log-space
+        g_smooth = smooth_log(XCEN, np.maximum(g_mean, 1e-12), k=7)
+        
+        # Build new background on fine log grid
+        xbg = np.logspace(-3, 4, 400)
+        # Interpolate smoothed ḡ to fine grid
+        lx_bg = np.log(xbg)
+        lx_cen = np.log(XCEN)
+        lg_smooth = np.log(np.clip(g_smooth, 1e-16, None))
+        lg_bg = np.interp(lx_bg, lx_cen, lg_smooth)
+        gbg = np.exp(lg_bg)
+        
+        # Rebuild LUT on updated background
+        bg1 = Background(xs=xbg, gs=gbg)
+        print("Rebuilding LUT on updated background...")
+        LUT = precompute_LUT(args.lut_x, args.lut_j, bg1)
+        
+        # Pass 2: measure again with updated background
+        print("Pass 2: Measuring with updated background...")
+        g_mean, g_err = run_once(args.steps, DT, args.pop, LUT, blocks=args.blocks, 
+                                 disable_capture=args.disable_capture,
+                                 X_FLOORS=X_FLOORS, n_clones=args.clones,
+                                 per_dlnx=use_per_dlnx)
+    
     if args.normalize_225:
         # normalize so ḡ at bin closest to 0.225 equals 1
         idx_225 = int(np.argmin(np.abs(XCEN - 0.225)))
