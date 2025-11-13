@@ -560,10 +560,16 @@ def main():
 
     # (C) measure ḡ with capture disabled to preserve deep tail (for diagnostics only)
     # For paper-like central curve, keep capture ON (don't pass --disable-capture)
+    # Default to per-Δln x (paper-like normalization)
+    use_per_dlnx = getattr(args, 'per_dlnx', True)  # default True if not set
+    if use_per_dlnx:
+        print("Using per-Δln x normalization (paper-like)")
+    else:
+        print("Using per-Δx normalization (diagnostic mode)")
     g_mean, g_err = run_once(args.steps, DT, args.pop, LUT, blocks=args.blocks, 
                              disable_capture=args.disable_capture,
                              X_FLOORS=X_FLOORS, n_clones=args.clones,
-                             per_dlnx=args.per_dlnx)
+                             per_dlnx=use_per_dlnx)
 
     if args.normalize_225:
         # normalize so ḡ at bin closest to 0.225 equals 1
