@@ -536,7 +536,7 @@ def coeff_from_LUT(x, j, L):
     return e1,e2,j1,j2,z2
 
 # ----------------- FP consistency diagnostic -----------------
-def check_fp_consistency(LUT, bg: Background = None, test_measure="none"):
+def check_fp_consistency(LUT, bg: Background = None, test_measure="none", g0_override=None):
     """
     Check if g0 is a stationary solution of the FP operator defined by LUT.
     
@@ -571,7 +571,14 @@ def check_fp_consistency(LUT, bg: Background = None, test_measure="none"):
     
     # Evaluate g0 on the LUT x-grid
     # Test different measure interpretations if requested
-    g0_vals_raw = g0_interp(x_grid)
+    if g0_override is not None:
+        # Use provided g0 function/array instead of g0_interp
+        if callable(g0_override):
+            g0_vals_raw = g0_override(x_grid)
+        else:
+            g0_vals_raw = np.interp(x_grid, g0_override[0], g0_override[1])
+    else:
+        g0_vals_raw = g0_interp(x_grid)
     g0_vals_raw = np.maximum(g0_vals_raw, 1e-16)
     
     if test_measure == "per-dx" or test_measure == "both":
@@ -658,6 +665,165 @@ def check_fp_consistency(LUT, bg: Background = None, test_measure="none"):
         diff_mixed_term_alt=diff_mixed_term_alt,
         diff_coeff_term_alt=diff_coeff_term_alt
     )
+
+# ----------------- Toy OU test for FP checker validation -----------------
+def test_toy_ou():
+    """
+    Test FP checker with a toy Ornstein-Uhlenbeck process.
+    
+    SDE: dx = -x dt + sqrt(2) dW
+    Stationary solution: g(x) ∝ exp(-x²/2)
+    
+    This validates that the FP checker machinery itself is correct.
+    """
+    print("\n" + "="*70)
+    print("Toy OU Test: Validating FP checker machinery")
+    print("="*70)
+    
+    # Create a toy LUT
+    x_grid = np.linspace(-4, 4, 100)  # Uniform grid for OU
+    j_grid = np.array([0.5])  # Single j value (not used for 1D)
+    
+    # OU coefficients: e1(x) = x, e2(x) = 2
+    e1_grid = np.tile(x_grid[:, None], (1, len(j_grid)))
+    e2_grid = np.full_like(e1_grid, 2.0)
+    j1_grid = np.zeros_like(e1_grid)
+    j2_grid = np.zeros_like(e1_grid)
+    z2_grid = np.zeros_like(e1_grid)
+    
+    toy_LUT = dict(x=x_grid, j=j_grid, e1=e1_grid, e2=e2_grid,
+                   j1=j1_grid, j2=j2_grid, z2=z2_grid)
+    
+    # Stationary solution: g(x) ∝ exp(-x²/2)
+    g0_toy = np.exp(-0.5 * x_grid**2)
+    g0_toy = g0_toy / np.trapz(g0_toy, x_grid)  # Normalize
+    
+    # Create a dummy Background that returns the toy g0
+    class ToyBackground:
+        def __init__(self, x, g):
+            self.xg = x
+            self.gg = g
+        def g(self, x):
+            return np.interp(x, self.xg, self.gg)
+        def moment(self, x, which):
+            return np.zeros_like(x)  # Not used for this test
+    
+    toy_bg = ToyBackground(x_grid, g0_toy)
+    
+    # Test FP consistency with toy g0
+    fp_diag = check_fp_consistency(toy_LUT, toy_bg, test_measure="none", 
+                                    g0_override=(x_grid, g0_toy))
+    
+    residual = fp_diag['residual']
+    rel_residual = fp_diag['relative_residual']
+    abs_rel_res = np.abs(rel_residual)
+    
+    # Also test alternative form
+    residual_alt = fp_diag['residual_alt']
+    scale_alt = (np.abs(fp_diag['drift_term_alt']) + np.abs(fp_diag['drift_coeff_term_alt']) + 
+                 np.abs(fp_diag['diff_term_alt']) + np.abs(fp_diag['diff_mixed_term_alt']) + 
+                 np.abs(fp_diag['diff_coeff_term_alt']) + 1e-30)
+    rel_residual_alt = residual_alt / scale_alt
+    abs_rel_res_alt = np.abs(rel_residual_alt)
+    
+    print(f"\nStandard FP form (should work for OU):")
+    print(f"  Mean |relative residual|: {np.mean(abs_rel_res):.6f}")
+    print(f"  Median |relative residual|: {np.median(abs_rel_res):.6f}")
+    print(f"  Max |relative residual|: {np.max(abs_rel_res):.6f}")
+    print(f"  Bins with |rel_res| > 0.01: {np.sum(abs_rel_res > 0.01)} / {len(x_grid)}")
+    
+    print(f"\nAlternative FP form (matching MC dx/dt=-e1):")
+    print(f"  Mean |relative residual|: {np.mean(abs_rel_res_alt):.6f}")
+    print(f"  Median |relative residual|: {np.median(abs_rel_res_alt):.6f}")
+    print(f"  Max |relative residual|: {np.max(abs_rel_res_alt):.6f}")
+    print(f"  Bins with |rel_res| > 0.01: {np.sum(abs_rel_res_alt > 0.01)} / {len(x_grid)}")
+    
+    # For OU: dx = -x dt + sqrt(2) dW, so e1 = x, e2 = 2
+    # The FP is: ∂g/∂t = ∂/∂x[x*g] + ½∂²/∂x²[2*g] = ∂/∂x[x*g] + ∂²/∂x²[g]
+    # This is the alternative form, so it should work better
+    if np.mean(abs_rel_res_alt) < 0.01:
+        print(f"\n✓ PASS: Alternative form gives small residuals (FP checker is working correctly)")
+    elif np.mean(abs_rel_res) < 0.01:
+        print(f"\n✓ PASS: Standard form gives small residuals (FP checker is working correctly)")
+    else:
+        print(f"\n✗ FAIL: Both forms give large residuals - check FP checker implementation!")
+    
+    print("="*70 + "\n")
+    
+    return fp_diag
+
+# ----------------- Reconstruct stationary solution from D_E, D_EE -----------------
+def reconstruct_stationary_solution(fp_diag):
+    """
+    Reconstruct the stationary solution implied by D_E, D_EE.
+    
+    For zero-flux stationary solution:
+        g'/g = (2*D_E - D_EE') / D_EE
+    
+    Integrate to get: ln g(x) = ∫ (2*D_E - D_EE')/D_EE dx + const
+    """
+    print("\n" + "="*70)
+    print("Reconstructing Stationary Solution from D_E, D_EE")
+    print("="*70)
+    
+    x = fp_diag['x']
+    D_E = fp_diag['D_E']
+    D_EE = fp_diag['D_EE']
+    dD_EE_dx = fp_diag['dD_EE_dx']
+    g0 = fp_diag['g0']
+    
+    # Compute (2*D_E - D_EE') / D_EE
+    numerator = 2.0 * D_E - dD_EE_dx
+    denominator = np.maximum(D_EE, 1e-30)  # Avoid division by zero
+    integrand = numerator / denominator
+    
+    # Integrate: ln g_stat = ∫ integrand dx
+    # Use cumulative trapezoid integration
+    from scipy.integrate import cumulative_trapezoid
+    ln_g_stat = cumulative_trapezoid(integrand, x, initial=0.0)
+    
+    # Normalize to match g0 at a reference point (e.g., x ≈ 0.225)
+    ref_idx = np.argmin(np.abs(x - 0.225))
+    if ref_idx < len(x):
+        ln_g_stat = ln_g_stat - ln_g_stat[ref_idx] + np.log(np.maximum(g0[ref_idx], 1e-16))
+    
+    g_stat = np.exp(ln_g_stat)
+    g_stat = np.maximum(g_stat, 1e-16)
+    
+    # Compare shapes (normalized at reference point)
+    g0_norm = g0 / g0[ref_idx]
+    g_stat_norm = g_stat / g_stat[ref_idx]
+    
+    # Compute ratio
+    ratio = g_stat_norm / np.maximum(g0_norm, 1e-16)
+    ratio_finite = ratio[np.isfinite(ratio) & (ratio > 0)]
+    
+    print(f"\nComparison of reconstructed g_stat vs BWII g0:")
+    print(f"  Reference point: x = {x[ref_idx]:.3f}")
+    print(f"  Mean ratio (g_stat/g0): {np.mean(ratio_finite):.4f}")
+    print(f"  Median ratio: {np.median(ratio_finite):.4f}")
+    print(f"  Min ratio: {np.min(ratio_finite):.4f} (at x = {x[np.argmin(ratio_finite)]:.2f})")
+    print(f"  Max ratio: {np.max(ratio_finite):.4f} (at x = {x[np.argmax(ratio_finite)]:.2f})")
+    print(f"  Ratio range: {np.max(ratio_finite)/np.min(ratio_finite):.2f}x")
+    
+    if np.mean(np.abs(ratio_finite - 1.0)) < 0.1:
+        print(f"\n  ✓ Shapes are similar (ratio ≈ 1) - g0 is consistent with D_E, D_EE")
+    else:
+        print(f"\n  ✗ Shapes differ significantly - g0 is NOT the stationary solution of this operator")
+        print(f"    This explains why FP residuals are O(1) and MC drifts away from g0")
+    
+    # Save comparison
+    arr_comp = np.column_stack([
+        x, D_E, D_EE, dD_EE_dx, integrand,
+        g0, g_stat, g0_norm, g_stat_norm, ratio
+    ])
+    np.savetxt("stationary_reconstruction.csv", arr_comp, delimiter=",",
+               header="x,D_E,D_EE,dD_EE_dx,integrand,g0,g_stat,g0_norm,g_stat_norm,ratio", 
+               comments="")
+    print(f"\n  Saved comparison to stationary_reconstruction.csv")
+    print("="*70 + "\n")
+    
+    return dict(x=x, g_stat=g_stat, g0=g0, ratio=ratio, integrand=integrand)
 
 # ----------------- MC machinery -----------------
 @dataclass
@@ -1282,6 +1448,10 @@ def main():
     ap.add_argument("--test-measure", choices=["none", "per-dx", "per-dlnx", "both"],
                     default="none",
                     help="test measure mismatch: treat g0 as per-dx or per-dlnx (or both)")
+    ap.add_argument("--test-toy-ou", action="store_true",
+                    help="test FP checker with toy Ornstein-Uhlenbeck process (validation)")
+    ap.add_argument("--reconstruct-stationary", action="store_true",
+                    help="reconstruct stationary solution from D_E, D_EE and compare to g0")
     args = ap.parse_args()
 
     # Set multiprocessing start method for Windows compatibility (before using ProcessPoolExecutor)
@@ -1311,6 +1481,10 @@ def main():
         print(f"Numba not available, running without JIT")
 
     DT = (6.0/args.steps) if args.dt is None else float(args.dt)
+
+    # Toy OU test (if requested) - validates FP checker before using it
+    if args.test_toy_ou:
+        test_toy_ou()
 
     # initial background from BWII g0
     xgrid = np.logspace(-3, 4, 400)
@@ -1437,6 +1611,10 @@ def main():
                    comments="")
         print(f"\n  Saved FP consistency diagnostic to fp_consistency.csv")
         print("="*70 + "\n")
+        
+        # Reconstruct stationary solution if requested
+        if args.reconstruct_stationary:
+            reconstruct_stationary_solution(fp_diag)
 
     # build floors
     X_FLOORS = None
