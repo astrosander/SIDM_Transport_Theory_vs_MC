@@ -393,6 +393,24 @@ def sample_initial(n):
     js = np.sqrt(rng.random(n))  # p(j)=2j
     return [Star(float(xs[i]), float(js[i]), 0.0) for i in range(n)]
 
+def sample_initial_from_g0(n):
+    """Sample initial x from g0(x) distribution between X_BOUND and X_D."""
+    # Define a fine grid in x for sampling
+    xs = np.logspace(math.log10(X_BOUND), math.log10(X_D), 2000)
+    g = g0_interp(xs)
+    # We want p(x) ∝ g(x) per dln x
+    # Since our bins are equal in ln x, g(x) itself is ∝ probability per dln x
+    pdf = g
+    cdf = np.cumsum(pdf)
+    cdf /= cdf[-1]
+
+    # Inverse-CDF sampling
+    us = rng.random(n)
+    x_samples = np.interp(us, cdf, xs)
+    j_samples = np.sqrt(rng.random(n))  # isotropic
+
+    return [Star(float(x_samples[i]), float(j_samples[i]), 0.0) for i in range(n)]
+
 def bidx(x):
     return int(np.clip(np.searchsorted(X_EDGES, x, side='right')-1, 0, len(XCEN)-1))
 
@@ -466,9 +484,12 @@ def mc_step(s: Star, L, DT, disable_capture=False):
 
 def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05,
              disable_capture=False, X_FLOORS=None, n_clones=0,
-             per_dlnx=True):
+             per_dlnx=True, burn_frac=0.0, init_g0=False):
 
-    stars = sample_initial(pop)
+    if init_g0:
+        stars = sample_initial_from_g0(pop)
+    else:
+        stars = sample_initial(pop)
 
     use_clones = (X_FLOORS is not None and n_clones > 0)
     clones  = []
@@ -597,8 +618,21 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05,
     bin_widths = X_EDGES[1:] - X_EDGES[:-1]
     dlnx = DLNX
 
-    for b in range(blocks):
+    # Calculate burn-in: skip early blocks when averaging
+    burn_blocks = int(burn_frac * blocks)
+    burn_blocks = max(0, min(burn_blocks, blocks - 1))  # ensure at least 1 block remains
+
+    for b in range(burn_blocks, blocks):
         tmp = gtime_blocks[b] / max(t0_blocks[b], 1e-30)
+        if per_dlnx:
+            g_b = np.divide(tmp, dlnx, out=np.zeros_like(tmp), where=(dlnx>0))
+        else:
+            g_b = np.divide(tmp, bin_widths, out=np.zeros_like(tmp), where=(bin_widths>0))
+        g_list.append(g_b)
+
+    if len(g_list) == 0:
+        # Fallback: if all blocks were burned, use the last block
+        tmp = gtime_blocks[-1] / max(t0_blocks[-1], 1e-30)
         if per_dlnx:
             g_b = np.divide(tmp, dlnx, out=np.zeros_like(tmp), where=(dlnx>0))
         else:
@@ -610,6 +644,10 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05,
     nb     = g_arr.shape[0]
     g_var  = np.var(g_arr, axis=0, ddof=1) if nb>1 else np.zeros_like(g_mean)
     g_err  = np.sqrt(np.maximum(g_var/nb, 0.0))
+    
+    if burn_blocks > 0:
+        print(f"  (Averaged over blocks {burn_blocks} to {blocks-1}, discarding {burn_blocks} early blocks)")
+    
     return g_mean, g_err
 
 # ----------------- safer background update -----------------
@@ -690,6 +728,10 @@ def main():
                     help="use per-Δx normalization instead of per-Δln x (diagnostic mode). Default: per-Δln x.")
     ap.add_argument("--background-update", action="store_true",
                     help="enable 2-pass background update (gentle ratio-smoothing)")
+    ap.add_argument("--burn-frac", type=float, default=0.5,
+                    help="fraction of blocks to discard as burn-in when averaging ḡ (default: 0.5)")
+    ap.add_argument("--init-g0", action="store_true",
+                    help="initialize stars from g0(x) instead of the outer reservoir")
     ap.add_argument("--seed", type=int, default=7,
                     help="random seed for reproducibility")
     args = ap.parse_args()
@@ -736,11 +778,17 @@ def main():
 
     # ----- Pass 1: baseline measurement -----
     print("Pass 1: Measuring with BWII g0 background...")
+    if args.init_g0:
+        print("  Initializing stars from g0(x) distribution")
+    else:
+        print("  Initializing stars at outer reservoir (x = X_BOUND)")
     g_mean, g_err = run_once(args.steps, DT, args.pop, LUT,
                              blocks=args.blocks,
                              disable_capture=args.disable_capture,
                              X_FLOORS=X_FLOORS, n_clones=args.clones,
-                             per_dlnx=use_per_dlnx)
+                             per_dlnx=use_per_dlnx,
+                             burn_frac=args.burn_frac,
+                             init_g0=args.init_g0)
 
     # ----- Optional background update -----
         # Optional: background update (paper's 2-pass style)
@@ -795,7 +843,9 @@ def main():
             args.steps, DT, args.pop, LUT, blocks=args.blocks,
             disable_capture=args.disable_capture,
             X_FLOORS=X_FLOORS, n_clones=args.clones,
-            per_dlnx=use_per_dlnx
+            per_dlnx=use_per_dlnx,
+            burn_frac=args.burn_frac,
+            init_g0=args.init_g0
         )
 
 
