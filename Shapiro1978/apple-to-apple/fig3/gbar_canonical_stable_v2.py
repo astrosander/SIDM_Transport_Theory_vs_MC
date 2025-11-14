@@ -627,7 +627,7 @@ if HAVE_NUMBA:
             x = x_arr[i]
             j = j_arr[i]
             phase = phase_arr[i]
-            x_prev_arr[i] = x
+            # x_prev_arr[i] is already set to pre-step position before calling this function
             
             # Bilinear interpolation of coefficients from LUT
             # Find grid indices
@@ -828,6 +828,13 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05,
         stars = sample_initial(pop)
 
     use_clones = (X_FLOORS is not None and n_clones > 0)
+    
+    # Determine if we should use parallel evolution
+    # Only use if numba is available and we're not using clones
+    # Note: --no-jit won't affect already-decorated functions, but parallel evolution
+    # will still work (just slower if JIT was disabled at import time)
+    use_parallel = (HAVE_NUMBA and not use_clones)
+    
     clones  = []
     if use_clones:
         parents = [dict(x=s.x, j=s.j, w=1.0, phase=s.phase,
@@ -835,7 +842,27 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05,
         stars = None
     else:
         parents = None
-        x_prev = [s.x for s in stars]
+        if use_parallel:
+            # Convert to arrays once, before the loop
+            x_arr = np.array([s.x for s in stars], dtype=np.float64)
+            j_arr = np.array([s.j for s in stars], dtype=np.float64)
+            phase_arr = np.array([s.phase for s in stars], dtype=np.float64)
+            x_prev_arr = x_arr.copy()  # Initialize with current positions
+            weights = np.ones(pop, dtype=np.float64)
+            # Extract LUT grids once
+            e1_grid = LUT['e1']
+            e2_grid = LUT['e2']
+            j1_grid = LUT['j1']
+            j2_grid = LUT['j2']
+            z2_grid = LUT['z2']
+            x_grid = LUT['x']
+            j_grid = LUT['j']
+            # We don't need Star objects in parallel mode
+            stars = None
+        else:
+            # Serial mode: keep Star objects
+            x_prev = [s.x for s in stars]
+            weights = [1.0]*len(stars)
 
     gtime_blocks = [np.zeros_like(XCEN) for _ in range(blocks)]
     t0_blocks    = np.zeros(blocks, float)
@@ -846,9 +873,6 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05,
         if use_clones:
             active = parents + [c for c in clones if c.get('active', True)]
             stars  = [Star(x=obj['x'], j=obj['j'], phase=obj['phase']) for obj in active]
-            weights = [obj['w'] for obj in active]
-        else:
-            weights = [1.0]*len(stars)
 
         # evolve
         if use_clones:
@@ -888,45 +912,26 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05,
                         nc['x_prev'] = nc['x']
                     clones.extend(new_clones)
         else:
-            # Use parallel evolution if numba is available
-            if HAVE_NUMBA:
-                # Convert to arrays for parallel processing
-                x_arr = np.array([s.x for s in stars], dtype=np.float64)
-                j_arr = np.array([s.j for s in stars], dtype=np.float64)
-                phase_arr = np.array([s.phase for s in stars], dtype=np.float64)
-                x_prev_arr = np.array(x_prev, dtype=np.float64)
+            if use_parallel:
+                # Parallel evolution: x_prev_arr is set inside evolve_stars_parallel
+                # to the pre-step position, so we need to save it first
+                x_prev_arr[:] = x_arr[:]  # Save current positions before evolution
                 
-                # Extract LUT grids
-                e1_grid = LUT['e1']
-                e2_grid = LUT['e2']
-                j1_grid = LUT['j1']
-                j2_grid = LUT['j2']
-                z2_grid = LUT['z2']
-                x_grid = LUT['x']
-                j_grid = LUT['j']
-                
-                # Evolve in parallel
+                # Evolve all stars in parallel
                 seed_offset = int(rng.integers(0, 2**31))
                 evolve_stars_parallel(x_arr, j_arr, phase_arr, x_prev_arr,
                                      e1_grid, e2_grid, j1_grid, j2_grid, z2_grid,
                                      x_grid, j_grid, DT,
                                      disable_capture, flip_energy_sign, inner_sink_frac, no_reservoir,
                                      seed_offset)
-                
-                # Update Star objects and x_prev
-                for i, s in enumerate(stars):
-                    s.x = float(x_arr[i])
-                    s.j = float(j_arr[i])
-                    s.phase = float(phase_arr[i])
-                    x_prev[i] = float(x_prev_arr[i])
             else:
-                # Serial evolution (fallback)
+                # Serial evolution (fallback): use original Star objects
                 x_prev_saved = x_prev.copy()
-                for i,s in enumerate(stars):
+                for i, s in enumerate(stars):
                     mc_step(s, LUT, DT, disable_capture=disable_capture,
                             flip_energy_sign=flip_energy_sign, inner_sink_frac=inner_sink_frac,
                             no_reservoir=no_reservoir)
-                    x_prev[i] = s.x
+                x_prev[i] = s.x
 
         # deposit along path in log-x
         blk = int(np.searchsorted(block_edges, k, side='right') - 1)
@@ -957,28 +962,55 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05,
                             gtime_blocks[blk][k_idx] += w*(dt0/nsub)
                 total_w += w
         else:
-            for i,s in enumerate(stars):
-                x0 = max(x_prev[i], X_BOUND)
-                x1 = max(s.x, X_BOUND)
-                w  = weights[i]
-                dt0 = DT
-                dlog = abs(math.log(max(x1,1e-12)/max(x0,1e-12)))
-                if dlog <= 0.25:
-                    xm = math.sqrt(x0*x1)
-                    xm = max(xm, X_BOUND*(1+1e-12))
-                    k_idx = bidx(xm)
-                    if 0 <= k_idx < len(XCEN):
-                        gtime_blocks[blk][k_idx] += w*dt0
-                else:
-                    nsub  = min(8, 1+int(dlog/0.25))
-                    ratio = max(x1,1e-12)/max(x0,1e-12)
-                    for u in range(nsub):
-                        xm = x0*(ratio**((u+0.5)/nsub))
+            if use_parallel:
+                # Parallel mode: use arrays
+                x_min = X_BOUND if not no_reservoir else 1e-4
+                for i in range(pop):
+                    x0 = max(x_prev_arr[i], x_min)
+                    x1 = max(x_arr[i], x_min)
+                    w  = weights[i]
+                    dt0 = DT
+                    dlog = abs(math.log(max(x1, 1e-12) / max(x0, 1e-12)))
+                    if dlog <= 0.25:
+                        xm = math.sqrt(x0 * x1)
+                        xm = max(xm, x_min * (1.0 + 1e-12))
+                        k_idx = bidx(xm)
+                        if 0 <= k_idx < len(XCEN):
+                            gtime_blocks[blk][k_idx] += w * dt0
+                    else:
+                        nsub = min(8, 1 + int(dlog / 0.25))
+                        ratio = max(x1, 1e-12) / max(x0, 1e-12)
+                        for u in range(nsub):
+                            xm = x0 * (ratio ** ((u + 0.5) / nsub))
+                            xm = max(xm, x_min * (1.0 + 1e-12))
+                            k_idx = bidx(xm)
+                            if 0 <= k_idx < len(XCEN):
+                                gtime_blocks[blk][k_idx] += w * (dt0 / nsub)
+                    total_w += w
+            else:
+                # Serial mode: use Star objects
+                for i, s in enumerate(stars):
+                    x0 = max(x_prev_saved[i], X_BOUND)
+                    x1 = max(s.x, X_BOUND)
+                    w  = weights[i]
+                    dt0 = DT
+                    dlog = abs(math.log(max(x1,1e-12)/max(x0,1e-12)))
+                    if dlog <= 0.25:
+                        xm = math.sqrt(x0*x1)
                         xm = max(xm, X_BOUND*(1+1e-12))
                         k_idx = bidx(xm)
                         if 0 <= k_idx < len(XCEN):
-                            gtime_blocks[blk][k_idx] += w*(dt0/nsub)
-                total_w += w
+                            gtime_blocks[blk][k_idx] += w*dt0
+                    else:
+                        nsub  = min(8, 1+int(dlog/0.25))
+                        ratio = max(x1,1e-12)/max(x0,1e-12)
+                        for u in range(nsub):
+                            xm = x0*(ratio**((u+0.5)/nsub))
+                            xm = max(xm, X_BOUND*(1+1e-12))
+                            k_idx = bidx(xm)
+                            if 0 <= k_idx < len(XCEN):
+                                gtime_blocks[blk][k_idx] += w*(dt0/nsub)
+                    total_w += w
 
         t0_blocks[blk] += total_w*DT
 
