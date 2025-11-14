@@ -743,21 +743,61 @@ def main():
                              per_dlnx=use_per_dlnx)
 
     # ----- Optional background update -----
+        # Optional: background update (paper's 2-pass style)
     if args.background_update:
-        print("Updating background from measured ḡ (gentle ratio method)...")
-        bg1 = build_updated_background_from_measure(bg0, g_mean, g_err,
-                                                    snr_max=1.0,
-                                                    x_min=0.23,
-                                                    x_max=50.0)
+        print("Updating background from measured ḡ...")
+
+        # Original BWII background at the Fig. 3 bin centers
+        g0_cen = g0_interp(XCEN)
+        g0_cen = np.maximum(g0_cen, 1e-16)
+
+        # Signal-to-noise for the Pass-1 measurement
+        snr = np.zeros_like(g_mean)
+        good = (g_mean > 0) & (g_err > 0)
+        snr[good] = g_mean[good] / g_err[good]
+
+        # Only trust bins with reasonable S/N and in a central-x window
+        # (you can tweak x_min/x_max or the SNR cut if you like)
+        x_min, x_max = 0.23, 50.0
+        use = good & (snr >= 1.0) & (XCEN >= x_min) & (XCEN <= x_max)
+
+        # Raw ratio R_raw = ḡ^(1) / g0, defaulting to 1 outside "use"
+        R_raw = np.ones_like(g_mean)
+        R_raw[use] = g_mean[use] / g0_cen[use]
+
+        # Smooth the ratio in log-space, not the absolute ḡ
+        R_smooth = smooth_log(XCEN, np.maximum(R_raw, 1e-3), k=3)
+
+        # Clamp to a modest range so we don't over-react to noise
+        R_smooth = np.clip(R_smooth, 0.5, 2.0)
+
+        # Build new background: g_bg(x) = R(x) * g0(x)
+        xbg = np.logspace(-3, 4, 400)
+        lx_bg = np.log(xbg)
+        lx_cen = np.log(XCEN)
+
+        # Interpolate ln R to the fine grid
+        lnR_cen = np.log(R_smooth)
+        lnR_bg = np.interp(lx_bg, lx_cen, lnR_cen)
+        R_bg = np.exp(lnR_bg)
+
+        # Final updated background
+        gbg = g0_interp(xbg) * R_bg
+
+        # Rebuild LUT on updated background
+        bg1 = Background(xs=xbg, gs=gbg)
         print("Rebuilding LUT on updated background...")
         LUT = precompute_LUT(args.lut_x, args.lut_j, bg1)
 
+        # Pass 2: measure again with updated background
         print("Pass 2: Measuring with updated background...")
-        g_mean, g_err = run_once(args.steps, DT, args.pop, LUT,
-                                 blocks=args.blocks,
-                                 disable_capture=args.disable_capture,
-                                 X_FLOORS=X_FLOORS, n_clones=args.clones,
-                                 per_dlnx=use_per_dlnx)
+        g_mean, g_err = run_once(
+            args.steps, DT, args.pop, LUT, blocks=args.blocks,
+            disable_capture=args.disable_capture,
+            X_FLOORS=X_FLOORS, n_clones=args.clones,
+            per_dlnx=use_per_dlnx
+        )
+
 
     # final normalization at x≈0.225 if requested
     if args.normalize_225:
