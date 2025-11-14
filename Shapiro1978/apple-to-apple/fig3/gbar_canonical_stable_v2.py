@@ -8,7 +8,47 @@
 import math, argparse, numpy as np
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
-from scipy.integrate import cumulative_trapezoid
+import sys
+import time
+import concurrent.futures as cf
+import multiprocessing as mp
+
+# Import scipy - handle potential circular import issues in multiprocessing workers
+# On Windows with multiprocessing, scipy can have circular import issues
+# We'll try to import it, and if it fails, Background.__init__ will retry
+try:
+    from scipy.integrate import cumulative_trapezoid
+except (ImportError, RuntimeError, RecursionError) as e:
+    # If import fails (e.g., in a worker process with circular imports),
+    # set to None and let Background.__init__ retry the import
+    cumulative_trapezoid = None
+    # Only print warning if we're in the main process (not a worker)
+    if __name__ == "__main__":
+        import traceback
+        if 'circular' in str(e).lower() or 'recursion' in str(e).lower():
+            # This is expected in some multiprocessing scenarios, don't warn
+            pass
+        else:
+            print(f"Warning: scipy import issue (will retry in Background): {e}", file=sys.stderr)
+
+# ---------- Optional Numba JIT ----------
+try:
+    import numba as nb
+    HAVE_NUMBA = True
+except ImportError:
+    nb = None
+    HAVE_NUMBA = False
+
+def nb_njit(*a, **k):
+    """Fallback decorator if numba is not available."""
+    def deco(f):
+        return f
+    return deco
+
+# If numba is present and user doesn't disable it, use real njit
+# (will be overridden in main() if --no-jit is set)
+njit = nb.njit if HAVE_NUMBA else nb_njit
+fastmath = dict(fastmath=True, nogil=True, cache=True) if HAVE_NUMBA else {}
 
 # ----------------- Global RNG -----------------
 rng = None
@@ -86,12 +126,22 @@ def g0_interp(x):
     return out
 
 # ----------------- Kepler helpers for capture phase check -----------------
+@njit(**fastmath)
 def j_min_exact(x):
-    val = 2.0*x/X_D - (x*x)/(X_D*X_D)
-    return math.sqrt(max(0.0, min(1.0, val)))
+    xd = 1.0e4  # X_D constant for numba
+    val = 2.0*x/xd - (x*x)/(xd*xd)
+    if val < 0.0:
+        val = 0.0
+    if val > 1.0:
+        val = 1.0
+    return math.sqrt(val)
 
+@njit(**fastmath)
 def Ptilde(x):  # ∝ x^{-3/2}, only for pericenter counting
-    return max(1e-3, x**(-1.5))
+    result = x**(-1.5)
+    if result < 1e-3:
+        return 1e-3
+    return result
 
 # ----------------- θ-quadrature (12-pt) -----------------
 def th_nodes(n=12):
@@ -116,10 +166,15 @@ def _z123(x, j, xp, xap, xp2):
     z3 = 1.0 - (x3/x1)*(S*S)
     return x1, x2, x3, z1, z2, z3
 
+@njit(**fastmath)
 def pericenter_xp(x, j):
     e = math.sqrt(max(0.0, 1.0 - j*j))
-    return 2.0*x / max(1e-12, 1.0 - e)
+    denom = 1.0 - e
+    if denom < 1e-12:
+        denom = 1e-12
+    return 2.0*x / denom
 
+@njit(**fastmath)
 def apocenter_xap(x, j):
     e = math.sqrt(max(0.0, 1.0 - j*j))
     return 2.0*x / (1.0 + e)
@@ -214,6 +269,19 @@ def smooth_log(xs, ys, k=7):
 # ----------------- background + moments -----------------
 class Background:
     def __init__(self, xs, gs):
+        # Lazy import of scipy to avoid circular import issues in multiprocessing workers
+        global cumulative_trapezoid
+        if cumulative_trapezoid is None:
+            try:
+                from scipy.integrate import cumulative_trapezoid as _ct
+                cumulative_trapezoid = _ct
+            except (ImportError, RuntimeError, RecursionError) as e:
+                raise RuntimeError(
+                    f"Failed to import scipy.integrate.cumulative_trapezoid: {e}\n"
+                    "This is required for Background class. "
+                    "If using multiprocessing, try setting start method to 'spawn'."
+                ) from e
+        
         # Build an internal fine log grid and precompute moments
         self.xg = np.logspace(-3, 4, 400)
         lx   = np.log(self.xg)
@@ -336,19 +404,105 @@ def orbital_perturbations(x, j, bg: Background):
     return e1, e2, j1, j2, z2
 
 # ----------------- coefficient LUT -----------------
-def precompute_LUT(nx, nj, bg: Background):
+def _compute_LUT_chunk(ix_start, ix_end, Xg, Jg, bg: "Background"):
+    """Worker function: compute LUT rows ix_start:ix_end for all j."""
+    nx_chunk = ix_end - ix_start
+    nj = Jg.size
+
+    E1_c = np.zeros((nx_chunk, nj))
+    E2_c = np.zeros_like(E1_c)
+    J1_c = np.zeros_like(E1_c)
+    J2_c = np.zeros_like(E1_c)
+    Z2_c = np.zeros_like(E1_c)
+
+    for local_ix, ix in enumerate(range(ix_start, ix_end)):
+        x = Xg[ix]
+        for ij, j in enumerate(Jg):
+            e1, e2, j1, j2, z2 = orbital_perturbations(x, j, bg)
+            E1_c[local_ix, ij] = e1
+            E2_c[local_ix, ij] = e2
+            J1_c[local_ix, ij] = j1
+            J2_c[local_ix, ij] = j2
+            Z2_c[local_ix, ij] = z2
+
+    return ix_start, ix_end, E1_c, E2_c, J1_c, J2_c, Z2_c
+
+def precompute_LUT(nx, nj, bg: Background, n_procs: int = 1):
     Xg = np.logspace(-3, 4, nx)
     Jg = np.linspace(0.0, 1.0, nj)
-    E1 = np.zeros((nx, nj)); E2 = np.zeros_like(E1)
-    J1 = np.zeros_like(E1);   J2 = np.zeros_like(E1)
+
+    E1 = np.zeros((nx, nj))
+    E2 = np.zeros_like(E1)
+    J1 = np.zeros_like(E1)
+    J2 = np.zeros_like(E1)
     Z2 = np.zeros_like(E1)
-    print(f"Precomputing LUT {nx}x{nj} ...")
-    for ix,x in enumerate(Xg):
-        for ij,j in enumerate(Jg):
-            e1,e2,j1,j2,z2 = orbital_perturbations(x,j,bg)
-            E1[ix,ij]=e1; E2[ix,ij]=e2
-            J1[ix,ij]=j1; J2[ix,ij]=j2
-            Z2[ix,ij]=z2
+
+    print(f"Precomputing LUT {nx}x{nj} ...", file=sys.stderr, flush=True)
+
+    if n_procs <= 1:
+        # Original serial version
+        for ix, x in enumerate(Xg):
+            for ij, j in enumerate(Jg):
+                e1, e2, j1, j2, z2 = orbital_perturbations(x, j, bg)
+                E1[ix, ij] = e1
+                E2[ix, ij] = e2
+                J1[ix, ij] = j1
+                J2[ix, ij] = j2
+                Z2[ix, ij] = z2
+    else:
+        # Parallel over x using ProcessPoolExecutor
+        n_procs = min(n_procs, mp.cpu_count())
+        # Build contiguous chunks in x
+        base = nx // n_procs
+        rem = nx % n_procs
+        chunks = []
+        start = 0
+        for p in range(n_procs):
+            size = base + (1 if p < rem else 0)
+            if size <= 0:
+                continue
+            end = start + size
+            chunks.append((start, end))
+            start = end
+
+        total_expected = len(chunks)
+        total_streams_completed = 0
+        start_time = time.time()
+
+        with cf.ProcessPoolExecutor(max_workers=n_procs) as ex:
+            futures = [
+                ex.submit(_compute_LUT_chunk, s, e, Xg, Jg, bg)
+                for (s, e) in chunks
+            ]
+            for fut in cf.as_completed(futures):
+                ix_start, ix_end, E1_c, E2_c, J1_c, J2_c, Z2_c = fut.result()
+                E1[ix_start:ix_end, :] = E1_c
+                E2[ix_start:ix_end, :] = E2_c
+                J1[ix_start:ix_end, :] = J1_c
+                J2[ix_start:ix_end, :] = J2_c
+                Z2[ix_start:ix_end, :] = Z2_c
+
+                # progress accounting
+                total_streams_completed += 1
+                elapsed = time.time() - start_time
+                rate = total_streams_completed / max(elapsed, 1e-6)
+                eta = (total_expected - total_streams_completed) / max(rate, 1e-6)
+
+                # "rep/streams" labels are mostly cosmetic here, but match your format
+                rep = 0
+                replicates = 1
+                completed = total_streams_completed
+                n_streams = total_expected
+                print(
+                    f"\rProgress: rep {rep+1}/{replicates}, {completed}/{n_streams} streams | "
+                    f"Total: {total_streams_completed}/{total_expected} "
+                    f"({100*total_streams_completed/total_expected:5.1f}%) | "
+                    f"Rate: {rate:5.1f} streams/s | ETA: {eta:5.0f}s",
+                    end="", flush=True, file=sys.stderr
+                )
+
+        print("", file=sys.stderr)  # newline after progress bar
+
     return dict(x=Xg, j=Jg, e1=E1, e2=E2, j1=J1, j2=J2, z2=Z2)
 
 def _interp2(bx, by, gx, gy, A):
@@ -439,6 +593,165 @@ def maybe_split(obj, X_FLOORS, n_clones):
                 phase=obj['phase'], floor_idx=obj['floor_idx']
             ))
     return new_clones
+
+# Numba-parallel star evolution (array-based for parallelization)
+if HAVE_NUMBA:
+    from numba import prange
+    from numba import types
+    from numba.typed import Dict
+    
+    @njit(parallel=True, **fastmath)
+    def evolve_stars_parallel(x_arr, j_arr, phase_arr, x_prev_arr,
+                              e1_grid, e2_grid, j1_grid, j2_grid, z2_grid,
+                              x_grid, j_grid, DT,
+                              disable_capture, flip_energy_sign, inner_sink_frac, no_reservoir,
+                              seed_offset):
+        """
+        Evolve all stars in parallel using numba prange.
+        
+        Parameters:
+        - x_arr, j_arr, phase_arr: current star states (modified in-place)
+        - x_prev_arr: previous x positions (for deposition)
+        - e1_grid, etc.: LUT coefficient grids
+        - x_grid, j_grid: LUT coordinate grids
+        - seed_offset: offset for thread-safe RNG
+        """
+        n = len(x_arr)
+        xd = 1.0e4  # X_D
+        xbound = 0.2  # X_BOUND
+        
+        for i in prange(n):
+            # Thread-local RNG seed (thread-safe LCG)
+            rng_seed = (seed_offset + i) * 1103515245 + 12345
+            
+            x = x_arr[i]
+            j = j_arr[i]
+            phase = phase_arr[i]
+            x_prev_arr[i] = x
+            
+            # Bilinear interpolation of coefficients from LUT
+            # Find grid indices
+            ix = 0
+            for idx in range(len(x_grid) - 1):
+                if x >= x_grid[idx] and x < x_grid[idx + 1]:
+                    ix = idx
+                    break
+            if x >= x_grid[-1]:
+                ix = len(x_grid) - 2
+            
+            ij = 0
+            for idx in range(len(j_grid) - 1):
+                if j >= j_grid[idx] and j < j_grid[idx + 1]:
+                    ij = idx
+                    break
+            if j >= j_grid[-1]:
+                ij = len(j_grid) - 2
+            
+            # Bilinear interpolation
+            x0, x1 = x_grid[ix], x_grid[ix + 1]
+            j0, j1 = j_grid[ij], j_grid[ij + 1]
+            tx = (x - x0) / max(x1 - x0, 1e-30)
+            ty = (j - j0) / max(j1 - j0, 1e-30)
+            tx = max(0.0, min(1.0, tx))
+            ty = max(0.0, min(1.0, ty))
+            
+            e1 = (1-tx)*(1-ty)*e1_grid[ix,ij] + tx*(1-ty)*e1_grid[ix+1,ij] + (1-tx)*ty*e1_grid[ix,ij+1] + tx*ty*e1_grid[ix+1,ij+1]
+            e2 = (1-tx)*(1-ty)*e2_grid[ix,ij] + tx*(1-ty)*e2_grid[ix+1,ij] + (1-tx)*ty*e2_grid[ix,ij+1] + tx*ty*e2_grid[ix+1,ij+1]
+            j1 = (1-tx)*(1-ty)*j1_grid[ix,ij] + tx*(1-ty)*j1_grid[ix+1,ij] + (1-tx)*ty*j1_grid[ix,ij+1] + tx*ty*j1_grid[ix+1,ij+1]
+            j2 = (1-tx)*(1-ty)*j2_grid[ix,ij] + tx*(1-ty)*j2_grid[ix+1,ij] + (1-tx)*ty*j2_grid[ix,ij+1] + tx*ty*j2_grid[ix+1,ij+1]
+            z2 = (1-tx)*(1-ty)*z2_grid[ix,ij] + tx*(1-ty)*z2_grid[ix+1,ij] + (1-tx)*ty*z2_grid[ix,ij+1] + tx*ty*z2_grid[ix+1,ij+1]
+            
+            e2 = max(e2, 0.0)
+            j2 = max(j2, 0.0)
+            z2 = max(min(z2, e2*j2+1e-22), 0.0)
+            
+            # Correlated Gaussian kick
+            muE, muJ = e1*DT, j1*DT
+            sE2, sJ2, sEZ = e2*DT, j2*DT, z2*DT
+            a = math.sqrt(max(sE2, 0.0) + 1e-30)
+            c0 = math.sqrt(max(sJ2, 0.0) + 1e-30)
+            rho_val = sEZ / max(a*c0, 1e-30)
+            if rho_val > 0.999:
+                rho_val = 0.999
+            if rho_val < -0.999:
+                rho_val = -0.999
+            
+            # Generate normal random numbers using LCG + Box-Muller
+            # First normal
+            rng_seed = (rng_seed * 1103515245 + 12345) & 0x7fffffff
+            u1 = rng_seed / 2147483648.0
+            rng_seed = (rng_seed * 1103515245 + 12345) & 0x7fffffff
+            u2 = rng_seed / 2147483648.0
+            z1 = math.sqrt(-2.0 * math.log(max(u1, 1e-10))) * math.cos(2.0 * math.pi * u2)
+            # Second normal
+            rng_seed = (rng_seed * 1103515245 + 12345) & 0x7fffffff
+            u1 = rng_seed / 2147483648.0
+            rng_seed = (rng_seed * 1103515245 + 12345) & 0x7fffffff
+            u2 = rng_seed / 2147483648.0
+            z2n = math.sqrt(-2.0 * math.log(max(u1, 1e-10))) * math.cos(2.0 * math.pi * u2)
+            
+            dE = muE + a*z1
+            dJ = muJ + rho_val*c0*z1 + c0*math.sqrt(max(1-rho_val*rho_val, 0.0))*z2n
+            
+            # Bounded step
+            max_dx = 0.15 * max(x, 1e-6)
+            jmin_val = math.sqrt(max(0.0, min(1.0, 2.0*x/xd - (x*x)/(xd*xd))))
+            max_dj = min(0.10, 0.40*max(0.0, 1.0 - j), max(0.25*abs(j - jmin_val), 0.10*max(jmin_val, 1e-8)))
+            
+            # Energy update
+            dE_clipped = max(-max_dx, min(max_dx, dE))
+            if flip_energy_sign:
+                x = max(1e-4, min(xd, x + dE_clipped))
+            else:
+                x = max(1e-4, min(xd, x - dE_clipped))
+            
+            dj = max(-max_dj, min(max_dj, dJ))
+            j = max(0.0, min(1.0, j + dj))
+            
+            # Inner sink boundary
+            if inner_sink_frac > 0.0:
+                sink_threshold = (1.0 - inner_sink_frac) * xd
+                if x >= sink_threshold:
+                    if no_reservoir:
+                        x = min(x, xd * 0.999)
+                    else:
+                        x = xbound
+                        rng_seed = (rng_seed * 1103515245 + 12345) & 0x7fffffff
+                        j = math.sqrt(rng_seed / 2147483648.0)
+                        phase = 0.0
+                    x_arr[i] = x
+                    j_arr[i] = j
+                    phase_arr[i] = phase
+                    continue
+            
+            # Reservoir boundary
+            if not no_reservoir and x < xbound:
+                x = xbound
+                rng_seed = (rng_seed * 1103515245 + 12345) & 0x7fffffff
+                j = math.sqrt(rng_seed / 2147483648.0)
+            
+            # Capture at pericenter crossings
+            if not disable_capture:
+                prev_phase_int = int(phase)
+                ptilde_val = max(1e-3, x**(-1.5))
+                phase += DT / max(ptilde_val, 1e-6)
+                if int(phase) > prev_phase_int and j <= jmin_val:
+                    if no_reservoir:
+                        j = max(jmin_val * 1.01, 1e-6)
+                        phase = 0.0
+                    else:
+                        x = xbound
+                        rng_seed = (rng_seed * 1103515245 + 12345) & 0x7fffffff
+                        j = math.sqrt(rng_seed / 2147483648.0)
+                        phase = 0.0
+            
+            x_arr[i] = x
+            j_arr[i] = j
+            phase_arr[i] = phase
+else:
+    # Fallback if numba not available
+    def evolve_stars_parallel(*args, **kwargs):
+        raise RuntimeError("numba is required for parallel star evolution")
 
 def mc_step(s: Star, L, DT, disable_capture=False, flip_energy_sign=False, inner_sink_frac=0.0, no_reservoir=False):
     e1,e2,j1,j2,z2 = coeff_from_LUT(s.x, s.j, L)
@@ -575,12 +888,45 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05,
                         nc['x_prev'] = nc['x']
                     clones.extend(new_clones)
         else:
-            x_prev_saved = x_prev.copy()
-            for i,s in enumerate(stars):
-                mc_step(s, LUT, DT, disable_capture=disable_capture,
-                        flip_energy_sign=flip_energy_sign, inner_sink_frac=inner_sink_frac,
-                        no_reservoir=no_reservoir)
-                x_prev[i] = s.x
+            # Use parallel evolution if numba is available
+            if HAVE_NUMBA:
+                # Convert to arrays for parallel processing
+                x_arr = np.array([s.x for s in stars], dtype=np.float64)
+                j_arr = np.array([s.j for s in stars], dtype=np.float64)
+                phase_arr = np.array([s.phase for s in stars], dtype=np.float64)
+                x_prev_arr = np.array(x_prev, dtype=np.float64)
+                
+                # Extract LUT grids
+                e1_grid = LUT['e1']
+                e2_grid = LUT['e2']
+                j1_grid = LUT['j1']
+                j2_grid = LUT['j2']
+                z2_grid = LUT['z2']
+                x_grid = LUT['x']
+                j_grid = LUT['j']
+                
+                # Evolve in parallel
+                seed_offset = int(rng.integers(0, 2**31))
+                evolve_stars_parallel(x_arr, j_arr, phase_arr, x_prev_arr,
+                                     e1_grid, e2_grid, j1_grid, j2_grid, z2_grid,
+                                     x_grid, j_grid, DT,
+                                     disable_capture, flip_energy_sign, inner_sink_frac, no_reservoir,
+                                     seed_offset)
+                
+                # Update Star objects and x_prev
+                for i, s in enumerate(stars):
+                    s.x = float(x_arr[i])
+                    s.j = float(j_arr[i])
+                    s.phase = float(phase_arr[i])
+                    x_prev[i] = float(x_prev_arr[i])
+            else:
+                # Serial evolution (fallback)
+                x_prev_saved = x_prev.copy()
+                for i,s in enumerate(stars):
+                    mc_step(s, LUT, DT, disable_capture=disable_capture,
+                            flip_energy_sign=flip_energy_sign, inner_sink_frac=inner_sink_frac,
+                            no_reservoir=no_reservoir)
+                    x_prev[i] = s.x
 
         # deposit along path in log-x
         blk = int(np.searchsorted(block_edges, k, side='right') - 1)
@@ -612,7 +958,7 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05,
                 total_w += w
         else:
             for i,s in enumerate(stars):
-                x0 = max(x_prev_saved[i], X_BOUND)
+                x0 = max(x_prev[i], X_BOUND)
                 x1 = max(s.x, X_BOUND)
                 w  = weights[i]
                 dt0 = DT
@@ -769,19 +1115,46 @@ def main():
                     help="save R(x) = g_MC(x) / g0(x) diagnostic to gbar_ratio.csv")
     ap.add_argument("--no-reservoir", action="store_true",
                     help="do not enforce outer reservoir at x = X_BOUND (for g0 stationarity tests)")
+    ap.add_argument("--procc", type=int, default=1,
+                    help="number of worker processes for LUT precomputation (1=serial)")
+    ap.add_argument("--no-jit", dest="use_jit", action="store_false", default=True,
+                    help="disable numba JIT even if available")
     ap.add_argument("--seed", type=int, default=7,
                     help="random seed for reproducibility")
     args = ap.parse_args()
 
-    global rng
+    # Set multiprocessing start method for Windows compatibility (before using ProcessPoolExecutor)
+    if args.procc > 1:
+        try:
+            mp.set_start_method('spawn', force=True)
+        except RuntimeError:
+            # Already set, ignore
+            pass
+
+    global rng, njit, fastmath
     rng = np.random.default_rng(args.seed)
+
+    # Update JIT settings based on --no-jit flag
+    use_jit = getattr(args, "use_jit", True) and HAVE_NUMBA
+    njit = nb.njit if use_jit else nb_njit
+    fastmath = dict(fastmath=True, nogil=True, cache=True) if use_jit else {}
+    if use_jit and HAVE_NUMBA:
+        # Set numba to use all available CPU threads for parallel execution
+        import os
+        num_threads = int(os.environ.get('NUMBA_NUM_THREADS', mp.cpu_count()))
+        nb.set_num_threads(num_threads)
+        print(f"Using numba JIT compilation with {num_threads} threads for parallel execution")
+    elif HAVE_NUMBA:
+        print(f"Numba available but JIT disabled (--no-jit)")
+    else:
+        print(f"Numba not available, running without JIT")
 
     DT = (6.0/args.steps) if args.dt is None else float(args.dt)
 
     # initial background from BWII g0
     xgrid = np.logspace(-3, 4, 400)
     bg0   = Background(xs=xgrid, gs=g0_interp(xgrid))
-    LUT   = precompute_LUT(args.lut_x, args.lut_j, bg0)
+    LUT   = precompute_LUT(args.lut_x, args.lut_j, bg0, n_procs=args.procc)
 
     # build floors
     X_FLOORS = None
@@ -882,14 +1255,14 @@ def main():
         # Rebuild LUT on updated background
         bg1 = Background(xs=xbg, gs=gbg)
         print("Rebuilding LUT on updated background...")
-        LUT = precompute_LUT(args.lut_x, args.lut_j, bg1)
+        LUT = precompute_LUT(args.lut_x, args.lut_j, bg1, n_procs=args.procc)
 
         # Pass 2: measure again with updated background
         print("Pass 2: Measuring with updated background...")
         g_mean, g_err = run_once(
             args.steps, DT, args.pop, LUT, blocks=args.blocks,
-            disable_capture=args.disable_capture,
-            X_FLOORS=X_FLOORS, n_clones=args.clones,
+                                 disable_capture=args.disable_capture,
+                                 X_FLOORS=X_FLOORS, n_clones=args.clones,
             per_dlnx=use_per_dlnx,
             burn_frac=args.burn_frac,
             init_g0=args.init_g0,
