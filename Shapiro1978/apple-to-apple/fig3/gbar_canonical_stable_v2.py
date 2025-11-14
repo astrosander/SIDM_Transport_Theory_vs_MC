@@ -181,42 +181,50 @@ def smooth_log(xs, ys, k=7):
     ly_s = np.convolve(ly, ker, mode='same')
     return np.exp(ly_s)
 
-def build_bg_from_measure(xcen, g_mean, alpha=0.6, xmin_upd=0.25, xmax_upd=50.0):
-    """Build updated background by blending measured ḡ with baseline g0"""
+def build_bg_from_measure(
+    xcen, g_mean, g_err,
+    xmin_upd=0.25, xmax_upd=50.0,
+    snr_max=0.6,          # keep bins with (g_err/g) <= snr_max
+    alpha=0.45,           # 0=all g0, 1=all updated (log-space blend)
+    floor_rel=0.30,       # never drop below 30% of g0
+    ceil_rel=3.0          # never exceed 3x g0
+):
+    """Build updated background by blending measured ḡ with baseline g0
+    - Anchors Pass-1 to g0 at x=0.225 BEFORE any smoothing
+    - Gates by SNR to exclude noisy bins
+    - Blends in log-space with floor/ceiling to prevent LUT collapse
+    """
     xbg = np.logspace(-3, 4, 400)
     g0b = g0_interp(xbg)
-    
-    # work only where we actually measured reliably
-    mask = (xcen >= xmin_upd) & (xcen <= xmax_upd) & (g_mean > 0)
+
+    # ---- Anchor Pass-1 to g0 at x=0.225 BEFORE any smoothing ----
+    i225 = int(np.argmin(np.abs(xcen - 0.225)))
+    scale = g0_interp(np.array([0.225]))[0] / max(g_mean[i225], 1e-16)
+    g1 = g_mean * scale
+    e1 = g_err * scale
+
+    # ---- Use only reliable bins in a safe window ----
+    ok = (xcen >= xmin_upd) & (xcen <= xmax_upd) & (g1 > 0)
+    ok &= (e1 / np.maximum(g1, 1e-16)) <= snr_max
+    if not np.any(ok):
+        return Background(xs=xbg, gs=g0b)   # fall back to baseline
+
+    # ---- Smooth in log-space & interpolate inside the window ----
+    g_sm = smooth_log(xcen[ok], np.maximum(g1[ok], 1e-16), k=7)
+    lx_in = np.log(xcen[ok])
+    lg_in = np.log(g_sm)
+    inwin = (xbg >= xmin_upd) & (xbg <= xmax_upd)
+    lg_up = np.interp(np.log(xbg[inwin]), lx_in, lg_in)
     g_upd = g0b.copy()
-    if np.any(mask):
-        # Get filtered arrays (ensure they're 1D numpy arrays)
-        xcen_filt = np.asarray(xcen[mask])
-        g_mean_filt = np.asarray(np.maximum(g_mean[mask], 1e-12))
-        
-        # Ensure we have at least 2 points for interpolation
-        if len(xcen_filt) < 2:
-            # Not enough points, skip update
-            pass
-        else:
-            # Smooth in log-space
-            g_sm = smooth_log(xcen_filt, g_mean_filt, k=7)
-            
-            # Ensure arrays have same length
-            if len(xcen_filt) != len(g_sm):
-                # Fallback: use unsmoothed if smoothing changes length
-                g_sm = g_mean_filt
-            
-            # Interpolate to fine grid
-            lx_in = np.log(xcen_filt)
-            lg_in = np.log(g_sm)
-            inwin = (xbg >= xmin_upd) & (xbg <= xmax_upd)
-            if np.any(inwin) and len(lx_in) == len(lg_in) and len(lx_in) > 0:
-                g_upd[inwin] = np.exp(np.interp(np.log(xbg[inwin]), lx_in, lg_in))
-    
-    # blend and protect against collapse
-    g_mix = (1.0 - alpha) * g0b + alpha * g_upd
-    g_mix = np.maximum(g_mix, 0.1 * g0b)  # keep ≥10% of baseline everywhere
+    g_upd[inwin] = np.exp(lg_up)
+
+    # ---- Log-space blend with g0 and clamp to guard rails ----
+    lg0 = np.log(np.maximum(g0b, 1e-16))
+    lgu = np.log(np.maximum(g_upd, 1e-16))
+    lgm = (1 - alpha) * lg0 + alpha * lgu
+    g_mix = np.exp(lgm)
+    g_mix = np.clip(g_mix, floor_rel * g0b, ceil_rel * g0b)
+
     return Background(xs=xbg, gs=g_mix)
 
 # ---------- background + moments ----------
@@ -235,10 +243,11 @@ class Background:
     def g(self, x):
         x = np.asarray(x)
         idx = np.clip(np.searchsorted(self.xg, x)-1, 0, len(self.xg)-2)
-        x0,x1 = self.xg[idx], self.xg[idx+1]
-        g0,g1 = self.gg[idx], self.gg[idx+1]
-        t = (x - x0)/np.maximum(x1-x0, 1e-30)
-        return np.maximum(g0*(1-t)+g1*t, 1e-16)
+        x0, x1 = self.xg[idx], self.xg[idx+1]
+        # Interpolate in log-space for better behavior
+        t = (np.log(x) - np.log(x0)) / np.maximum(np.log(x1) - np.log(x0), 1e-30)
+        lg = np.log(self.gg[idx]) * (1 - t) + np.log(self.gg[idx+1]) * t
+        return np.exp(lg)
     def moment(self, x, which):
         M = self.Mm32 if which=='m32' else self.Mm12
         x = np.asarray(x)
@@ -332,6 +341,13 @@ def precompute_LUT(nx, nj, bg: Background):
             e1,e2,j1,j2,z2 = orbital_perturbations(x,j,bg)
             E1[ix,ij]=e1; E2[ix,ij]=e2; J1[ix,ij]=j1; J2[ix,ij]=j2; Z2[ix,ij]=z2
     return dict(x=Xg, j=Jg, e1=E1, e2=E2, j1=J1, j2=J2, z2=Z2)
+
+def _lut_probe(L):
+    """Quick health check: verify diffusion coefficients are non-zero"""
+    for xv in [0.3, 1.0, 3.0]:
+        ix = max(0, min(len(L['x']) - 2, np.searchsorted(L['x'], xv) - 1))
+        print(f"x≈{xv:>4}: med E2={np.median(L['e2'][ix,:]):.3e}, "
+              f"J2={np.median(L['j2'][ix,:]):.3e}")
 
 def _interp2(bx, by, gx, gy, A):
     ix = np.clip(np.searchsorted(gx, bx) - 1, 0, len(gx)-2)
@@ -688,20 +704,17 @@ def main():
     
     # Optional: background update (paper's 2-pass method)
     if args.background_update:
-        print("Updating background from measured ḡ...")
+        print("Updating background from measured ḡ (anchored/SNR-gated/blended)...")
         # Build updated background by blending with baseline (prevents LUT collapse)
-        bg1 = build_bg_from_measure(XCEN, g_mean, alpha=args.bg_alpha, 
-                                    xmin_upd=args.bg_xmin, xmax_upd=args.bg_xmax)
+        bg1 = build_bg_from_measure(XCEN, g_mean, g_err,
+                                    xmin_upd=0.25, xmax_upd=50.0,
+                                    snr_max=0.6, alpha=0.45,
+                                    floor_rel=0.30, ceil_rel=3.0)
         print("Rebuilding LUT on updated background...")
         LUT = precompute_LUT(args.lut_x, args.lut_j, bg1)
         
-        # Sanity check: verify diffusion coefficients aren't collapsed
-        e2_low = float(np.median(LUT['e2'][:5, :]))
-        idx_x1 = np.searchsorted(LUT['x'], 1.0) - 1
-        e2_x1 = float(np.median(LUT['e2'][max(0, idx_x1):idx_x1+2, :]))
-        print(f"E2@low-x median: {e2_low:.2e}, E2@x~1 median: {e2_x1:.2e}")
-        if e2_low < 1e-10 or e2_x1 < 1e-10:
-            print("WARNING: Diffusion coefficients appear collapsed! Consider reducing --bg-alpha or narrowing update window.")
+        # LUT health check (fail fast if collapsed)
+        _lut_probe(LUT)
         
         # Pass 2: measure again with updated background
         print("Pass 2: Measuring with updated background...")
