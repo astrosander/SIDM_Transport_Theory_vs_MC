@@ -882,6 +882,44 @@ def reconstruct_stationary_solution(fp_diag):
     
     return dict(x=x, g_stat=g_stat, g0=g0, ratio=ratio, integrand=integrand, J=J, rel_J=rel_J)
 
+# ----------------- Compute stationarity-implied drift -----------------
+def compute_stationarity_implied_drift(fp_diag):
+    """
+    Compute the drift D_E_stat that would make g0 exactly stationary for the given D_EE.
+    
+    For zero-flux stationary solution of alternative FP form:
+        J = -D_E*g - 0.5*d/dx(D_EE*g) = 0
+        => D_E_stat = -0.5 * d/dx(D_EE*g0) / g0
+    
+    This is the drift that, when used with the current D_EE, makes g0 stationary.
+    """
+    x = fp_diag['x']
+    D_E = fp_diag['D_E']
+    D_EE = fp_diag['D_EE']
+    g0 = fp_diag['g0']
+    
+    # Compute D_EE * g0 and its derivative
+    DEE_g0 = D_EE * g0
+    d_DEE_g0_dx = np.gradient(DEE_g0, x)
+    
+    # Stationarity-implied drift
+    D_E_stat = -0.5 * d_DEE_g0_dx / np.maximum(g0, 1e-16)
+    
+    # Compare to current D_E
+    ratio = D_E / np.maximum(np.abs(D_E_stat), 1e-30)
+    delta = (D_E - D_E_stat) / np.maximum(np.abs(D_E_stat), 1e-30)
+    
+    return dict(
+        x=x,
+        D_E_orig=D_E,
+        D_E_stat=D_E_stat,
+        D_EE=D_EE,
+        g0=g0,
+        ratio=ratio,
+        delta=delta,
+        d_DEE_g0_dx=d_DEE_g0_dx
+    )
+
 # ----------------- MC machinery -----------------
 @dataclass
 class Star:
@@ -1518,6 +1556,10 @@ def main():
                     help="test FP checker with toy Ornstein-Uhlenbeck process (validation)")
     ap.add_argument("--reconstruct-stationary", action="store_true",
                     help="reconstruct stationary solution from D_E, D_EE and compare to g0")
+    ap.add_argument("--compare-drift", action="store_true",
+                    help="compare current D_E to stationarity-implied D_E_stat (diagnostic)")
+    ap.add_argument("--enforce-stationary-drift", action="store_true",
+                    help="use stationarity-implied D_E_stat instead of computed D_E (for testing)")
     args = ap.parse_args()
 
     # Set multiprocessing start method for Windows compatibility (before using ProcessPoolExecutor)
@@ -1669,9 +1711,127 @@ def main():
         print(f"\n  Saved FP consistency diagnostic to fp_consistency.csv")
         print("="*70 + "\n")
         
+        # Compare drift if requested
+        if args.compare_drift:
+            drift_diag = compute_stationarity_implied_drift(fp_diag)
+            
+            print("\n" + "="*70)
+            print("Comparing Current D_E vs Stationarity-Implied D_E_stat")
+            print("="*70)
+            
+            x_drift = drift_diag['x']
+            D_E_orig = drift_diag['D_E_orig']
+            D_E_stat = drift_diag['D_E_stat']
+            ratio = drift_diag['ratio']
+            delta = drift_diag['delta']
+            
+            # Statistics
+            abs_ratio = np.abs(ratio)
+            abs_delta = np.abs(delta)
+            
+            print(f"\nD_E comparison statistics:")
+            print(f"  Mean |D_E / D_E_stat|: {np.mean(abs_ratio):.4f}")
+            print(f"  Median |D_E / D_E_stat|: {np.median(abs_ratio):.4f}")
+            print(f"  Min |D_E / D_E_stat|: {np.min(abs_ratio):.4f} (at x = {x_drift[np.argmin(abs_ratio)]:.2f})")
+            print(f"  Max |D_E / D_E_stat|: {np.max(abs_ratio):.4f} (at x = {x_drift[np.argmax(abs_ratio)]:.2f})")
+            
+            print(f"\n  Mean |(D_E - D_E_stat) / D_E_stat|: {np.mean(abs_delta):.4f}")
+            print(f"  Median |(D_E - D_E_stat) / D_E_stat|: {np.median(abs_delta):.4f}")
+            print(f"  Max |(D_E - D_E_stat) / D_E_stat|: {np.max(abs_delta):.4f} (at x = {x_drift[np.argmax(abs_delta)]:.2f})")
+            
+            # Check for patterns
+            if np.allclose(ratio, -1.0, rtol=0.1):
+                print(f"\n  → Pattern: D_E ≈ -D_E_stat (global sign error)")
+            elif np.allclose(ratio, 1.0, rtol=0.1):
+                print(f"\n  → Pattern: D_E ≈ D_E_stat (drift is correct!)")
+            elif np.std(ratio) < 0.5 * np.mean(abs_ratio):
+                # Ratio is roughly constant
+                const_ratio = np.median(ratio)
+                print(f"\n  → Pattern: D_E ≈ {const_ratio:.2f} × D_E_stat (constant scaling factor)")
+            else:
+                # Check if ratio scales with x
+                log_x = np.log(x_drift)
+                log_ratio = np.log(np.abs(ratio) + 1e-10)
+                corr = np.corrcoef(log_x, log_ratio)[0, 1]
+                if abs(corr) > 0.7:
+                    print(f"\n  → Pattern: D_E / D_E_stat scales with x (correlation = {corr:.2f})")
+                    print(f"    This suggests a Jacobian/variable transform issue")
+                else:
+                    print(f"\n  → Pattern: D_E and D_E_stat differ in shape (not just sign/scale)")
+            
+            # Show worst mismatches
+            worst_idx = np.argsort(abs_delta)[-5:][::-1]
+            print(f"\n  Worst mismatches (top 5):")
+            for idx in worst_idx:
+                print(f"    x = {x_drift[idx]:8.2f}: D_E = {D_E_orig[idx]:.4e}, "
+                      f"D_E_stat = {D_E_stat[idx]:.4e}, ratio = {ratio[idx]:.4f}, "
+                      f"delta = {delta[idx]:.4f}")
+            
+            # Save comparison
+            g0_drift = drift_diag['g0']
+            D_EE_drift = drift_diag['D_EE']
+            arr_drift = np.column_stack([
+                x_drift, D_E_orig, D_E_stat, D_EE_drift, g0_drift,
+                ratio, delta, drift_diag['d_DEE_g0_dx']
+            ])
+            np.savetxt("drift_comparison.csv", arr_drift, delimiter=",",
+                       header="x,D_E_orig,D_E_stat,D_EE,g0,ratio,delta,d_DEE_g0_dx", 
+                       comments="")
+            print(f"\n  Saved comparison to drift_comparison.csv")
+            print("="*70 + "\n")
+        
         # Reconstruct stationary solution if requested
         if args.reconstruct_stationary:
             reconstruct_stationary_solution(fp_diag)
+        
+        # If enforcing stationary drift, modify the LUT
+        if args.enforce_stationary_drift:
+            print("\n" + "="*70)
+            print("Enforcing Stationarity-Implied Drift D_E_stat")
+            print("="*70)
+            
+            drift_diag = compute_stationarity_implied_drift(fp_diag)
+            D_E_stat = drift_diag['D_E_stat']
+            
+            # Recompute j-averaged D_E_stat for all j values
+            # (For now, we'll use the same D_E_stat for all j, which is an approximation)
+            x_grid = LUT['x']
+            j_grid = LUT['j']
+            
+            # Interpolate D_E_stat onto LUT x-grid
+            D_E_stat_interp = np.interp(x_grid, drift_diag['x'], D_E_stat)
+            
+            # Replace e1 in LUT with D_E_stat (for all j)
+            print(f"  Replacing e1 in LUT with D_E_stat")
+            print(f"  Original e1 range: [{np.min(LUT['e1']):.4e}, {np.max(LUT['e1']):.4e}]")
+            print(f"  New D_E_stat range: [{np.min(D_E_stat_interp):.4e}, {np.max(D_E_stat_interp):.4e}]")
+            
+            # Update LUT: replace e1 with D_E_stat for all j
+            for ix in range(len(x_grid)):
+                LUT['e1'][ix, :] = D_E_stat_interp[ix]
+            
+            print(f"  LUT updated. Re-running FP consistency check with enforced drift...")
+            print("="*70 + "\n")
+            
+            # Re-run FP check with modified LUT
+            bg0_updated = Background(xs=xgrid, gs=g0_interp(xgrid))
+            fp_diag_updated = check_fp_consistency(LUT, bg0_updated, test_measure=args.test_measure)
+            
+            # Show updated residuals
+            abs_rel_res_updated = np.abs(fp_diag_updated['relative_residual'])
+            print(f"\nFP residuals with enforced D_E_stat:")
+            print(f"  Mean |relative residual|: {np.mean(abs_rel_res_updated):.4f}")
+            print(f"  Median |relative residual|: {np.median(abs_rel_res_updated):.4f}")
+            print(f"  Max |relative residual|: {np.max(abs_rel_res_updated):.4f}")
+            print(f"  Bins with |rel_res| < 0.01: {np.sum(abs_rel_res_updated < 0.01)} / {len(x_grid)}")
+            
+            if np.mean(abs_rel_res_updated) < 0.1:
+                print(f"\n  ✓ SUCCESS: FP residuals are now small - g0 is approximately stationary!")
+            else:
+                print(f"\n  ✗ Residuals still large - check g0 measure or D_EE implementation")
+            
+            # Update fp_diag for downstream use
+            fp_diag = fp_diag_updated
 
     # build floors
     X_FLOORS = None
