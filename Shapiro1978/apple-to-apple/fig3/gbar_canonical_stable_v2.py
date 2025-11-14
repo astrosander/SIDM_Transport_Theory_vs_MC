@@ -540,21 +540,23 @@ def check_fp_consistency(LUT, bg: Background = None):
     """
     Check if g0 is a stationary solution of the FP operator defined by LUT.
     
-    For a 1D FP in ln x with drift D_E and diffusion D_EE, the stationary
-    condition L[g0] = 0 roughly requires:
-        residual = D_E * g0 + D_EE * d/dx(g0) ≈ 0
+    The MC implements: dx/dt = -e1 + sqrt(e2) * noise
+    So the FP equation in x-space is:
+        ∂g/∂t = ∂/∂x[e1 * g] + (1/2)∂²/∂x²[e2 * g]
+    
+    For stationarity: L[g0] = ∂/∂x[e1 * g0] + (1/2)∂²/∂x²[e2 * g0] = 0
     
     This function computes j-averaged coefficients and checks the residual.
     
     Returns:
         dict with keys: x, D_E (j-averaged drift), D_EE (j-averaged diffusion),
-        g0, dln_g0_dlnx, residual, relative_residual
+        g0, dg0_dx, d2g0_dx2, residual, relative_residual
     """
     x_grid = LUT['x']
     j_grid = LUT['j']
     nx = len(x_grid)
     
-    # j-averaged coefficients (simple mean over j, weighted by phase-space measure)
+    # j-averaged coefficients (weighted by phase-space measure)
     # For isotropic distribution, p(j) = 2j, so we weight by 2j
     j_weights = 2.0 * j_grid  # p(j) = 2j for isotropic
     j_weights = j_weights / j_weights.sum()  # normalize
@@ -571,38 +573,52 @@ def check_fp_consistency(LUT, bg: Background = None):
     g0_vals = g0_interp(x_grid)
     g0_vals = np.maximum(g0_vals, 1e-16)
     
-    # Compute d(ln g0)/d(ln x) using gradient
-    ln_g0 = np.log(g0_vals)
-    ln_x = np.log(x_grid)
-    dln_g0_dlnx = np.gradient(ln_g0, ln_x)
+    # Compute derivatives in x-space (not ln x)
+    dg0_dx = np.gradient(g0_vals, x_grid)
+    d2g0_dx2 = np.gradient(dg0_dx, x_grid)
     
-    # For a 1D FP in ln x: ∂g/∂t = -∂/∂(ln x)[D_E * g] + (1/2)∂²/∂(ln x)²[D_EE * g]
-    # Stationary condition: -∂/∂(ln x)[D_E * g] + (1/2)∂²/∂(ln x)²[D_EE * g] = 0
-    # Expanding: -D_E * g * (dln_g/dln_x) - g * dD_E/dln_x + (1/2)[D_EE * g * (d²ln_g/dln_x² + (dln_g/dln_x)²) + ...]
-    # Simplified residual (ignoring derivatives of D_E, D_EE for now):
-    # residual ≈ -D_E * g0 * (dln_g0/dln_x) + (1/2) * D_EE * g0 * (dln_g0/dln_x)²
+    # Also compute derivatives of coefficients
+    dD_E_dx = np.gradient(D_E, x_grid)
+    dD_EE_dx = np.gradient(D_EE, x_grid)
+    d2D_EE_dx2 = np.gradient(dD_EE_dx, x_grid)
     
-    # More direct: check if the drift-diffusion balance holds
-    # For stationary: D_E * g0 + D_EE * dg0/dx ≈ 0 (in linearized form)
-    # In log space: dg0/dx = g0 * (dln_g0/dln_x) / x
-    dg0_dx = g0_vals * dln_g0_dlnx / x_grid
+    # FP operator: L[g] = ∂/∂x[e1 * g] + (1/2)∂²/∂x²[e2 * g]
+    # Expanding: e1 * dg/dx + g * de1/dx + (1/2)[e2 * d²g/dx² + 2*(de2/dx)*(dg/dx) + g * d²e2/dx²]
+    # For stationarity: L[g0] = 0
+    Lg0 = (D_E * dg0_dx + 
+           g0_vals * dD_E_dx + 
+           0.5 * (D_EE * d2g0_dx2 + 
+                  2.0 * dD_EE_dx * dg0_dx + 
+                  g0_vals * d2D_EE_dx2))
     
-    # Residual: how far from zero is the stationary condition?
-    # Using simplified form: residual = D_E * g0 + D_EE * dg0/dx
-    residual = D_E * g0_vals + D_EE * dg0_dx
+    # Relative residual (normalized by typical scale of each term)
+    drift_term = D_E * dg0_dx
+    drift_coeff_term = g0_vals * dD_E_dx
+    diff_term = 0.5 * D_EE * d2g0_dx2
+    diff_mixed_term = dD_EE_dx * dg0_dx
+    diff_coeff_term = 0.5 * g0_vals * d2D_EE_dx2
     
-    # Relative residual (normalized by typical scale)
-    scale = np.abs(D_E * g0_vals) + np.abs(D_EE * dg0_dx) + 1e-30
-    relative_residual = residual / scale
+    scale = (np.abs(drift_term) + np.abs(drift_coeff_term) + 
+             np.abs(diff_term) + np.abs(diff_mixed_term) + 
+             np.abs(diff_coeff_term) + 1e-30)
+    relative_residual = Lg0 / scale
     
     return dict(
         x=x_grid,
         D_E=D_E,
         D_EE=D_EE,
         g0=g0_vals,
-        dln_g0_dlnx=dln_g0_dlnx,
-        residual=residual,
-        relative_residual=relative_residual
+        dg0_dx=dg0_dx,
+        d2g0_dx2=d2g0_dx2,
+        dD_E_dx=dD_E_dx,
+        dD_EE_dx=dD_EE_dx,
+        residual=Lg0,
+        relative_residual=relative_residual,
+        drift_term=drift_term,
+        drift_coeff_term=drift_coeff_term,
+        diff_term=diff_term,
+        diff_mixed_term=diff_mixed_term,
+        diff_coeff_term=diff_coeff_term
     )
 
 # ----------------- MC machinery -----------------
@@ -1290,13 +1306,30 @@ def main():
                 print(f"    x = {x_fp[ix]:8.2f}: |rel_res| = {abs_rel_res[ix]:.4f}, "
                       f"D_E = {D_E[ix]:.4e}, D_EE = {D_EE[ix]:.4e}, g0 = {g0_fp[ix]:.4e}")
         
-        # Save diagnostic CSV
+        # Show breakdown of terms for a few representative points
+        print(f"\n  Breakdown of FP operator terms (showing largest residuals):")
+        top_ix = np.argsort(abs_rel_res)[-5:][::-1]  # Top 5 worst
+        for ix in top_ix:
+            print(f"    x = {x_fp[ix]:8.2f}:")
+            print(f"      L[g0] = {residual[ix]:.4e} (rel = {abs_rel_res[ix]:.4f})")
+            print(f"        drift: e1*dg/dx = {fp_diag['drift_term'][ix]:.4e}")
+            print(f"        drift_coeff: g*de1/dx = {fp_diag['drift_coeff_term'][ix]:.4e}")
+            print(f"        diff: 0.5*e2*d²g/dx² = {fp_diag['diff_term'][ix]:.4e}")
+            print(f"        diff_mixed: de2/dx*dg/dx = {fp_diag['diff_mixed_term'][ix]:.4e}")
+            print(f"        diff_coeff: 0.5*g*d²e2/dx² = {fp_diag['diff_coeff_term'][ix]:.4e}")
+        
+        # Save diagnostic CSV with all terms
         arr_fp = np.column_stack([
-            x_fp, D_E, D_EE, g0_fp, fp_diag['dln_g0_dlnx'],
-            residual, rel_residual
+            x_fp, D_E, D_EE, g0_fp, fp_diag['dg0_dx'], fp_diag['d2g0_dx2'],
+            fp_diag['dD_E_dx'], fp_diag['dD_EE_dx'],
+            residual, rel_residual,
+            fp_diag['drift_term'], fp_diag['drift_coeff_term'],
+            fp_diag['diff_term'], fp_diag['diff_mixed_term'], fp_diag['diff_coeff_term']
         ])
         np.savetxt("fp_consistency.csv", arr_fp, delimiter=",",
-                   header="x,D_E,D_EE,g0,dln_g0_dlnx,residual,relative_residual", comments="")
+                   header="x,D_E,D_EE,g0,dg0_dx,d2g0_dx2,dD_E_dx,dD_EE_dx,residual,relative_residual,"
+                          "drift_term,drift_coeff_term,diff_term,diff_mixed_term,diff_coeff_term", 
+                   comments="")
         print(f"\n  Saved FP consistency diagnostic to fp_consistency.csv")
         print("="*70 + "\n")
 
@@ -1444,12 +1477,38 @@ def main():
         n_missing = np.sum(missing_bins)
         print(f"\nWarning: {n_missing} / {len(XCEN)} bins have zero deposition (g_mean=0 or g_err=0):")
         for idx in np.where(missing_bins)[0][:10]:  # Show first 10
-            print(f"  x = {XCEN[idx]:.2f}: g_mean = {g_mean[idx]:.4e}, g_err = {g_err[idx]:.4e}")
+            x_cen = XCEN[idx]
+            # Find bin edges
+            if idx == 0:
+                x_left = X_EDGES[0]
+                x_right = X_EDGES[1]
+            elif idx == len(XCEN) - 1:
+                x_left = X_EDGES[-2]
+                x_right = X_EDGES[-1]
+            else:
+                x_left = X_EDGES[idx]
+                x_right = X_EDGES[idx + 1]
+            print(f"  x = {x_cen:.2f} (bin [{x_left:.3f}, {x_right:.3f}]): "
+                  f"g_mean = {g_mean[idx]:.4e}, g_err = {g_err[idx]:.4e}")
         if n_missing > 10:
             print(f"  ... and {n_missing - 10} more")
         print(f"  These bins may indicate binning issues or regions with no star visits.")
+        print(f"  Check bidx() logic and deposition path integration for these bins.")
     else:
         print(f"\nAll {len(XCEN)} bins have non-zero deposition (good).")
+    
+    # Additional diagnostic: check bin edge coverage
+    print(f"\nBin coverage diagnostic:")
+    print(f"  Number of bins: {len(XCEN)}")
+    print(f"  Bin centers range: [{XCEN[0]:.3f}, {XCEN[-1]:.1f}]")
+    print(f"  Bin edges range: [{X_EDGES[0]:.3f}, {X_EDGES[-1]:.1f}]")
+    # Check for any suspicious gaps
+    edge_gaps = np.diff(X_EDGES)
+    large_gaps = edge_gaps > 2.0 * np.median(edge_gaps)
+    if np.any(large_gaps):
+        print(f"  Warning: Found {np.sum(large_gaps)} bins with unusually large width:")
+        for idx in np.where(large_gaps)[0]:
+            print(f"    Bin {idx}: width = {edge_gaps[idx]:.3f} (center = {XCEN[idx]:.2f})")
 
     # write CSV
     arr = np.column_stack([XCEN, g_mean, g_err])
