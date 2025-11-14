@@ -282,15 +282,26 @@ class Background:
                     "If using multiprocessing, try setting start method to 'spawn'."
                 ) from e
         
+        # Ensure arrays
+        xs = np.asarray(xs, dtype=float)
+        gs = np.asarray(gs, dtype=float)
+
         # Build an internal fine log grid and precompute moments
         self.xg = np.logspace(-3, 4, 400)
         lx   = np.log(self.xg)
         lx_s = np.log(xs)
-        glog = np.log(np.clip(np.interp(lx, lx_s, np.log(np.clip(gs,1e-16,None))), 1e-16, None))
-        # mild smoothing
-        k = 7
-        ker = np.exp(-0.5*((np.arange(-k,k+1)/2.0)**2)); ker /= ker.sum()
+
+        # INTERPOLATE ln g, don't take ln twice
+        log_gs = np.log(np.clip(gs, 1e-16, None))
+        glog   = np.interp(lx, lx_s, log_gs)
+
+        # mild smoothing in log-g
+        k   = 7
+        ker = np.exp(-0.5 * ((np.arange(-k, k+1) / 2.0)**2))
+        ker /= ker.sum()
         glog = np.convolve(glog, ker, mode='same')
+
+        # back to g(x)
         self.gg = np.exp(glog)
 
         self.Mm32 = cumulative_trapezoid(self.gg * self.xg**(-1.5), self.xg, initial=0.0)
@@ -628,13 +639,17 @@ def check_fp_consistency(LUT, bg: Background = None, test_measure="none", g0_ove
     Lg0_alt = (drift_term_alt + drift_coeff_term_alt + 
                diff_term_alt + diff_mixed_term_alt + diff_coeff_term_alt)
     
-    # Use the standard form by default, but return both for comparison
-    Lg0 = Lg0_std
-    drift_term = drift_term_std
-    drift_coeff_term = drift_coeff_term_std
-    diff_term = diff_term_std
-    diff_mixed_term = diff_mixed_term_std
-    diff_coeff_term = diff_coeff_term_std
+    # Use the ALTERNATIVE form by default, since MC uses dx/dt = -e1
+    # This matches the SDE: dx = -e1 dt + sqrt(e2) dW
+    Lg0 = Lg0_alt
+    drift_term = drift_term_alt
+    drift_coeff_term = drift_coeff_term_alt
+    diff_term = diff_term_alt
+    diff_mixed_term = diff_mixed_term_alt
+    diff_coeff_term = diff_coeff_term_alt
+    
+    # Keep standard form for comparison
+    residual_std = Lg0_std
     
     scale = (np.abs(drift_term) + np.abs(drift_coeff_term) + 
              np.abs(diff_term) + np.abs(diff_mixed_term) + 
@@ -650,20 +665,20 @@ def check_fp_consistency(LUT, bg: Background = None, test_measure="none", g0_ove
         d2g0_dx2=d2g0_dx2,
         dD_E_dx=dD_E_dx,
         dD_EE_dx=dD_EE_dx,
-        residual=Lg0,
-        residual_alt=Lg0_alt,  # Alternative sign convention
+        residual=Lg0,  # Alternative form (matches MC)
+        residual_std=Lg0_std,  # Standard form (for comparison)
         relative_residual=relative_residual,
         drift_term=drift_term,
         drift_coeff_term=drift_coeff_term,
         diff_term=diff_term,
         diff_mixed_term=diff_mixed_term,
         diff_coeff_term=diff_coeff_term,
-        # Also return alternative terms for comparison
-        drift_term_alt=drift_term_alt,
-        drift_coeff_term_alt=drift_coeff_term_alt,
-        diff_term_alt=diff_term_alt,
-        diff_mixed_term_alt=diff_mixed_term_alt,
-        diff_coeff_term_alt=diff_coeff_term_alt
+        # Also return standard form terms for comparison
+        drift_term_std=drift_term_std,
+        drift_coeff_term_std=drift_coeff_term_std,
+        diff_term_std=diff_term_std,
+        diff_mixed_term_std=diff_mixed_term_std,
+        diff_coeff_term_std=diff_coeff_term_std
     )
 
 # ----------------- Toy OU test for FP checker validation -----------------
@@ -726,27 +741,25 @@ def test_toy_ou():
     rel_residual_alt = residual_alt / scale_alt
     abs_rel_res_alt = np.abs(rel_residual_alt)
     
-    print(f"\nStandard FP form (should work for OU):")
-    print(f"  Mean |relative residual|: {np.mean(abs_rel_res):.6f}")
-    print(f"  Median |relative residual|: {np.median(abs_rel_res):.6f}")
-    print(f"  Max |relative residual|: {np.max(abs_rel_res):.6f}")
-    print(f"  Bins with |rel_res| > 0.01: {np.sum(abs_rel_res > 0.01)} / {len(x_grid)}")
-    
-    print(f"\nAlternative FP form (matching MC dx/dt=-e1):")
+    print(f"\nAlternative FP form (matching dx = -e1 dt + sqrt(e2) dW):")
     print(f"  Mean |relative residual|: {np.mean(abs_rel_res_alt):.6f}")
     print(f"  Median |relative residual|: {np.median(abs_rel_res_alt):.6f}")
     print(f"  Max |relative residual|: {np.max(abs_rel_res_alt):.6f}")
     print(f"  Bins with |rel_res| > 0.01: {np.sum(abs_rel_res_alt > 0.01)} / {len(x_grid)}")
+    
+    print(f"\nStandard FP form (opposite drift sign, not expected to be stationary here):")
+    print(f"  Mean |relative residual|: {np.mean(abs_rel_res):.6f}")
+    print(f"  Median |relative residual|: {np.median(abs_rel_res):.6f}")
+    print(f"  Max |relative residual|: {np.max(abs_rel_res):.6f}")
+    print(f"  Bins with |rel_res| > 0.01: {np.sum(abs_rel_res > 0.01)} / {len(x_grid)}")
     
     # For OU: dx = -x dt + sqrt(2) dW, so e1 = x, e2 = 2
     # The FP is: ∂g/∂t = ∂/∂x[x*g] + ½∂²/∂x²[2*g] = ∂/∂x[x*g] + ∂²/∂x²[g]
     # This is the alternative form, so it should work better
     if np.mean(abs_rel_res_alt) < 0.01:
         print(f"\n✓ PASS: Alternative form gives small residuals (FP checker is working correctly)")
-    elif np.mean(abs_rel_res) < 0.01:
-        print(f"\n✓ PASS: Standard form gives small residuals (FP checker is working correctly)")
     else:
-        print(f"\n✗ FAIL: Both forms give large residuals - check FP checker implementation!")
+        print(f"\n✗ FAIL: Alternative form gives large residuals - check FP checker implementation!")
     
     print("="*70 + "\n")
     
@@ -954,6 +967,15 @@ if HAVE_NUMBA:
             e2 = max(e2, 0.0)
             j2 = max(j2, 0.0)
             z2 = max(min(z2, e2*j2+1e-22), 0.0)
+            
+            # --- match coeff_from_LUT asymptotes ---
+            if j > 0.95 and e2 > 0.0:
+                j2 = max(e2 / (2.0 * x), 0.0)
+                z2 = min(e2 * j2, e2 * j2 + 1e-22)
+            if j < 0.05 and j1 > 0.0:
+                j2 = math.sqrt(max(2.0 * j * j1, 0.0))
+            z2 = max(min(z2, e2 * j2 + 1e-22), 0.0)
+            # ----------------------------------------
             
             # Correlated Gaussian kick
             muE, muJ = e1*DT, j1*DT
@@ -1537,36 +1559,33 @@ def main():
         D_EE = fp_diag['D_EE']
         g0_fp = fp_diag['g0']
         
-        # Compare both sign conventions
-        residual_alt = fp_diag['residual_alt']
-        scale_alt = (np.abs(fp_diag['drift_term_alt']) + np.abs(fp_diag['drift_coeff_term_alt']) + 
-                     np.abs(fp_diag['diff_term_alt']) + np.abs(fp_diag['diff_mixed_term_alt']) + 
-                     np.abs(fp_diag['diff_coeff_term_alt']) + 1e-30)
-        rel_residual_alt = residual_alt / scale_alt
-        abs_rel_res_alt = np.abs(rel_residual_alt)
+        # Compare both sign conventions (primary is alternative, matching MC)
+        residual_std = fp_diag['residual_std']
+        scale_std = (np.abs(fp_diag['drift_term_std']) + np.abs(fp_diag['drift_coeff_term_std']) + 
+                     np.abs(fp_diag['diff_term_std']) + np.abs(fp_diag['diff_mixed_term_std']) + 
+                     np.abs(fp_diag['diff_coeff_term_std']) + 1e-30)
+        rel_residual_std = residual_std / scale_std
+        abs_rel_res_std = np.abs(rel_residual_std)
         
         # Find regions where residual is significant
         abs_rel_res = np.abs(rel_residual)
         significant = abs_rel_res > 0.1  # >10% relative error
-        significant_alt = abs_rel_res_alt > 0.1
+        significant_std = abs_rel_res_std > 0.1
         
-        print(f"\nResidual statistics (STANDARD FP form: -∂/∂x[D_E*g] + ½∂²/∂x²[D_EE*g]):")
+        print(f"\nResidual statistics (ALTERNATIVE form: +∂/∂x[e1*g] + ½∂²/∂x²[e2*g], matching MC dx/dt=-e1):")
         print(f"  Mean |relative residual|: {np.mean(abs_rel_res):.4f}")
         print(f"  Median |relative residual|: {np.median(abs_rel_res):.4f}")
         print(f"  Max |relative residual|: {np.max(abs_rel_res):.4f} (at x = {x_fp[np.argmax(abs_rel_res)]:.2f})")
         print(f"  Bins with |relative residual| > 0.1: {np.sum(significant)} / {len(x_fp)}")
         
-        print(f"\nResidual statistics (ALTERNATIVE form: +∂/∂x[e1*g] + ½∂²/∂x²[e2*g], matching MC dx/dt=-e1):")
-        print(f"  Mean |relative residual|: {np.mean(abs_rel_res_alt):.4f}")
-        print(f"  Median |relative residual|: {np.median(abs_rel_res_alt):.4f}")
-        print(f"  Max |relative residual|: {np.max(abs_rel_res_alt):.4f} (at x = {x_fp[np.argmax(abs_rel_res_alt)]:.2f})")
-        print(f"  Bins with |relative residual| > 0.1: {np.sum(significant_alt)} / {len(x_fp)}")
+        print(f"\nResidual statistics (STANDARD FP form: -∂/∂x[D_E*g] + ½∂²/∂x²[D_EE*g], for comparison):")
+        print(f"  Mean |relative residual|: {np.mean(abs_rel_res_std):.4f}")
+        print(f"  Median |relative residual|: {np.median(abs_rel_res_std):.4f}")
+        print(f"  Max |relative residual|: {np.max(abs_rel_res_std):.4f} (at x = {x_fp[np.argmax(abs_rel_res_std)]:.2f})")
+        print(f"  Bins with |relative residual| > 0.1: {np.sum(significant_std)} / {len(x_fp)}")
         
-        # Determine which form is better
-        if np.mean(abs_rel_res_alt) < np.mean(abs_rel_res):
-            print(f"\n  → ALTERNATIVE form has smaller residuals (better match)")
-        else:
-            print(f"\n  → STANDARD form has smaller residuals (better match)")
+        # Note which form matches the MC
+        print(f"\n  → Using ALTERNATIVE form as primary (matches MC SDE: dx = -e1 dt + sqrt(e2) dW)")
         
         if np.sum(significant) > 0:
             print(f"\n  Regions with significant residual:")
@@ -1587,27 +1606,21 @@ def main():
             print(f"        diff_coeff: 0.5*g*d²e2/dx² = {fp_diag['diff_coeff_term'][ix]:.4e}")
         
         # Save diagnostic CSV with all terms (both sign conventions)
-        residual_alt = fp_diag['residual_alt']
-        scale_alt = (np.abs(fp_diag['drift_term_alt']) + np.abs(fp_diag['drift_coeff_term_alt']) + 
-                     np.abs(fp_diag['diff_term_alt']) + np.abs(fp_diag['diff_mixed_term_alt']) + 
-                     np.abs(fp_diag['diff_coeff_term_alt']) + 1e-30)
-        rel_residual_alt = residual_alt / scale_alt
-        
         arr_fp = np.column_stack([
             x_fp, D_E, D_EE, g0_fp, fp_diag['dg0_dx'], fp_diag['d2g0_dx2'],
             fp_diag['dD_E_dx'], fp_diag['dD_EE_dx'],
-            residual, rel_residual,  # Standard form
-            residual_alt, rel_residual_alt,  # Alternative form
+            residual, rel_residual,  # Alternative form (primary, matches MC)
+            residual_std, rel_residual_std,  # Standard form (for comparison)
             fp_diag['drift_term'], fp_diag['drift_coeff_term'],
             fp_diag['diff_term'], fp_diag['diff_mixed_term'], fp_diag['diff_coeff_term'],
-            fp_diag['drift_term_alt'], fp_diag['drift_coeff_term_alt'],
-            fp_diag['diff_term_alt'], fp_diag['diff_mixed_term_alt'], fp_diag['diff_coeff_term_alt']
+            fp_diag['drift_term_std'], fp_diag['drift_coeff_term_std'],
+            fp_diag['diff_term_std'], fp_diag['diff_mixed_term_std'], fp_diag['diff_coeff_term_std']
         ])
         np.savetxt("fp_consistency.csv", arr_fp, delimiter=",",
                    header="x,D_E,D_EE,g0,dg0_dx,d2g0_dx2,dD_E_dx,dD_EE_dx,"
-                          "residual_std,relative_residual_std,residual_alt,relative_residual_alt,"
-                          "drift_term_std,drift_coeff_term_std,diff_term_std,diff_mixed_term_std,diff_coeff_term_std,"
-                          "drift_term_alt,drift_coeff_term_alt,diff_term_alt,diff_mixed_term_alt,diff_coeff_term_alt", 
+                          "residual_alt,relative_residual_alt,residual_std,relative_residual_std,"
+                          "drift_term_alt,drift_coeff_term_alt,diff_term_alt,diff_mixed_term_alt,diff_coeff_term_alt,"
+                          "drift_term_std,drift_coeff_term_std,diff_term_std,diff_mixed_term_std,diff_coeff_term_std", 
                    comments="")
         print(f"\n  Saved FP consistency diagnostic to fp_consistency.csv")
         print("="*70 + "\n")
