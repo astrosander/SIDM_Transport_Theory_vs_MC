@@ -440,7 +440,7 @@ def maybe_split(obj, X_FLOORS, n_clones):
             ))
     return new_clones
 
-def mc_step(s: Star, L, DT, disable_capture=False, flip_energy_sign=False, inner_sink_frac=0.0):
+def mc_step(s: Star, L, DT, disable_capture=False, flip_energy_sign=False, inner_sink_frac=0.0, no_reservoir=False):
     e1,e2,j1,j2,z2 = coeff_from_LUT(s.x, s.j, L)
 
     # correlated Gaussian kick
@@ -472,13 +472,17 @@ def mc_step(s: Star, L, DT, disable_capture=False, flip_energy_sign=False, inner
     if inner_sink_frac > 0.0:
         sink_threshold = (1.0 - inner_sink_frac) * X_D
         if s.x >= sink_threshold:
-            s.x = X_BOUND
-            s.j = float(np.sqrt(rng.random()))
-            s.phase = 0.0
+            if no_reservoir:
+                # If no reservoir, just clip at X_D instead of re-injecting
+                s.x = float(min(s.x, X_D * 0.999))
+            else:
+                s.x = X_BOUND
+                s.j = float(np.sqrt(rng.random()))
+                s.phase = 0.0
             return
 
-    # reservoir boundary
-    if s.x < X_BOUND:
+    # reservoir boundary (only if reservoir is enabled)
+    if not no_reservoir and s.x < X_BOUND:
         s.x = X_BOUND
         s.j = float(np.sqrt(rng.random()))
 
@@ -490,15 +494,20 @@ def mc_step(s: Star, L, DT, disable_capture=False, flip_energy_sign=False, inner
         if int(s.phase) > prev and (s.j <= j_min_exact(s.x)):
             captured = True
         if captured:
-            s.x = X_BOUND
-            s.j = float(np.sqrt(rng.random()))
-            s.phase = 0.0
+            if no_reservoir:
+                # If no reservoir, just clip j to minimum and continue (for testing)
+                s.j = float(max(j_min_exact(s.x) * 1.01, 1e-6))
+                s.phase = 0.0
+            else:
+                s.x = X_BOUND
+                s.j = float(np.sqrt(rng.random()))
+                s.phase = 0.0
     return
 
 def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05,
              disable_capture=False, X_FLOORS=None, n_clones=0,
              per_dlnx=True, burn_frac=0.0, init_g0=False,
-             flip_energy_sign=False, inner_sink_frac=0.0):
+             flip_energy_sign=False, inner_sink_frac=0.0, no_reservoir=False):
 
     if init_g0:
         stars = sample_initial_from_g0(pop)
@@ -535,9 +544,10 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05,
                 p['x_prev'] = p['x']
                 s = Star(x=p['x'], j=p['j'], phase=p['phase'])
                 mc_step(s, LUT, DT, disable_capture=disable_capture,
-                        flip_energy_sign=flip_energy_sign, inner_sink_frac=inner_sink_frac)
+                        flip_energy_sign=flip_energy_sign, inner_sink_frac=inner_sink_frac,
+                        no_reservoir=no_reservoir)
                 p['x'], p['j'], p['phase'] = s.x, s.j, s.phase
-                if p['x'] < X_BOUND:
+                if not no_reservoir and p['x'] < X_BOUND:
                     p['x'] = X_BOUND
                     p['j'] = float(np.sqrt(rng.random()))
                 new_clones = maybe_split(p, X_FLOORS, n_clones)
@@ -551,9 +561,10 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05,
                 c['x_prev'] = c['x']
                 s = Star(x=c['x'], j=c['j'], phase=c['phase'])
                 mc_step(s, LUT, DT, disable_capture=disable_capture,
-                        flip_energy_sign=flip_energy_sign, inner_sink_frac=inner_sink_frac)
+                        flip_energy_sign=flip_energy_sign, inner_sink_frac=inner_sink_frac,
+                        no_reservoir=no_reservoir)
                 c['x'], c['j'], c['phase'] = s.x, s.j, s.phase
-                if c['x'] < X_BOUND:
+                if not no_reservoir and c['x'] < X_BOUND:
                     c['x'] = X_BOUND
                     c['j'] = float(np.sqrt(rng.random()))
                 if c['floor_idx'] >= 0 and c['x'] < X_FLOORS[c['floor_idx']]:
@@ -567,7 +578,8 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05,
             x_prev_saved = x_prev.copy()
             for i,s in enumerate(stars):
                 mc_step(s, LUT, DT, disable_capture=disable_capture,
-                        flip_energy_sign=flip_energy_sign, inner_sink_frac=inner_sink_frac)
+                        flip_energy_sign=flip_energy_sign, inner_sink_frac=inner_sink_frac,
+                        no_reservoir=no_reservoir)
                 x_prev[i] = s.x
 
         # deposit along path in log-x
@@ -754,7 +766,9 @@ def main():
     ap.add_argument("--inner-sink-frac", type=float, default=0.0,
                     help="fraction of X_D to use as inner sink threshold (0=off, 0.1 means sink at 0.9*X_D)")
     ap.add_argument("--save-ratio", action="store_true",
-                    help="save R(x) = g_MC(x) / g0(x) diagnostic to gbar_ratio1.csv")
+                    help="save R(x) = g_MC(x) / g0(x) diagnostic to gbar_ratio.csv")
+    ap.add_argument("--no-reservoir", action="store_true",
+                    help="do not enforce outer reservoir at x = X_BOUND (for g0 stationarity tests)")
     ap.add_argument("--seed", type=int, default=7,
                     help="random seed for reproducibility")
     args = ap.parse_args()
@@ -810,6 +824,8 @@ def main():
     if args.inner_sink_frac > 0.0:
         sink_thresh = (1.0 - args.inner_sink_frac) * X_D
         print(f"  Inner sink active: stars at x >= {sink_thresh:.1f} re-inject to reservoir")
+    if args.no_reservoir:
+        print("  WARNING: Outer reservoir is DISABLED (for g0 stationarity tests)")
     g_mean, g_err = run_once(args.steps, DT, args.pop, LUT,
                              blocks=args.blocks,
                              disable_capture=args.disable_capture,
@@ -818,7 +834,8 @@ def main():
                              burn_frac=args.burn_frac,
                              init_g0=args.init_g0,
                              flip_energy_sign=args.flip_energy_sign,
-                             inner_sink_frac=args.inner_sink_frac)
+                             inner_sink_frac=args.inner_sink_frac,
+                             no_reservoir=args.no_reservoir)
 
     # ----- Optional background update -----
         # Optional: background update (paper's 2-pass style)
@@ -877,7 +894,8 @@ def main():
             burn_frac=args.burn_frac,
             init_g0=args.init_g0,
             flip_energy_sign=args.flip_energy_sign,
-            inner_sink_frac=args.inner_sink_frac
+            inner_sink_frac=args.inner_sink_frac,
+            no_reservoir=args.no_reservoir
         )
 
 
@@ -887,17 +905,30 @@ def main():
         s = g_mean[idx_225] if g_mean[idx_225] > 0 else 1.0
         g_mean /= s; g_err /= s
 
+    # Diagnostic: compute R(x) = g_MC(x) / g0(x) (always compute, optionally save)
+    g0_vals = g0_interp(XCEN)
+    g0_vals = np.maximum(g0_vals, 1e-16)
+    R = g_mean / g0_vals
+    R_finite = R[np.isfinite(R) & (R > 0)]
+    
+    if len(R_finite) > 0:
+        print(f"\nDiagnostic: g_MC / g0 ratio statistics:")
+        print(f"  Mean ratio: {np.mean(R_finite):.4f}")
+        print(f"  Median ratio: {np.median(R_finite):.4f}")
+        print(f"  Min ratio: {np.min(R_finite):.4f} (at x = {XCEN[np.argmin(R_finite)]:.2f})")
+        print(f"  Max ratio: {np.max(R_finite):.4f} (at x = {XCEN[np.argmax(R_finite)]:.2f})")
+        print(f"  Ratio range: {np.max(R_finite)/np.min(R_finite):.2f}x")
+        if args.no_reservoir and args.disable_capture and args.init_g0:
+            print(f"  (For g0 stationarity test: ratio should be ~constant if operator is self-consistent)")
+
     # write CSV
     arr = np.column_stack([XCEN, g_mean, g_err])
-    np.savetxt("gbar_table1.csv", arr, delimiter=",",
+    np.savetxt("gbar_table.csv", arr, delimiter=",",
                header="x,gbar,gbar_err", comments="")
-    print("Wrote gbar_table1.csv")
+    print("Wrote gbar_table.csv")
 
-    # Diagnostic: compute and save R(x) = g_MC(x) / g0(x)
+    # Save ratio diagnostic if requested
     if args.save_ratio:
-        g0_vals = g0_interp(XCEN)
-        g0_vals = np.maximum(g0_vals, 1e-16)
-        R = g_mean / g0_vals
         # Renormalize R so R at x=0.225 is 1 (for comparison with paper)
         idx_225 = int(np.argmin(np.abs(XCEN - 0.225)))
         if R[idx_225] > 0:
@@ -905,9 +936,9 @@ def main():
         else:
             R_norm = R.copy()
         arr_ratio = np.column_stack([XCEN, R, R_norm, g0_vals])
-        np.savetxt("gbar_ratio1.csv", arr_ratio, delimiter=",",
+        np.savetxt("gbar_ratio.csv", arr_ratio, delimiter=",",
                    header="x,R_raw,R_norm,g0", comments="")
-        print("Wrote gbar_ratio1.csv (R = g_MC / g0, normalized at x=0.225)")
+        print("Wrote gbar_ratio.csv (R = g_MC / g0, normalized at x=0.225)")
 
     # plot
     if args.out:
