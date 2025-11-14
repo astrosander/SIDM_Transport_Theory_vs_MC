@@ -770,35 +770,48 @@ def reconstruct_stationary_solution(fp_diag):
     """
     Reconstruct the stationary solution implied by D_E, D_EE.
     
-    For zero-flux stationary solution:
-        g'/g = (2*D_E - D_EE') / D_EE
+    For the ALTERNATIVE FP form (matching MC: dx = -D_E dt + sqrt(D_EE) dW):
+        ∂g/∂t = ∂/∂x[D_E*g] + ½∂²/∂x²[D_EE*g]
     
-    Integrate to get: ln g(x) = ∫ (2*D_E - D_EE')/D_EE dx + const
+    Zero-flux condition: J = -D_E*g - ½d/dx(D_EE*g) = 0
+        => (D_EE*g)' = -2*D_E*g
+        => d/dx ln(D_EE*g) = -2*D_E/D_EE
+        => ln(D_EE*g) = -∫ 2*D_E/D_EE dx
+        => g = (1/D_EE) * exp(-∫ 2*D_E/D_EE dx)
     """
     print("\n" + "="*70)
     print("Reconstructing Stationary Solution from D_E, D_EE")
+    print("(Using ALTERNATIVE FP form: dx = -D_E dt + sqrt(D_EE) dW)")
     print("="*70)
     
     x = fp_diag['x']
     D_E = fp_diag['D_E']
     D_EE = fp_diag['D_EE']
-    dD_EE_dx = fp_diag['dD_EE_dx']
     g0 = fp_diag['g0']
     
-    # Compute (2*D_E - D_EE') / D_EE
-    numerator = 2.0 * D_E - dD_EE_dx
-    denominator = np.maximum(D_EE, 1e-30)  # Avoid division by zero
-    integrand = numerator / denominator
+    # Ensure D_EE is positive
+    D_EE = np.maximum(D_EE, 1e-30)
     
-    # Integrate: ln g_stat = ∫ integrand dx
-    # Use cumulative trapezoid integration
+    # Compute integrand: -2*D_E/D_EE (for d/dx ln(D_EE*g))
+    integrand = -2.0 * D_E / D_EE
+    
+    # Integrate: ln(D_EE*g_stat) = ∫ integrand dx
     from scipy.integrate import cumulative_trapezoid
-    ln_g_stat = cumulative_trapezoid(integrand, x, initial=0.0)
+    ln_DEE_g_stat = cumulative_trapezoid(integrand, x, initial=0.0)
+    
+    # Convert to ln(g_stat): ln(g) = ln(D_EE*g) - ln(D_EE)
+    ln_g_stat = ln_DEE_g_stat - np.log(D_EE)
     
     # Normalize to match g0 at a reference point (e.g., x ≈ 0.225)
     ref_idx = np.argmin(np.abs(x - 0.225))
     if ref_idx < len(x):
         ln_g_stat = ln_g_stat - ln_g_stat[ref_idx] + np.log(np.maximum(g0[ref_idx], 1e-16))
+    
+    # Check for overflow before exp
+    max_ln_g = np.max(ln_g_stat)
+    if max_ln_g > 700:  # exp(700) would overflow
+        print(f"  Warning: ln(g_stat) has large values (max = {max_ln_g:.2f})")
+        print(f"  This suggests the integrand may still have wrong sign or D_E/D_EE are inconsistent")
     
     g_stat = np.exp(ln_g_stat)
     g_stat = np.maximum(g_stat, 1e-16)
@@ -809,34 +822,65 @@ def reconstruct_stationary_solution(fp_diag):
     
     # Compute ratio
     ratio = g_stat_norm / np.maximum(g0_norm, 1e-16)
-    ratio_finite = ratio[np.isfinite(ratio) & (ratio > 0)]
+    ratio_finite = ratio[np.isfinite(ratio) & (ratio > 0) & (ratio < 1e10)]  # Exclude overflow
     
     print(f"\nComparison of reconstructed g_stat vs BWII g0:")
     print(f"  Reference point: x = {x[ref_idx]:.3f}")
-    print(f"  Mean ratio (g_stat/g0): {np.mean(ratio_finite):.4f}")
-    print(f"  Median ratio: {np.median(ratio_finite):.4f}")
-    print(f"  Min ratio: {np.min(ratio_finite):.4f} (at x = {x[np.argmin(ratio_finite)]:.2f})")
-    print(f"  Max ratio: {np.max(ratio_finite):.4f} (at x = {x[np.argmax(ratio_finite)]:.2f})")
-    print(f"  Ratio range: {np.max(ratio_finite)/np.min(ratio_finite):.2f}x")
-    
-    if np.mean(np.abs(ratio_finite - 1.0)) < 0.1:
-        print(f"\n  ✓ Shapes are similar (ratio ≈ 1) - g0 is consistent with D_E, D_EE")
+    if len(ratio_finite) > 0:
+        print(f"  Mean ratio (g_stat/g0): {np.mean(ratio_finite):.4f}")
+        print(f"  Median ratio: {np.median(ratio_finite):.4f}")
+        print(f"  Min ratio: {np.min(ratio_finite):.4f} (at x = {x[np.argmin(ratio_finite)]:.2f})")
+        print(f"  Max ratio: {np.max(ratio_finite):.4f} (at x = {x[np.argmax(ratio_finite)]:.2f})")
+        if np.max(ratio_finite) > 0:
+            print(f"  Ratio range: {np.max(ratio_finite)/np.min(ratio_finite):.2f}x")
+        
+        if np.mean(np.abs(ratio_finite - 1.0)) < 0.1:
+            print(f"\n  ✓ Shapes are similar (ratio ≈ 1) - g0 is consistent with D_E, D_EE")
+        else:
+            print(f"\n  ✗ Shapes differ significantly - g0 is NOT the stationary solution of this operator")
+            print(f"    This explains why FP residuals are O(1) and MC drifts away from g0")
     else:
-        print(f"\n  ✗ Shapes differ significantly - g0 is NOT the stationary solution of this operator")
-        print(f"    This explains why FP residuals are O(1) and MC drifts away from g0")
+        print(f"  Warning: All ratios are invalid (overflow or inf)")
+        print(f"  This suggests the integrand sign or D_E/D_EE values are inconsistent")
+    
+    # Compute flux diagnostic: J = -D_E*g - 0.5*d/dx(D_EE*g)
+    # For a zero-flux stationary solution, J should be ≈ 0
+    dg0_dx = fp_diag['dg0_dx']
+    dD_EE_dx = fp_diag['dD_EE_dx']
+    DEE_g0 = D_EE * g0
+    d_DEE_g0_dx = np.gradient(DEE_g0, x)
+    J = -D_E * g0 - 0.5 * d_DEE_g0_dx
+    
+    # Normalize flux by typical scale
+    scale_J = np.maximum(np.abs(D_E * g0), 1e-30)
+    rel_J = J / scale_J
+    abs_rel_J = np.abs(rel_J)
+    
+    print(f"\nFlux diagnostic (J = -D_E*g - ½d/dx(D_EE*g), should be ≈ 0 for zero-flux stationary):")
+    print(f"  Mean |J| / |D_E*g|: {np.mean(abs_rel_J):.4f}")
+    print(f"  Median |J| / |D_E*g|: {np.median(abs_rel_J):.4f}")
+    print(f"  Max |J| / |D_E*g|: {np.max(abs_rel_J):.4f} (at x = {x[np.argmax(abs_rel_J)]:.2f})")
+    print(f"  Bins with |J|/|D_E*g| < 0.1: {np.sum(abs_rel_J < 0.1)} / {len(x)}")
+    
+    if np.mean(abs_rel_J) < 0.1:
+        print(f"  ✓ Flux is small - g0 is approximately a zero-flux solution")
+    else:
+        print(f"  ✗ Flux is large - g0 is NOT a zero-flux solution of this operator")
+        print(f"    This confirms the FP residual analysis")
     
     # Save comparison
     arr_comp = np.column_stack([
-        x, D_E, D_EE, dD_EE_dx, integrand,
-        g0, g_stat, g0_norm, g_stat_norm, ratio
+        x, D_E, D_EE, integrand, ln_DEE_g_stat, ln_g_stat,
+        g0, g_stat, g0_norm, g_stat_norm, ratio,
+        J, rel_J
     ])
     np.savetxt("stationary_reconstruction.csv", arr_comp, delimiter=",",
-               header="x,D_E,D_EE,dD_EE_dx,integrand,g0,g_stat,g0_norm,g_stat_norm,ratio", 
+               header="x,D_E,D_EE,integrand,ln_DEE_g_stat,ln_g_stat,g0,g_stat,g0_norm,g_stat_norm,ratio,J,rel_J", 
                comments="")
     print(f"\n  Saved comparison to stationary_reconstruction.csv")
     print("="*70 + "\n")
     
-    return dict(x=x, g_stat=g_stat, g0=g0, ratio=ratio, integrand=integrand)
+    return dict(x=x, g_stat=g_stat, g0=g0, ratio=ratio, integrand=integrand, J=J, rel_J=rel_J)
 
 # ----------------- MC machinery -----------------
 @dataclass
