@@ -535,6 +535,76 @@ def coeff_from_LUT(x, j, L):
     z2 = max(min(z2, e2*j2+1e-22),0.0)
     return e1,e2,j1,j2,z2
 
+# ----------------- FP consistency diagnostic -----------------
+def check_fp_consistency(LUT, bg: Background = None):
+    """
+    Check if g0 is a stationary solution of the FP operator defined by LUT.
+    
+    For a 1D FP in ln x with drift D_E and diffusion D_EE, the stationary
+    condition L[g0] = 0 roughly requires:
+        residual = D_E * g0 + D_EE * d/dx(g0) ≈ 0
+    
+    This function computes j-averaged coefficients and checks the residual.
+    
+    Returns:
+        dict with keys: x, D_E (j-averaged drift), D_EE (j-averaged diffusion),
+        g0, dln_g0_dlnx, residual, relative_residual
+    """
+    x_grid = LUT['x']
+    j_grid = LUT['j']
+    nx = len(x_grid)
+    
+    # j-averaged coefficients (simple mean over j, weighted by phase-space measure)
+    # For isotropic distribution, p(j) = 2j, so we weight by 2j
+    j_weights = 2.0 * j_grid  # p(j) = 2j for isotropic
+    j_weights = j_weights / j_weights.sum()  # normalize
+    
+    D_E = np.zeros(nx)
+    D_EE = np.zeros(nx)
+    
+    for ix in range(nx):
+        # Weighted average over j
+        D_E[ix] = np.sum(LUT['e1'][ix, :] * j_weights)
+        D_EE[ix] = np.sum(LUT['e2'][ix, :] * j_weights)
+    
+    # Evaluate g0 on the LUT x-grid
+    g0_vals = g0_interp(x_grid)
+    g0_vals = np.maximum(g0_vals, 1e-16)
+    
+    # Compute d(ln g0)/d(ln x) using gradient
+    ln_g0 = np.log(g0_vals)
+    ln_x = np.log(x_grid)
+    dln_g0_dlnx = np.gradient(ln_g0, ln_x)
+    
+    # For a 1D FP in ln x: ∂g/∂t = -∂/∂(ln x)[D_E * g] + (1/2)∂²/∂(ln x)²[D_EE * g]
+    # Stationary condition: -∂/∂(ln x)[D_E * g] + (1/2)∂²/∂(ln x)²[D_EE * g] = 0
+    # Expanding: -D_E * g * (dln_g/dln_x) - g * dD_E/dln_x + (1/2)[D_EE * g * (d²ln_g/dln_x² + (dln_g/dln_x)²) + ...]
+    # Simplified residual (ignoring derivatives of D_E, D_EE for now):
+    # residual ≈ -D_E * g0 * (dln_g0/dln_x) + (1/2) * D_EE * g0 * (dln_g0/dln_x)²
+    
+    # More direct: check if the drift-diffusion balance holds
+    # For stationary: D_E * g0 + D_EE * dg0/dx ≈ 0 (in linearized form)
+    # In log space: dg0/dx = g0 * (dln_g0/dln_x) / x
+    dg0_dx = g0_vals * dln_g0_dlnx / x_grid
+    
+    # Residual: how far from zero is the stationary condition?
+    # Using simplified form: residual = D_E * g0 + D_EE * dg0/dx
+    residual = D_E * g0_vals + D_EE * dg0_dx
+    
+    # Relative residual (normalized by typical scale)
+    scale = np.abs(D_E * g0_vals) + np.abs(D_EE * dg0_dx) + 1e-30
+    relative_residual = residual / scale
+    
+    return dict(
+        x=x_grid,
+        D_E=D_E,
+        D_EE=D_EE,
+        g0=g0_vals,
+        dln_g0_dlnx=dln_g0_dlnx,
+        residual=residual,
+        relative_residual=relative_residual
+    )
+
 # ----------------- MC machinery -----------------
 @dataclass
 class Star:
@@ -931,7 +1001,7 @@ def run_once(steps, DT, pop, LUT, blocks=8, progress_every=0.05,
                     mc_step(s, LUT, DT, disable_capture=disable_capture,
                             flip_energy_sign=flip_energy_sign, inner_sink_frac=inner_sink_frac,
                             no_reservoir=no_reservoir)
-                x_prev[i] = s.x
+                    x_prev[i] = s.x  # Update x_prev for next iteration (though we use x_prev_saved for deposition)
 
         # deposit along path in log-x
         blk = int(np.searchsorted(block_edges, k, side='right') - 1)
@@ -1153,6 +1223,8 @@ def main():
                     help="disable numba JIT even if available")
     ap.add_argument("--seed", type=int, default=7,
                     help="random seed for reproducibility")
+    ap.add_argument("--check-fp-consistency", action="store_true",
+                    help="check if g0 is a stationary solution of the FP operator (diagnostic)")
     args = ap.parse_args()
 
     # Set multiprocessing start method for Windows compatibility (before using ProcessPoolExecutor)
@@ -1187,6 +1259,46 @@ def main():
     xgrid = np.logspace(-3, 4, 400)
     bg0   = Background(xs=xgrid, gs=g0_interp(xgrid))
     LUT   = precompute_LUT(args.lut_x, args.lut_j, bg0, n_procs=args.procc)
+
+    # FP consistency check (diagnostic)
+    if args.check_fp_consistency:
+        print("\n" + "="*70)
+        print("FP Consistency Check: Is g0 a stationary solution?")
+        print("="*70)
+        fp_diag = check_fp_consistency(LUT, bg0)
+        
+        x_fp = fp_diag['x']
+        residual = fp_diag['residual']
+        rel_residual = fp_diag['relative_residual']
+        D_E = fp_diag['D_E']
+        D_EE = fp_diag['D_EE']
+        g0_fp = fp_diag['g0']
+        
+        # Find regions where residual is significant
+        abs_rel_res = np.abs(rel_residual)
+        significant = abs_rel_res > 0.1  # >10% relative error
+        
+        print(f"\nResidual statistics:")
+        print(f"  Mean |relative residual|: {np.mean(abs_rel_res):.4f}")
+        print(f"  Median |relative residual|: {np.median(abs_rel_res):.4f}")
+        print(f"  Max |relative residual|: {np.max(abs_rel_res):.4f} (at x = {x_fp[np.argmax(abs_rel_res)]:.2f})")
+        print(f"  Bins with |relative residual| > 0.1: {np.sum(significant)} / {len(x_fp)}")
+        
+        if np.sum(significant) > 0:
+            print(f"\n  Regions with significant residual:")
+            for ix in np.where(significant)[0][:10]:  # Show first 10
+                print(f"    x = {x_fp[ix]:8.2f}: |rel_res| = {abs_rel_res[ix]:.4f}, "
+                      f"D_E = {D_E[ix]:.4e}, D_EE = {D_EE[ix]:.4e}, g0 = {g0_fp[ix]:.4e}")
+        
+        # Save diagnostic CSV
+        arr_fp = np.column_stack([
+            x_fp, D_E, D_EE, g0_fp, fp_diag['dln_g0_dlnx'],
+            residual, rel_residual
+        ])
+        np.savetxt("fp_consistency.csv", arr_fp, delimiter=",",
+                   header="x,D_E,D_EE,g0,dln_g0_dlnx,residual,relative_residual", comments="")
+        print(f"\n  Saved FP consistency diagnostic to fp_consistency.csv")
+        print("="*70 + "\n")
 
     # build floors
     X_FLOORS = None
@@ -1325,6 +1437,19 @@ def main():
         print(f"  Ratio range: {np.max(R_finite)/np.min(R_finite):.2f}x")
         if args.no_reservoir and args.disable_capture and args.init_g0:
             print(f"  (For g0 stationarity test: ratio should be ~constant if operator is self-consistent)")
+
+    # Check for missing bins (zero deposition)
+    missing_bins = (g_mean == 0.0) | (g_err == 0.0)
+    if np.any(missing_bins):
+        n_missing = np.sum(missing_bins)
+        print(f"\nWarning: {n_missing} / {len(XCEN)} bins have zero deposition (g_mean=0 or g_err=0):")
+        for idx in np.where(missing_bins)[0][:10]:  # Show first 10
+            print(f"  x = {XCEN[idx]:.2f}: g_mean = {g_mean[idx]:.4e}, g_err = {g_err[idx]:.4e}")
+        if n_missing > 10:
+            print(f"  ... and {n_missing - 10} more")
+        print(f"  These bins may indicate binning issues or regions with no star visits.")
+    else:
+        print(f"\nAll {len(XCEN)} bins have non-zero deposition (good).")
 
     # write CSV
     arr = np.column_stack([XCEN, g_mean, g_err])
