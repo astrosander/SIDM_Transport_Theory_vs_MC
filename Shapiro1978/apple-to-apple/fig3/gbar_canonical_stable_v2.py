@@ -536,7 +536,7 @@ def coeff_from_LUT(x, j, L):
     return e1,e2,j1,j2,z2
 
 # ----------------- FP consistency diagnostic -----------------
-def check_fp_consistency(LUT, bg: Background = None):
+def check_fp_consistency(LUT, bg: Background = None, test_measure="none"):
     """
     Check if g0 is a stationary solution of the FP operator defined by LUT.
     
@@ -570,7 +570,21 @@ def check_fp_consistency(LUT, bg: Background = None):
         D_EE[ix] = np.sum(LUT['e2'][ix, :] * j_weights)
     
     # Evaluate g0 on the LUT x-grid
-    g0_vals = g0_interp(x_grid)
+    # Test different measure interpretations if requested
+    g0_vals_raw = g0_interp(x_grid)
+    g0_vals_raw = np.maximum(g0_vals_raw, 1e-16)
+    
+    if test_measure == "per-dx" or test_measure == "both":
+        # If g0_interp returns per-dlnx, convert to per-dx: g_dx = g_ln / x
+        g0_vals = g0_vals_raw / x_grid
+    elif test_measure == "per-dlnx":
+        # If g0_interp returns per-dx, convert to per-dlnx: g_ln = x * g_dx
+        # But we assume it's already per-dlnx, so this is just for completeness
+        g0_vals = g0_vals_raw * x_grid
+    else:
+        # Default: assume g0_interp returns per-dlnx (as used in MC)
+        g0_vals = g0_vals_raw
+    
     g0_vals = np.maximum(g0_vals, 1e-16)
     
     # Compute derivatives in x-space (not ln x)
@@ -582,21 +596,38 @@ def check_fp_consistency(LUT, bg: Background = None):
     dD_EE_dx = np.gradient(D_EE, x_grid)
     d2D_EE_dx2 = np.gradient(dD_EE_dx, x_grid)
     
-    # FP operator: L[g] = ∂/∂x[e1 * g] + (1/2)∂²/∂x²[e2 * g]
-    # Expanding: e1 * dg/dx + g * de1/dx + (1/2)[e2 * d²g/dx² + 2*(de2/dx)*(dg/dx) + g * d²e2/dx²]
+    # Standard FP equation: ∂g/∂t = -∂/∂x[D_E * g] + (1/2)∂²/∂x²[D_EE * g]
+    # Expanding: -D_E * dg/dx - g * dD_E/dx + (1/2)[D_EE * d²g/dx² + 2*(dD_EE/dx)*(dg/dx) + g * d²D_EE/dx²]
     # For stationarity: L[g0] = 0
-    Lg0 = (D_E * dg0_dx + 
-           g0_vals * dD_E_dx + 
-           0.5 * (D_EE * d2g0_dx2 + 
-                  2.0 * dD_EE_dx * dg0_dx + 
-                  g0_vals * d2D_EE_dx2))
+    # Note: MC implements dx/dt = -e1 + sqrt(e2)*noise, so e1 = -D_E in standard convention
+    # But we'll check both sign conventions to diagnose the issue
     
-    # Relative residual (normalized by typical scale of each term)
-    drift_term = D_E * dg0_dx
-    drift_coeff_term = g0_vals * dD_E_dx
-    diff_term = 0.5 * D_EE * d2g0_dx2
-    diff_mixed_term = dD_EE_dx * dg0_dx
-    diff_coeff_term = 0.5 * g0_vals * d2D_EE_dx2
+    # Standard FP form (with minus sign on drift):
+    drift_term_std = -D_E * dg0_dx
+    drift_coeff_term_std = -g0_vals * dD_E_dx
+    diff_term_std = 0.5 * D_EE * d2g0_dx2
+    diff_mixed_term_std = dD_EE_dx * dg0_dx
+    diff_coeff_term_std = 0.5 * g0_vals * d2D_EE_dx2
+    Lg0_std = (drift_term_std + drift_coeff_term_std + 
+               diff_term_std + diff_mixed_term_std + diff_coeff_term_std)
+    
+    # Alternative form (matching MC's dx/dt = -e1 convention):
+    # If MC uses dx/dt = -e1, then the FP is ∂g/∂t = ∂/∂x[e1*g] + (1/2)∂²/∂x²[e2*g]
+    drift_term_alt = D_E * dg0_dx
+    drift_coeff_term_alt = g0_vals * dD_E_dx
+    diff_term_alt = 0.5 * D_EE * d2g0_dx2
+    diff_mixed_term_alt = dD_EE_dx * dg0_dx
+    diff_coeff_term_alt = 0.5 * g0_vals * d2D_EE_dx2
+    Lg0_alt = (drift_term_alt + drift_coeff_term_alt + 
+               diff_term_alt + diff_mixed_term_alt + diff_coeff_term_alt)
+    
+    # Use the standard form by default, but return both for comparison
+    Lg0 = Lg0_std
+    drift_term = drift_term_std
+    drift_coeff_term = drift_coeff_term_std
+    diff_term = diff_term_std
+    diff_mixed_term = diff_mixed_term_std
+    diff_coeff_term = diff_coeff_term_std
     
     scale = (np.abs(drift_term) + np.abs(drift_coeff_term) + 
              np.abs(diff_term) + np.abs(diff_mixed_term) + 
@@ -613,12 +644,19 @@ def check_fp_consistency(LUT, bg: Background = None):
         dD_E_dx=dD_E_dx,
         dD_EE_dx=dD_EE_dx,
         residual=Lg0,
+        residual_alt=Lg0_alt,  # Alternative sign convention
         relative_residual=relative_residual,
         drift_term=drift_term,
         drift_coeff_term=drift_coeff_term,
         diff_term=diff_term,
         diff_mixed_term=diff_mixed_term,
-        diff_coeff_term=diff_coeff_term
+        diff_coeff_term=diff_coeff_term,
+        # Also return alternative terms for comparison
+        drift_term_alt=drift_term_alt,
+        drift_coeff_term_alt=drift_coeff_term_alt,
+        diff_term_alt=diff_term_alt,
+        diff_mixed_term_alt=diff_mixed_term_alt,
+        diff_coeff_term_alt=diff_coeff_term_alt
     )
 
 # ----------------- MC machinery -----------------
@@ -1241,6 +1279,9 @@ def main():
                     help="random seed for reproducibility")
     ap.add_argument("--check-fp-consistency", action="store_true",
                     help="check if g0 is a stationary solution of the FP operator (diagnostic)")
+    ap.add_argument("--test-measure", choices=["none", "per-dx", "per-dlnx", "both"],
+                    default="none",
+                    help="test measure mismatch: treat g0 as per-dx or per-dlnx (or both)")
     args = ap.parse_args()
 
     # Set multiprocessing start method for Windows compatibility (before using ProcessPoolExecutor)
@@ -1281,7 +1322,39 @@ def main():
         print("\n" + "="*70)
         print("FP Consistency Check: Is g0 a stationary solution?")
         print("="*70)
-        fp_diag = check_fp_consistency(LUT, bg0)
+        if args.test_measure == "both":
+            # Test both measures
+            print("\n" + "-"*70)
+            print("Testing per-dx interpretation (g_dx = g_ln / x):")
+            fp_diag_dx = check_fp_consistency(LUT, bg0, test_measure="per-dx")
+            abs_rel_res_dx = np.abs(fp_diag_dx['relative_residual'])
+            print(f"  Mean |relative residual|: {np.mean(abs_rel_res_dx):.4f}")
+            
+            print("\n" + "-"*70)
+            print("Testing per-dlnx interpretation (g_ln = x * g_dx, or raw if already per-dlnx):")
+            fp_diag_ln = check_fp_consistency(LUT, bg0, test_measure="per-dlnx")
+            abs_rel_res_ln = np.abs(fp_diag_ln['relative_residual'])
+            print(f"  Mean |relative residual|: {np.mean(abs_rel_res_ln):.4f}")
+            
+            print("\n" + "-"*70)
+            print("Testing raw g0 (assuming per-dlnx, default):")
+            fp_diag_raw = check_fp_consistency(LUT, bg0, test_measure="none")
+            abs_rel_res_raw = np.abs(fp_diag_raw['relative_residual'])
+            print(f"  Mean |relative residual|: {np.mean(abs_rel_res_raw):.4f}")
+            
+            # Use the best one for detailed output
+            if np.mean(abs_rel_res_dx) < np.mean(abs_rel_res_ln) and np.mean(abs_rel_res_dx) < np.mean(abs_rel_res_raw):
+                print(f"\n  → per-dx interpretation has smallest residuals (use --test-measure per-dx)")
+                fp_diag = fp_diag_dx
+            elif np.mean(abs_rel_res_ln) < np.mean(abs_rel_res_raw):
+                print(f"\n  → per-dlnx interpretation has smallest residuals (use --test-measure per-dlnx)")
+                fp_diag = fp_diag_ln
+            else:
+                print(f"\n  → raw g0 (per-dlnx) has smallest residuals (default)")
+                fp_diag = fp_diag_raw
+            print("="*70 + "\n")
+        else:
+            fp_diag = check_fp_consistency(LUT, bg0, test_measure=args.test_measure)
         
         x_fp = fp_diag['x']
         residual = fp_diag['residual']
@@ -1290,15 +1363,36 @@ def main():
         D_EE = fp_diag['D_EE']
         g0_fp = fp_diag['g0']
         
+        # Compare both sign conventions
+        residual_alt = fp_diag['residual_alt']
+        scale_alt = (np.abs(fp_diag['drift_term_alt']) + np.abs(fp_diag['drift_coeff_term_alt']) + 
+                     np.abs(fp_diag['diff_term_alt']) + np.abs(fp_diag['diff_mixed_term_alt']) + 
+                     np.abs(fp_diag['diff_coeff_term_alt']) + 1e-30)
+        rel_residual_alt = residual_alt / scale_alt
+        abs_rel_res_alt = np.abs(rel_residual_alt)
+        
         # Find regions where residual is significant
         abs_rel_res = np.abs(rel_residual)
         significant = abs_rel_res > 0.1  # >10% relative error
+        significant_alt = abs_rel_res_alt > 0.1
         
-        print(f"\nResidual statistics:")
+        print(f"\nResidual statistics (STANDARD FP form: -∂/∂x[D_E*g] + ½∂²/∂x²[D_EE*g]):")
         print(f"  Mean |relative residual|: {np.mean(abs_rel_res):.4f}")
         print(f"  Median |relative residual|: {np.median(abs_rel_res):.4f}")
         print(f"  Max |relative residual|: {np.max(abs_rel_res):.4f} (at x = {x_fp[np.argmax(abs_rel_res)]:.2f})")
         print(f"  Bins with |relative residual| > 0.1: {np.sum(significant)} / {len(x_fp)}")
+        
+        print(f"\nResidual statistics (ALTERNATIVE form: +∂/∂x[e1*g] + ½∂²/∂x²[e2*g], matching MC dx/dt=-e1):")
+        print(f"  Mean |relative residual|: {np.mean(abs_rel_res_alt):.4f}")
+        print(f"  Median |relative residual|: {np.median(abs_rel_res_alt):.4f}")
+        print(f"  Max |relative residual|: {np.max(abs_rel_res_alt):.4f} (at x = {x_fp[np.argmax(abs_rel_res_alt)]:.2f})")
+        print(f"  Bins with |relative residual| > 0.1: {np.sum(significant_alt)} / {len(x_fp)}")
+        
+        # Determine which form is better
+        if np.mean(abs_rel_res_alt) < np.mean(abs_rel_res):
+            print(f"\n  → ALTERNATIVE form has smaller residuals (better match)")
+        else:
+            print(f"\n  → STANDARD form has smaller residuals (better match)")
         
         if np.sum(significant) > 0:
             print(f"\n  Regions with significant residual:")
@@ -1318,17 +1412,28 @@ def main():
             print(f"        diff_mixed: de2/dx*dg/dx = {fp_diag['diff_mixed_term'][ix]:.4e}")
             print(f"        diff_coeff: 0.5*g*d²e2/dx² = {fp_diag['diff_coeff_term'][ix]:.4e}")
         
-        # Save diagnostic CSV with all terms
+        # Save diagnostic CSV with all terms (both sign conventions)
+        residual_alt = fp_diag['residual_alt']
+        scale_alt = (np.abs(fp_diag['drift_term_alt']) + np.abs(fp_diag['drift_coeff_term_alt']) + 
+                     np.abs(fp_diag['diff_term_alt']) + np.abs(fp_diag['diff_mixed_term_alt']) + 
+                     np.abs(fp_diag['diff_coeff_term_alt']) + 1e-30)
+        rel_residual_alt = residual_alt / scale_alt
+        
         arr_fp = np.column_stack([
             x_fp, D_E, D_EE, g0_fp, fp_diag['dg0_dx'], fp_diag['d2g0_dx2'],
             fp_diag['dD_E_dx'], fp_diag['dD_EE_dx'],
-            residual, rel_residual,
+            residual, rel_residual,  # Standard form
+            residual_alt, rel_residual_alt,  # Alternative form
             fp_diag['drift_term'], fp_diag['drift_coeff_term'],
-            fp_diag['diff_term'], fp_diag['diff_mixed_term'], fp_diag['diff_coeff_term']
+            fp_diag['diff_term'], fp_diag['diff_mixed_term'], fp_diag['diff_coeff_term'],
+            fp_diag['drift_term_alt'], fp_diag['drift_coeff_term_alt'],
+            fp_diag['diff_term_alt'], fp_diag['diff_mixed_term_alt'], fp_diag['diff_coeff_term_alt']
         ])
         np.savetxt("fp_consistency.csv", arr_fp, delimiter=",",
-                   header="x,D_E,D_EE,g0,dg0_dx,d2g0_dx2,dD_E_dx,dD_EE_dx,residual,relative_residual,"
-                          "drift_term,drift_coeff_term,diff_term,diff_mixed_term,diff_coeff_term", 
+                   header="x,D_E,D_EE,g0,dg0_dx,d2g0_dx2,dD_E_dx,dD_EE_dx,"
+                          "residual_std,relative_residual_std,residual_alt,relative_residual_alt,"
+                          "drift_term_std,drift_coeff_term_std,diff_term_std,diff_mixed_term_std,diff_coeff_term_std,"
+                          "drift_term_alt,drift_coeff_term_alt,diff_term_alt,diff_mixed_term_alt,diff_coeff_term_alt", 
                    comments="")
         print(f"\n  Saved FP consistency diagnostic to fp_consistency.csv")
         print("="*70 + "\n")
