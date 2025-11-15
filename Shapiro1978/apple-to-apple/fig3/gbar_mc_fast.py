@@ -163,7 +163,7 @@ ZETA2 = np.array([  # ζ*²
 ], dtype=np.float64)
 
 # ---------------- kernels (Numba or pure python) ----------------
-def _build_kernels(use_jit=True, cone_gamma=0.25):
+def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False):
     """Build numba-jitted kernels (or pure-python fallbacks)."""
     nb_njit = (lambda *a, **k: (lambda f: f))
     njit = nb.njit if (use_jit and HAVE_NUMBA) else nb_njit
@@ -239,7 +239,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
         return e1, e2v, j1v, j2v, z2v
 
     @njit(**fastmath)
-    def pick_n(x, j, e2v, j2v, cone_gamma_val):
+    def pick_n(x, j, e2v, j2v, cone_gamma_val, noloss_flag):
         jmin = j_min_of_x(x)
         nmax = 1e30
         
@@ -260,13 +260,14 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
             if v < nmax:
                 nmax = v
 
-            # (29d) distance to loss cone (correct form)
-            gap = cone_gamma_val * (j - jmin)
-            floor = max(gap, 0.10 * jmin)
-            if floor > 0.0:
-                v = (floor / j2v)**2
-                if v < nmax:
-                    nmax = v
+            # (29d) distance to loss cone - skip completely if noloss is enabled
+            if not noloss_flag:
+                gap = cone_gamma_val * (j - jmin)
+                floor = max(gap, 0.10 * jmin)
+                if floor > 0.0:
+                    v = (floor / j2v)**2
+                    if v < nmax:
+                        nmax = v
 
         # choose n (fraction of an orbit); no artificial 0.5 cap
         n = nmax if nmax > 1e-8 else 1e-8
@@ -306,9 +307,9 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
         return k
 
     @njit(**fastmath)
-    def step_one(x, j, phase, cone_gamma_val):
+    def step_one(x, j, phase, cone_gamma_val, noloss_flag):
         e1, e2v, j1v, j2v, z2v = bilinear_coeffs(x, j)
-        n_raw = pick_n(x, j, e2v, j2v, cone_gamma_val)
+        n_raw = pick_n(x, j, e2v, j2v, cone_gamma_val, noloss_flag)
 
         # land exactly on next pericenter if we'd cross it
         next_int = math.floor(phase) + 1.0
@@ -341,9 +342,9 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
         # phase advance
         phase = phase + n
 
-        # capture only if we actually hit pericenter on this step
+        # capture only if we actually hit pericenter on this step (and noloss is disabled)
         captured = False
-        if crossed_peri and (j_new < j_min_of_x(x_new)):
+        if (not noloss_flag) and crossed_peri and (j_new < j_min_of_x(x_new)):
             captured = True
 
         return x_new, j_new, phase, n, captured, crossed_peri
@@ -351,7 +352,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
     @njit(**fastmath)
     def run_stream(n_relax, floors, clones_per_split, x_bins, dx,
                    seed, cone_gamma_val, warmup_t0, x_init,
-                   include_clone_gbar=True, use_snapshots=False, noloss=False):
+                   include_clone_gbar=True, use_snapshots=False, noloss=False, use_clones=True):
         """
         Single time-carrying stream + clone tree.
 
@@ -372,8 +373,11 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
         w = 1.0  # statistical weight
         parent_floor_idx = floor_index_for_j2(j*j, floors)  # -1 if above floors[0]
 
-        # clone pool (use floor indices, not floor values)
-        MAX_CLONES = 2048
+        # clone pool (use floor indices, not floor values) - disabled if use_clones=False
+        if use_clones:
+            MAX_CLONES = 2048
+        else:
+            MAX_CLONES = 0
         cx  = np.zeros(MAX_CLONES, dtype=np.float64)
         cj  = np.zeros(MAX_CLONES, dtype=np.float64)
         cph = np.zeros(MAX_CLONES, dtype=np.float64)
@@ -397,7 +401,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
         t0_used = 0.0
         while t0_used < warmup_t0:
             x_prev = x
-            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, cone_gamma_val)
+            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, cone_gamma_val, noloss)
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
 
@@ -406,7 +410,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                 x = X_BOUND
                 j = math.sqrt(np.random.random())
                 parent_floor_idx = floor_index_for_j2(j*j, floors)
-            else:
+            elif use_clones:
                 # splitting for parent: only when entering a new deeper floor (with hysteresis)
                 j2_now = j*j
                 target_idx = target_floor_with_hysteresis(j2_now, floors, parent_floor_idx, SPLIT_HYST)
@@ -425,52 +429,53 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                             cactive[ccount] = 1
                             ccount += 1
 
-            # evolve clones during warm-up (no tallies)
-            i = 0
-            while i < ccount:
-                if cactive[i] == 0:
-                    i += 1
-                    continue
-                x_c, j_c, ph_c = cx[i], cj[i], cph[i]
-                x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, cone_gamma_val)
-                cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
+            # evolve clones during warm-up (no tallies) - only if use_clones
+            if use_clones:
+                i = 0
+                while i < ccount:
+                    if cactive[i] == 0:
+                        i += 1
+                        continue
+                    x_c, j_c, ph_c = cx[i], cj[i], cph[i]
+                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, cone_gamma_val, noloss)
+                    cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
 
-                if cap_c or (x_c2 < X_BOUND):
-                    # recycle clone at reservoir
-                    cx[i]  = X_BOUND
-                    cj[i]  = math.sqrt(np.random.random())
-                    cph[i] = ph_c2
-                    cfloor_idx[i] = floor_index_for_j2(cj[i]*cj[i], floors)
-                    cactive[i] = 1
-                    i += 1
-                    continue
+                    if cap_c or (x_c2 < X_BOUND):
+                        # recycle clone at reservoir
+                        cx[i]  = X_BOUND
+                        cj[i]  = math.sqrt(np.random.random())
+                        cph[i] = ph_c2
+                        cfloor_idx[i] = floor_index_for_j2(cj[i]*cj[i], floors)
+                        cactive[i] = 1
+                        i += 1
+                        continue
 
-                # outward across its own floor → remove clone (return weight to parent)
-                if cfloor_idx[i] >= 0 and j_c2*j_c2 >= floors[cfloor_idx[i]]:
-                    w += cw[i]
-                    cw[i] = 0.0
-                    cactive[i] = 0
-                    i += 1
-                    continue
+                    # outward across its own floor → remove clone (return weight to parent)
+                    if cfloor_idx[i] >= 0 and j_c2*j_c2 >= floors[cfloor_idx[i]]:
+                        w += cw[i]
+                        cw[i] = 0.0
+                        cactive[i] = 0
+                        i += 1
+                        continue
 
-                # deeper splitting for clone
-                j2_c = j_c2 * j_c2
-                target_idx_c = target_floor_with_hysteresis(j2_c, floors, cfloor_idx[i], SPLIT_HYST)
-                while cfloor_idx[i] < target_idx_c:
-                    cfloor_idx[i] += 1
-                    if ccount <= MAX_CLONES - clones_per_split:
-                        alpha = 1.0 / (1.0 + clones_per_split)
-                        new_w = cw[i] * alpha
-                        cw[i] = new_w
-                        for k in range(clones_per_split):
-                            cx[ccount] = x_c2
-                            cj[ccount] = j_c2
-                            cph[ccount]= ph_c2
-                            cw[ccount] = new_w
-                            cfloor_idx[ccount] = cfloor_idx[i]
-                            cactive[ccount] = 1
-                            ccount += 1
-                i += 1
+                    # deeper splitting for clone
+                    j2_c = j_c2 * j_c2
+                    target_idx_c = target_floor_with_hysteresis(j2_c, floors, cfloor_idx[i], SPLIT_HYST)
+                    while cfloor_idx[i] < target_idx_c:
+                        cfloor_idx[i] += 1
+                        if ccount <= MAX_CLONES - clones_per_split:
+                            alpha = 1.0 / (1.0 + clones_per_split)
+                            new_w = cw[i] * alpha
+                            cw[i] = new_w
+                            for k in range(clones_per_split):
+                                cx[ccount] = x_c2
+                                cj[ccount] = j_c2
+                                cph[ccount]= ph_c2
+                                cw[ccount] = new_w
+                                cfloor_idx[ccount] = cfloor_idx[i]
+                                cactive[ccount] = 1
+                                ccount += 1
+                    i += 1
 
         # ---------- (2) zero tallies; measurement window ----------
         g_time = np.zeros(x_bins.size, dtype=np.float64)
@@ -487,11 +492,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
 
         while t0_used < n_relax:
             x_prev = x
-            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, cone_gamma_val)
-            
-            # Patch C: suppress captures if noloss is enabled
-            if noloss:
-                cap = False
+            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, cone_gamma_val, noloss)
             
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -503,8 +504,8 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                 while total_t0 >= t0_next:
                     # snapshot parent
                     g_snap[bin_index(x)] += w
-                    # and clones (gated by include_clone_gbar - Patch A)
-                    if include_clone_gbar:
+                    # and clones (gated by use_clones and include_clone_gbar - Patch A)
+                    if use_clones and include_clone_gbar:
                         for ii in range(ccount):
                             if cactive[ii]:
                                 g_snap[bin_index(cx[ii])] += cw[ii]
@@ -513,8 +514,8 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
             else:
                 # time-weighted occupancy at start of step for parent + clones
                 g_time[bin_index(x_prev)] += w * dt0
-                # Patch A: gate clone contribution
-                if include_clone_gbar:
+                # Patch A: gate clone contribution (only if use_clones is enabled)
+                if use_clones and include_clone_gbar:
                     for ii in range(ccount):
                         if cactive[ii]:
                             g_time[bin_index(cx[ii])] += cw[ii] * dt0
@@ -532,7 +533,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                 x = X_BOUND
                 j = math.sqrt(np.random.random())
                 parent_floor_idx = floor_index_for_j2(j*j, floors)
-            else:
+            elif use_clones:
                 # splitting after we know we weren't captured / escaped
                 j2_now = j*j
                 target_idx = target_floor_with_hysteresis(j2_now, floors, parent_floor_idx, SPLIT_HYST)
@@ -553,72 +554,69 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                             if ccount > max_ccount:
                                 max_ccount = ccount
 
-            # evolve all active clones (sharing the same time variable; do NOT add to t0_used again)
-            i = 0
-            while i < ccount:
-                if cactive[i] == 0:
-                    i += 1
-                    continue
-                x_c, j_c, ph_c = cx[i], cj[i], cph[i]
-                x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, cone_gamma_val)
-                
-                # Patch C: suppress captures if noloss is enabled
-                if noloss:
-                    cap_c = False
-                
-                cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
-
-                if crossed_c:
-                    crossings += 1
-
-                # capture first
-                if cap_c:
-                    caps += 1
-                    cx[i]  = X_BOUND
-                    cj[i]  = math.sqrt(np.random.random())
-                    cph[i] = ph_c2
-                    cfloor_idx[i] = floor_index_for_j2(cj[i]*cj[i], floors)
-                    cactive[i] = 1
-                    if ccount > max_ccount:
-                        max_ccount = ccount
-                    i += 1
-                    continue
-
-                # escape replacement
-                if x_c2 < X_BOUND:
-                    x_c2 = X_BOUND
-                    j_c2 = math.sqrt(np.random.random())
+            # evolve all active clones (sharing the same time variable; do NOT add to t0_used again) - only if use_clones
+            if use_clones:
+                i = 0
+                while i < ccount:
+                    if cactive[i] == 0:
+                        i += 1
+                        continue
+                    x_c, j_c, ph_c = cx[i], cj[i], cph[i]
+                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, cone_gamma_val, noloss)
+                    
                     cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
-                    cfloor_idx[i] = floor_index_for_j2(j_c2*j_c2, floors)
 
-                # outward crossing of its own floor → annihilate clone, return weight
-                if cfloor_idx[i] >= 0 and j_c2*j_c2 >= floors[cfloor_idx[i]]:
-                    w += cw[i]
-                    cw[i] = 0.0
-                    cactive[i] = 0
+                    if crossed_c:
+                        crossings += 1
+
+                    # capture first
+                    if cap_c:
+                        caps += 1
+                        cx[i]  = X_BOUND
+                        cj[i]  = math.sqrt(np.random.random())
+                        cph[i] = ph_c2
+                        cfloor_idx[i] = floor_index_for_j2(cj[i]*cj[i], floors)
+                        cactive[i] = 1
+                        if ccount > max_ccount:
+                            max_ccount = ccount
+                        i += 1
+                        continue
+
+                    # escape replacement
+                    if x_c2 < X_BOUND:
+                        x_c2 = X_BOUND
+                        j_c2 = math.sqrt(np.random.random())
+                        cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
+                        cfloor_idx[i] = floor_index_for_j2(j_c2*j_c2, floors)
+
+                    # outward crossing of its own floor → annihilate clone, return weight
+                    if cfloor_idx[i] >= 0 and j_c2*j_c2 >= floors[cfloor_idx[i]]:
+                        w += cw[i]
+                        cw[i] = 0.0
+                        cactive[i] = 0
+                        i += 1
+                        continue
+
+                    # deeper splitting
+                    j2_c = j_c2 * j_c2
+                    target_idx_c = target_floor_with_hysteresis(j2_c, floors, cfloor_idx[i], SPLIT_HYST)
+                    while cfloor_idx[i] < target_idx_c:
+                        cfloor_idx[i] += 1
+                        if ccount <= MAX_CLONES - clones_per_split:
+                            alpha = 1.0 / (1.0 + clones_per_split)
+                            new_w = cw[i] * alpha
+                            cw[i] = new_w
+                            for k in range(clones_per_split):
+                                cx[ccount] = x_c2
+                                cj[ccount] = j_c2
+                                cph[ccount]= ph_c2
+                                cw[ccount] = new_w
+                                cfloor_idx[ccount] = cfloor_idx[i]
+                                cactive[ccount] = 1
+                                ccount += 1
+                                if ccount > max_ccount:
+                                    max_ccount = ccount
                     i += 1
-                    continue
-
-                # deeper splitting
-                j2_c = j_c2 * j_c2
-                target_idx_c = target_floor_with_hysteresis(j2_c, floors, cfloor_idx[i], SPLIT_HYST)
-                while cfloor_idx[i] < target_idx_c:
-                    cfloor_idx[i] += 1
-                    if ccount <= MAX_CLONES - clones_per_split:
-                        alpha = 1.0 / (1.0 + clones_per_split)
-                        new_w = cw[i] * alpha
-                        cw[i] = new_w
-                        for k in range(clones_per_split):
-                            cx[ccount] = x_c2
-                            cj[ccount] = j_c2
-                            cph[ccount]= ph_c2
-                            cw[ccount] = new_w
-                            cfloor_idx[ccount] = cfloor_idx[i]
-                            cactive[ccount] = 1
-                            ccount += 1
-                            if ccount > max_ccount:
-                                max_ccount = ccount
-                i += 1
 
         # Patch B: return snapshot data if using snapshots
         if use_snapshots:
@@ -632,9 +630,9 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
 def _worker_one(args):
     (sid, n_relax, floors, clones_per_split,
      stream_seeds, use_jit, cone_gamma, warmup_t0, u0,
-     include_clone_gbar, use_snapshots, noloss) = args
+     include_clone_gbar, use_snapshots, noloss, use_clones) = args
 
-    P_of_x, T0, run_stream = _build_kernels(use_jit=use_jit, cone_gamma=cone_gamma)
+    P_of_x, T0, run_stream = _build_kernels(use_jit=use_jit, cone_gamma=cone_gamma, noloss=noloss)
 
     # Sample initial x from BW distribution using stratified u value
     x_init = sample_x_from_g0(u0)
@@ -642,17 +640,17 @@ def _worker_one(args):
     # tiny warmup to pull kernels from cache
     _ = run_stream(1e-6, floors, clones_per_split, X_BINS, DX,
                    int(stream_seeds[sid] ^ 0xABCDEF), cone_gamma, 0.0, x_init,
-                   include_clone_gbar, use_snapshots, noloss)
+                   include_clone_gbar, use_snapshots, noloss, use_clones)
 
     return run_stream(n_relax, floors, clones_per_split, X_BINS, DX,
                       int(stream_seeds[sid]), cone_gamma, warmup_t0, x_init,
-                      include_clone_gbar, use_snapshots, noloss)
+                      include_clone_gbar, use_snapshots, noloss, use_clones)
 
 # ---------------- parallel driver (ḡ only) ----------------
 def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
                       procs=48, use_jit=True, seed=SEED, show_progress=True,
                       cone_gamma=0.25, warmup_t0=2.0, replicates=1, gexp=2.5,
-                      include_clone_gbar=True, use_snapshots=False, noloss=False):
+                      include_clone_gbar=True, use_snapshots=False, noloss=False, use_clones=True):
     """
     Run many independent time-carrying streams in parallel and accumulate ḡ(x).
 
@@ -666,6 +664,10 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
                     at the boundary bin (containing X_BOUND = 0.2)
         gbar_raw  : unnormalised ḡ(x) before normalization (for diagnostics)
     """
+    # For noloss diagnostics, disable cloning – parent stream is enough
+    if noloss:
+        use_clones = False
+    
     if floors is None:
         floors = np.array([10.0**(-k) for k in range(0, 9)], dtype=np.float64)  # 1 ... 1e-8
     else:
@@ -703,7 +705,7 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
                     _worker_one,
                     (sid, n_relax, floors, clones_per_split,
                      stream_seeds, use_jit, cone_gamma, warmup_t0, u_strat[sid],
-                     include_clone_gbar, use_snapshots, noloss)
+                     include_clone_gbar, use_snapshots, noloss, use_clones)
                 )
                 for sid in range(n_streams)
             ]
@@ -900,6 +902,7 @@ def main():
         include_clone_gbar=(not args.gbar_no_clones),
         use_snapshots=args.snapshots,
         noloss=args.noloss,
+        use_clones=(not args.noloss and not args.gbar_no_clones),
     )
 
     # ---- print comparison table ----
