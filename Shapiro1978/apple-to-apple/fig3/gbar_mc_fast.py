@@ -336,7 +336,6 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
             j_new = 1.0
 
         # phase advance
-        phase_before = phase
         phase = phase + n
 
         # capture only if we actually hit pericenter on this step
@@ -393,7 +392,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
         # ---------- (1) warm-up: evolve, recycle, split — do NOT tally ----------
         t0_used = 0.0
         while t0_used < warmup_t0:
-            x_prev = x; j_prev = j
+            x_prev = x
             x, j, phase, n_used, cap, crossed = step_one(x, j, phase, cone_gamma_val)
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -626,7 +625,7 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
     if procs is None or procs < 1:
         procs = os.cpu_count() or 1
 
-    import concurrent.futures
+    import concurrent.futures as cf
 
     rs = np.random.RandomState(seed)
 
@@ -649,7 +648,7 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
         u_strat = (np.arange(n_streams) + 0.5) / n_streams
         rs.shuffle(u_strat)
 
-        with concurrent.futures.ProcessPoolExecutor(max_workers=procs) as ex:
+        with cf.ProcessPoolExecutor(max_workers=procs) as ex:
             futs = [
                 ex.submit(
                     _worker_one,
@@ -659,7 +658,7 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
                 for sid in range(n_streams)
             ]
 
-            for i, f in enumerate(concurrent.futures.as_completed(futs), 1):
+            for i, f in enumerate(cf.as_completed(futs), 1):
                 gtime_b, t0_b, peri_b, caps_b, ccount_b = f.result()
                 gtime_total += gtime_b
                 t0_total    += t0_b
