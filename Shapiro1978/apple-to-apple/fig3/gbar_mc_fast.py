@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-gbar_mc_fast.py  (Fig. 3 reproduction: ḡ(x) only)
+gbar_mc_fast.py  (Fig. 3 reproduction: ḡ(x) phase-space DF)
 
 Canonical 2D MC for a star cluster with a massive central BH, following
 Shapiro–Marchant (1978/79), using the same kernels / rules as the FE*·x
-Monte-Carlo you posted, but focusing on the time-averaged occupancy
-ḡ(x) in the Fig. 3 energy bins.
+Monte-Carlo you posted, but focusing on the time-averaged phase-space
+distribution function ḡ(x) in the Fig. 3 energy bins.
 
 Key points:
 - Canonical parameters: P* = 0.005, x_D = 1e4, x_b = 0.2 (Eb = -0.2 v0²)
 - Pericenter-only capture check and pericenter-aligned step truncation
 - Creation–annihilation scheme using j² floors with cloning
 - Time is measured in units of t0 = P*(x=1); ḡ(x) is averaged over t0
-- At the end we normalise ḡ so that ḡ(X=0.225) = 1, matching the paper.
+- The MC measures time-averaged occupancy N(E), which is converted to
+  the phase-space DF g(x) using g(x) ∝ x^{5/2} N(E) for a Kepler potential
+- At the end we normalise ḡ so that ḡ(x_b) = 1 at the boundary bin,
+  matching the paper's normalization.
 
 By default the driver runs with 48 worker processes.
 
@@ -613,9 +616,14 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
     """
     Run many independent time-carrying streams in parallel and accumulate ḡ(x).
 
+    The MC measures time-averaged occupancy N(E), which is converted to the
+    phase-space distribution function g(x) using g(x) ∝ x^{5/2} N(E) for a
+    Kepler potential.
+
     Returns:
-        gbar_norm : ḡ(x) normalised so that ḡ(X=0.225) = 1
-        gbar_raw  : unnormalised ḡ(x) (for diagnostics)
+        gbar_norm : ḡ(x) phase-space DF, normalised so that ḡ(x_b) = 1
+                    at the boundary bin (containing X_BOUND = 0.2)
+        gbar_raw  : unnormalised ḡ(x) before normalization (for diagnostics)
     """
     if floors is None:
         floors = np.array([10.0**(-k) for k in range(0, 9)], dtype=np.float64)  # 1 ... 1e-8
@@ -689,14 +697,40 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
     if t0_total <= 0.0:
         raise RuntimeError("No time accumulated in measurement window; check parameters.")
 
-    # time-averaged occupancy ḡ(x) = (1/t_total) ∫ dt g(x,t)  / Δx
-    gbar_raw = (gtime_total / t0_total) / DX
-
-    # normalise so that first bin (X=0.225) has ḡ=1
-    norm_idx = 0  # X_BINS[0] = 0.225 by construction
-    if gbar_raw[norm_idx] <= 0:
-        raise RuntimeError("gbar_raw[0] <= 0; cannot normalise.")
-    gbar_norm = gbar_raw / gbar_raw[norm_idx]
+    # Convert from time-averaged occupancy N(E) to phase-space DF g(x)
+    # 
+    # The MC accumulates: gtime_total[i] = time-weighted occupancy in bin i
+    # This is proportional to N(E) * Δx, where N(E) is the number of stars per energy.
+    # 
+    # For a Kepler potential: N(E) ∝ x^{-5/2} g(x)
+    # Therefore: g(x) ∝ x^{5/2} N(E)
+    # 
+    # We compute: N_x = gtime_total / t0_total (proportional to N(E) per bin)
+    # Then: g(x) ∝ N_x * x^{5/2}
+    
+    N_x = gtime_total / t0_total  # proportional to N(E) per bin
+    
+    # Convert to g(x) using g(x) ∝ x^{5/2} N(E)
+    # Note: We don't divide by DX here; the Δx factor is absorbed in normalization
+    g_unscaled = N_x * (X_BINS ** 2.5)
+    
+    # Find the normalization bin (the one containing X_BOUND = 0.2)
+    norm_idx = 0
+    for i in range(X_EDGES.size - 1):
+        if X_EDGES[i] <= X_BOUND < X_EDGES[i+1]:
+            norm_idx = i
+            break
+    # If X_BOUND is exactly at the last edge, use the last bin
+    if X_BOUND >= X_EDGES[-1]:
+        norm_idx = X_BINS.size - 1
+    
+    # Normalize so that g(x_b) = 1 at the boundary bin
+    if g_unscaled[norm_idx] <= 0:
+        raise RuntimeError(f"g_unscaled[{norm_idx}] <= 0; cannot normalise.")
+    gbar_norm = g_unscaled / g_unscaled[norm_idx]
+    
+    # Store raw version (before normalization) for diagnostics
+    gbar_raw = g_unscaled.copy()
 
     return gbar_norm, gbar_raw
 
