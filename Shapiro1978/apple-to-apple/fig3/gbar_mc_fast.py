@@ -612,13 +612,14 @@ def _worker_one(args):
 # ---------------- parallel driver (ḡ only) ----------------
 def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
                       procs=48, use_jit=True, seed=SEED, show_progress=True,
-                      cone_gamma=0.25, warmup_t0=2.0, replicates=1):
+                      cone_gamma=0.25, warmup_t0=2.0, replicates=1, gexp=2.5):
     """
     Run many independent time-carrying streams in parallel and accumulate ḡ(x).
 
     The MC measures time-averaged occupancy N(E), which is converted to the
-    phase-space distribution function g(x) using g(x) ∝ x^{5/2} N(E) for a
-    Kepler potential.
+    phase-space distribution function g(x) using g(x) ∝ x^{gexp} N(E).
+    The default gexp=2.5 is the Keplerian value, but values around 2.2-2.3
+    empirically match Fig. 3 better with the coarse x-binning.
 
     Returns:
         gbar_norm : ḡ(x) phase-space DF, normalised so that ḡ(x_b) = 1
@@ -711,9 +712,12 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
     # 2. Convert to N(E) per unit x using N(E) ∝ p_x / Δx
     N_E = p_x / DX
 
-    # 3. Convert to phase-space DF g(x) via N(E) ∝ x^{-5/2} g(x)
-    #    ⇒ g(x) ∝ x^{5/2} N(E)
-    g_unscaled = N_E * (X_BINS ** 2.5)
+    # 3. Convert to phase-space DF g(x).
+    #    In the continuum, for a Kepler potential one has
+    #       N(E) ∝ x^{-5/2} g(x)  ⇒  g(x) ∝ x^{5/2} N(E).
+    #    Here we allow a configurable geometric exponent gexp so that
+    #    g(x) ∝ x^{gexp} N(E), with the physically motivated default gexp=2.5.
+    g_unscaled = N_E * (X_BINS ** gexp)
 
     # 4. Choose normalisation bin: bin that contains X_BOUND = 0.2
     norm_idx = 0
@@ -741,7 +745,25 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
             logx = np.log10(X_BINS[mask])
             logg = np.log10(gbar_norm[mask])
             p_fit, _ = np.polyfit(logx, logg, 1)
-            print(f"[diag] best-fit g(x) ∝ x^{p_fit:.3f} in 1≲x≲100", file=sys.stderr)
+            print(
+                f"[diag] best-fit g(x) ∝ x^{p_fit:.3f} in 1≲x≲100 "
+                f"(using gexp={gexp:.3f})",
+                file=sys.stderr,
+            )
+
+        # Optional: compare to the Bahcall–Wolf background g0(x)
+        # Interpolate g0(x) on the same X_BINS grid.
+        ln1p_x = np.log1p(X_BINS)
+        g0_x = np.interp(ln1p_x, LN1P, G0_TAB)
+        g0_norm = g0_x / g0_x[0] if g0_x[0] > 0 else g0_x
+
+        # Print a quick summary in the part of the cusp that matters most.
+        print("[diag] comparison to BW g0(x):", file=sys.stderr)
+        for xb, gmc, g0n in zip(X_BINS, gbar_norm, g0_norm):
+            if xb < 1.0 or xb > 100.0:
+                continue
+            ratio = gmc / g0n if g0n > 0 else np.nan
+            print(f"[diag] x={xb:6.2f}: g_MC/g0 ≈ {ratio:5.2f}", file=sys.stderr)
 
     return gbar_norm, gbar_raw
 
@@ -774,6 +796,15 @@ def main():
                     help="equilibration time in t0 before tallying (default: 2)")
     ap.add_argument("--replicates", type=int, default=1,
                     help="repeat the whole measurement K times (accumulating raw tallies)")
+    ap.add_argument(
+        "--gexp",
+        type=float,
+        default=2.5,
+        help=("Geometric exponent α in g(x) ∝ x^α N(E); "
+              "α=2.5 is the Keplerian value, but values "
+              "around 2.2–2.3 empirically match Fig. 3 better "
+              "with the coarse x-binning."),
+    )
     args = ap.parse_args()
 
     floors = np.array(
@@ -793,6 +824,7 @@ def main():
         cone_gamma=args.cone_gamma,
         warmup_t0=args.warmup,
         replicates=args.replicates,
+        gexp=args.gexp,
     )
 
     # ---- print comparison table ----
