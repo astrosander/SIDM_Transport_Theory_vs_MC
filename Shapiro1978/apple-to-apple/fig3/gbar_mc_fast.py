@@ -98,9 +98,14 @@ mask = (X_G0 >= X_BOUND) & (X_G0 <= XMAX) & (G0_TAB > 0)
 XG  = X_G0[mask]
 G0  = G0_TAB[mask]
 
-# Build an inverse-CDF w.r.t. x using trapezoidal integration of g0(x)
-cdf_x = np.zeros_like(XG)
-cdf_x[1:] = np.cumsum(0.5*(G0[1:] + G0[:-1])*(XG[1:] - XG[:-1]))
+# Build an inverse CDF with respect to the *number* of stars per unit x.
+# For an isotropic Kepler system, N(x) ∝ x^(-5/2) g0(x).
+# Births at the reservoir should be drawn from N(x), not directly from g0(x).
+weights = G0 * (XG ** (-2.5))      # ∝ N(x)
+cdf_x   = np.zeros_like(XG)
+cdf_x[1:] = np.cumsum(
+    0.5 * (weights[1:] + weights[:-1]) * (XG[1:] - XG[:-1])
+)
 cdf_x /= cdf_x[-1]  # normalise to 1
 
 def sample_x_from_g0(u):
@@ -163,16 +168,17 @@ ZETA2 = np.array([  # ζ*²
 ], dtype=np.float64)
 
 # ---------------- kernels (Numba or pure python) ----------------
-def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False):
+def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False, lc_scale=1.0):
     """Build numba-jitted kernels (or pure-python fallbacks)."""
     nb_njit = (lambda *a, **k: (lambda f: f))
     njit = nb.njit if (use_jit and HAVE_NUMBA) else nb_njit
     fastmath = dict(fastmath=True, nogil=True, cache=True) if (use_jit and HAVE_NUMBA) else {}
 
     @njit(**fastmath)
-    def j_min_of_x(x):
+    def j_min_of_x(x, lc_scale_val):
         v = 2.0*x/X_D - (x/X_D)**2
-        return math.sqrt(v) if v > 0.0 else 0.0
+        jmin = math.sqrt(v) if v > 0.0 else 0.0
+        return lc_scale_val * jmin
 
     @njit(**fastmath)
     def P_of_x(x):  # orbital period P(E) with E=-x
@@ -239,8 +245,8 @@ def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False):
         return e1, e2v, j1v, j2v, z2v
 
     @njit(**fastmath)
-    def pick_n(x, j, e2v, j2v, cone_gamma_val, noloss_flag):
-        jmin = j_min_of_x(x)
+    def pick_n(x, j, e2v, j2v, cone_gamma_val, noloss_flag, lc_scale_val):
+        jmin = j_min_of_x(x, lc_scale_val)
         nmax = 1e30
         
         # (29a) energy rms limit
@@ -307,9 +313,9 @@ def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False):
         return k
 
     @njit(**fastmath)
-    def step_one(x, j, phase, cone_gamma_val, noloss_flag):
+    def step_one(x, j, phase, cone_gamma_val, noloss_flag, x_max, lc_scale_val):
         e1, e2v, j1v, j2v, z2v = bilinear_coeffs(x, j)
-        n_raw = pick_n(x, j, e2v, j2v, cone_gamma_val, noloss_flag)
+        n_raw = pick_n(x, j, e2v, j2v, cone_gamma_val, noloss_flag, lc_scale_val)
 
         # land exactly on next pericenter if we'd cross it
         next_int = math.floor(phase) + 1.0
@@ -324,6 +330,13 @@ def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False):
         x_new = x - dE
         if x_new < 1e-12:
             x_new = 1e-12
+        # In noloss runs, prevent orbits from diffusing to x ≫ X_EDGES[-1].
+        # That regime isn't plotted in Fig. 3 but makes P(x) tiny and dt0
+        # extremely small, which kills performance. Capping here keeps the
+        # dynamics correct over the plotted range while avoiding a runaway
+        # deep cusp.
+        if noloss_flag and x_new > x_max:
+            x_new = x_max
 
         # 2-D RW gate
         use_2d = (j < 0.6) or (math.sqrt(n)*j2v > max(1e-12, j/4.0))
@@ -344,7 +357,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False):
 
         # capture only if we actually hit pericenter on this step (and noloss is disabled)
         captured = False
-        if (not noloss_flag) and crossed_peri and (j_new < j_min_of_x(x_new)):
+        if (not noloss_flag) and crossed_peri and (j_new < j_min_of_x(x_new, lc_scale_val)):
             captured = True
 
         return x_new, j_new, phase, n, captured, crossed_peri
@@ -352,7 +365,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False):
     @njit(**fastmath)
     def run_stream(n_relax, floors, clones_per_split, x_bins, dx,
                    seed, cone_gamma_val, warmup_t0, x_init,
-                   include_clone_gbar=True, use_snapshots=False, noloss=False, use_clones=True):
+                   include_clone_gbar=True, use_snapshots=False, noloss=False, use_clones=True, x_max=1e10, lc_scale_val=1.0):
         """
         Single time-carrying stream + clone tree.
 
@@ -401,7 +414,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False):
         t0_used = 0.0
         while t0_used < warmup_t0:
             x_prev = x
-            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, cone_gamma_val, noloss)
+            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, cone_gamma_val, noloss, x_max, lc_scale_val)
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
 
@@ -437,7 +450,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False):
                         i += 1
                         continue
                     x_c, j_c, ph_c = cx[i], cj[i], cph[i]
-                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, cone_gamma_val, noloss)
+                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, cone_gamma_val, noloss, x_max, lc_scale_val)
                     cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
 
                     if cap_c or (x_c2 < X_BOUND):
@@ -492,7 +505,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False):
 
         while t0_used < n_relax:
             x_prev = x
-            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, cone_gamma_val, noloss)
+            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, cone_gamma_val, noloss, x_max, lc_scale_val)
             
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -562,7 +575,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False):
                         i += 1
                         continue
                     x_c, j_c, ph_c = cx[i], cj[i], cph[i]
-                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, cone_gamma_val, noloss)
+                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, cone_gamma_val, noloss, x_max, lc_scale_val)
                     
                     cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
 
@@ -630,9 +643,9 @@ def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False):
 def _worker_one(args):
     (sid, n_relax, floors, clones_per_split,
      stream_seeds, use_jit, cone_gamma, warmup_t0, u0,
-     include_clone_gbar, use_snapshots, noloss, use_clones) = args
+     include_clone_gbar, use_snapshots, noloss, use_clones, lc_scale) = args
 
-    P_of_x, T0, run_stream = _build_kernels(use_jit=use_jit, cone_gamma=cone_gamma, noloss=noloss)
+    P_of_x, T0, run_stream = _build_kernels(use_jit=use_jit, cone_gamma=cone_gamma, noloss=noloss, lc_scale=lc_scale)
 
     # Sample initial x from BW distribution using stratified u value
     x_init = sample_x_from_g0(u0)
@@ -640,17 +653,17 @@ def _worker_one(args):
     # tiny warmup to pull kernels from cache
     _ = run_stream(1e-6, floors, clones_per_split, X_BINS, DX,
                    int(stream_seeds[sid] ^ 0xABCDEF), cone_gamma, 0.0, x_init,
-                   include_clone_gbar, use_snapshots, noloss, use_clones)
+                   include_clone_gbar, use_snapshots, noloss, use_clones, XMAX, lc_scale)
 
     return run_stream(n_relax, floors, clones_per_split, X_BINS, DX,
                       int(stream_seeds[sid]), cone_gamma, warmup_t0, x_init,
-                      include_clone_gbar, use_snapshots, noloss, use_clones)
+                      include_clone_gbar, use_snapshots, noloss, use_clones, XMAX, lc_scale)
 
 # ---------------- parallel driver (ḡ only) ----------------
 def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
                       procs=48, use_jit=True, seed=SEED, show_progress=True,
                       cone_gamma=0.25, warmup_t0=2.0, replicates=1, gexp=2.5,
-                      include_clone_gbar=True, use_snapshots=False, noloss=False, use_clones=True):
+                      include_clone_gbar=True, use_snapshots=False, noloss=False, use_clones=True, lc_scale=1.0):
     """
     Run many independent time-carrying streams in parallel and accumulate ḡ(x).
 
@@ -705,7 +718,7 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
                     _worker_one,
                     (sid, n_relax, floors, clones_per_split,
                      stream_seeds, use_jit, cone_gamma, warmup_t0, u_strat[sid],
-                     include_clone_gbar, use_snapshots, noloss, use_clones)
+                     include_clone_gbar, use_snapshots, noloss, use_clones, lc_scale)
                 )
                 for sid in range(n_streams)
             ]
@@ -879,6 +892,10 @@ def main():
                     help="Use per-t₀ snapshots for ḡ accumulation (closer to paper's procedure) instead of time-weighted integration.")
     ap.add_argument("--noloss", action="store_true",
                     help="Disable loss-cone capture (for g(x) diagnostics vs BW g0).")
+    ap.add_argument(
+        "--lc_scale", type=float, default=1.0,
+        help="Scale factor for the loss-cone boundary j_min; lc_scale<1 shrinks the cone."
+    )
     args = ap.parse_args()
 
     floors = np.array(
@@ -903,6 +920,7 @@ def main():
         use_snapshots=args.snapshots,
         noloss=args.noloss,
         use_clones=(not args.noloss and not args.gbar_no_clones),
+        lc_scale=args.lc_scale,
     )
 
     # ---- print comparison table ----
