@@ -350,13 +350,14 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
 
     @njit(**fastmath)
     def run_stream(n_relax, floors, clones_per_split, x_bins, dx,
-                   seed, cone_gamma_val, warmup_t0, x_init):
+                   seed, cone_gamma_val, warmup_t0, x_init,
+                   include_clone_gbar=True, use_snapshots=False, noloss=False):
         """
         Single time-carrying stream + clone tree.
 
         Returns:
-            g_time   : time-weighted occupancy per x-bin
-            total_t0 : total t0 elapsed in measurement window
+            g_time   : time-weighted occupancy per x-bin (or snapshot counts if use_snapshots=True)
+            total_t0 : total t0 elapsed in measurement window (or snapshot count if use_snapshots=True)
             crosses  : number of pericenter crossings (diagnostic)
             caps     : number of capture events (diagnostic)
             ccount   : clone pool high-water mark (diagnostic)
@@ -478,19 +479,45 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
         crossings = 0
         caps = 0
         max_ccount = ccount
+        
+        # Snapshot bookkeeping (Patch B)
+        snapshots = 0.0
+        g_snap = np.zeros(x_bins.size, dtype=np.float64)
+        t0_next = 1.0  # next snapshot at integer t0 (first snapshot at t0=1.0)
 
         while t0_used < n_relax:
             x_prev = x
             x, j, phase, n_used, cap, crossed = step_one(x, j, phase, cone_gamma_val)
+            
+            # Patch C: suppress captures if noloss is enabled
+            if noloss:
+                cap = False
+            
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
             total_t0 += dt0
 
-            # time-weighted occupancy at start of step for parent + clones
-            g_time[bin_index(x_prev)] += w * dt0
-            for ii in range(ccount):
-                if cactive[ii]:
-                    g_time[bin_index(cx[ii])] += cw[ii] * dt0
+            # Patch B: snapshot-based accumulation OR time-weighted accumulation
+            if use_snapshots:
+                # Snapshot whenever we cross an integer t0
+                while total_t0 >= t0_next:
+                    # snapshot parent
+                    g_snap[bin_index(x)] += w
+                    # and clones (gated by include_clone_gbar - Patch A)
+                    if include_clone_gbar:
+                        for ii in range(ccount):
+                            if cactive[ii]:
+                                g_snap[bin_index(cx[ii])] += cw[ii]
+                    snapshots += 1.0
+                    t0_next += 1.0
+            else:
+                # time-weighted occupancy at start of step for parent + clones
+                g_time[bin_index(x_prev)] += w * dt0
+                # Patch A: gate clone contribution
+                if include_clone_gbar:
+                    for ii in range(ccount):
+                        if cactive[ii]:
+                            g_time[bin_index(cx[ii])] += cw[ii] * dt0
 
             if crossed:
                 crossings += 1
@@ -534,6 +561,11 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                     continue
                 x_c, j_c, ph_c = cx[i], cj[i], cph[i]
                 x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, cone_gamma_val)
+                
+                # Patch C: suppress captures if noloss is enabled
+                if noloss:
+                    cap_c = False
+                
                 cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
 
                 if crossed_c:
@@ -588,14 +620,19 @@ def _build_kernels(use_jit=True, cone_gamma=0.25):
                                 max_ccount = ccount
                 i += 1
 
-        return g_time, total_t0, crossings, caps, max_ccount
+        # Patch B: return snapshot data if using snapshots
+        if use_snapshots:
+            return g_snap, snapshots, crossings, caps, max_ccount
+        else:
+            return g_time, total_t0, crossings, caps, max_ccount
 
     return P_of_x, T0, run_stream
 
 # ---------------- multiprocessing worker (single stream) ----------------
 def _worker_one(args):
     (sid, n_relax, floors, clones_per_split,
-     stream_seeds, use_jit, cone_gamma, warmup_t0, u0) = args
+     stream_seeds, use_jit, cone_gamma, warmup_t0, u0,
+     include_clone_gbar, use_snapshots, noloss) = args
 
     P_of_x, T0, run_stream = _build_kernels(use_jit=use_jit, cone_gamma=cone_gamma)
 
@@ -604,15 +641,18 @@ def _worker_one(args):
 
     # tiny warmup to pull kernels from cache
     _ = run_stream(1e-6, floors, clones_per_split, X_BINS, DX,
-                   int(stream_seeds[sid] ^ 0xABCDEF), cone_gamma, 0.0, x_init)
+                   int(stream_seeds[sid] ^ 0xABCDEF), cone_gamma, 0.0, x_init,
+                   include_clone_gbar, use_snapshots, noloss)
 
     return run_stream(n_relax, floors, clones_per_split, X_BINS, DX,
-                      int(stream_seeds[sid]), cone_gamma, warmup_t0, x_init)
+                      int(stream_seeds[sid]), cone_gamma, warmup_t0, x_init,
+                      include_clone_gbar, use_snapshots, noloss)
 
 # ---------------- parallel driver (ḡ only) ----------------
 def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
                       procs=48, use_jit=True, seed=SEED, show_progress=True,
-                      cone_gamma=0.25, warmup_t0=2.0, replicates=1, gexp=2.5):
+                      cone_gamma=0.25, warmup_t0=2.0, replicates=1, gexp=2.5,
+                      include_clone_gbar=True, use_snapshots=False, noloss=False):
     """
     Run many independent time-carrying streams in parallel and accumulate ḡ(x).
 
@@ -662,7 +702,8 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
                 ex.submit(
                     _worker_one,
                     (sid, n_relax, floors, clones_per_split,
-                     stream_seeds, use_jit, cone_gamma, warmup_t0, u_strat[sid])
+                     stream_seeds, use_jit, cone_gamma, warmup_t0, u_strat[sid],
+                     include_clone_gbar, use_snapshots, noloss)
                 )
                 for sid in range(n_streams)
             ]
@@ -690,17 +731,25 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
     if show_progress:
         elapsed = time.time() - start_time
         print(f"\nDone in {elapsed:.1f}s", file=sys.stderr)
-        print(f"[diag] total t0 across all streams: {t0_total:.3e}", file=sys.stderr)
+        if use_snapshots:
+            print(f"[diag] total snapshots across all streams: {t0_total:.0f}", file=sys.stderr)
+        else:
+            print(f"[diag] total t0 across all streams: {t0_total:.3e}", file=sys.stderr)
         print(f"[diag] pericenter crossings (total): {peri_total}", file=sys.stderr)
         print(f"[diag] capture events (total):      {caps_total}", file=sys.stderr)
         print(f"[diag] clone pool high-water:       {max_ccount}", file=sys.stderr)
 
     if t0_total <= 0.0:
-        raise RuntimeError("No time accumulated in measurement window; check parameters.")
+        raise RuntimeError("No time/snapshots accumulated in measurement window; check parameters.")
 
     # 1. Time-averaged occupancy probability per bin:
-    #    p_x[i] = Prob{star in bin i at a random time}
-    p_x = gtime_total / t0_total
+    #    p_x[i] = Prob{star in bin i at a random time} (or at snapshot times if use_snapshots)
+    if use_snapshots:
+        if t0_total <= 0:
+            raise RuntimeError("No snapshots taken; check n_relax.")
+        p_x = gtime_total / t0_total
+    else:
+        p_x = gtime_total / t0_total
 
     # Optional diagnostics: should be very close to 1
     if not np.isfinite(p_x).all():
@@ -755,7 +804,15 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
         # Interpolate g0(x) on the same X_BINS grid.
         ln1p_x = np.log1p(X_BINS)
         g0_x = np.interp(ln1p_x, LN1P, G0_TAB)
-        g0_norm = g0_x / g0_x[0] if g0_x[0] > 0 else g0_x
+        # Normalize g0 to match the same normalization bin as gbar_norm
+        g0_norm_idx = 0
+        for i in range(X_EDGES.size - 1):
+            if X_EDGES[i] <= X_BOUND < X_EDGES[i + 1]:
+                g0_norm_idx = i
+                break
+        if X_BOUND >= X_EDGES[-1]:
+            g0_norm_idx = X_BINS.size - 1
+        g0_norm = g0_x / g0_x[g0_norm_idx] if g0_x[g0_norm_idx] > 0 else g0_x
 
         # Print a quick summary in the part of the cusp that matters most.
         print("[diag] comparison to BW g0(x):", file=sys.stderr)
@@ -764,6 +821,15 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
                 continue
             ratio = gmc / g0n if g0n > 0 else np.nan
             print(f"[diag] x={xb:6.2f}: g_MC/g0 ≈ {ratio:5.2f}", file=sys.stderr)
+        
+        # Patch C: special diagnostics for noloss mode
+        if noloss:
+            print("[diag] noloss mode: comparing g_MC to BW g0(x):", file=sys.stderr)
+            for xb, gmc, g0n in zip(X_BINS, gbar_norm, g0_norm):
+                if xb < 0.2 or xb > 100.0:
+                    continue
+                ratio = gmc / g0n if g0n > 0 else np.nan
+                print(f"[diag] noloss: x={xb:6.2g}, g_MC/g0 ≈ {ratio:6.3f}", file=sys.stderr)
 
     return gbar_norm, gbar_raw
 
@@ -805,6 +871,12 @@ def main():
               "around 2.2–2.3 empirically match Fig. 3 better "
               "with the coarse x-binning."),
     )
+    ap.add_argument("--gbar-no-clones", action="store_true",
+                    help="For ḡ(x) diagnostics: accumulate ḡ(x) from the parent stream only (ignore clones).")
+    ap.add_argument("--snapshots", action="store_true",
+                    help="Use per-t₀ snapshots for ḡ accumulation (closer to paper's procedure) instead of time-weighted integration.")
+    ap.add_argument("--noloss", action="store_true",
+                    help="Disable loss-cone capture (for g(x) diagnostics vs BW g0).")
     args = ap.parse_args()
 
     floors = np.array(
@@ -825,6 +897,9 @@ def main():
         warmup_t0=args.warmup,
         replicates=args.replicates,
         gexp=args.gexp,
+        include_clone_gbar=(not args.gbar_no_clones),
+        use_snapshots=args.snapshots,
+        noloss=args.noloss,
     )
 
     # ---- print comparison table ----
