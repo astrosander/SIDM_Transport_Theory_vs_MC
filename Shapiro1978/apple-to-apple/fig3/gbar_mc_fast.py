@@ -98,13 +98,12 @@ mask = (X_G0 >= X_BOUND) & (X_G0 <= XMAX) & (G0_TAB > 0)
 XG  = X_G0[mask]
 G0  = G0_TAB[mask]
 
-# Build an inverse CDF with respect to the *number* of stars per unit x.
-# For an isotropic Kepler system, N(x) ∝ x^(-5/2) g0(x).
-# Births at the reservoir should be drawn from N(x), not directly from g0(x).
-weights = G0 * (XG ** (-2.5))      # ∝ N(x)
+# Build an inverse-CDF w.r.t. x by integrating the *DF* g0(x) itself.
+# This matches the way Shapiro & Marchant test their code against
+# the BW II steady-state solution in the noloss experiment.
 cdf_x   = np.zeros_like(XG)
 cdf_x[1:] = np.cumsum(
-    0.5 * (weights[1:] + weights[:-1]) * (XG[1:] - XG[:-1])
+    0.5*(G0[1:] + G0[:-1])*(XG[1:] - XG[:-1])
 )
 cdf_x /= cdf_x[-1]  # normalise to 1
 
@@ -678,8 +677,11 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
         gbar_raw  : unnormalised ḡ(x) before normalization (for diagnostics)
     """
     # For noloss diagnostics, disable cloning – parent stream is enough
+    # and force gexp to the canonical N↔g exponent so that g_MC can be
+    # compared directly to BW g0(x).
     if noloss:
         use_clones = False
+        gexp = 2.5  # Force canonical exponent for calibration
     
     if floors is None:
         floors = np.array([10.0**(-k) for k in range(0, 9)], dtype=np.float64)  # 1 ... 1e-8
