@@ -697,40 +697,51 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
     if t0_total <= 0.0:
         raise RuntimeError("No time accumulated in measurement window; check parameters.")
 
-    # Convert from time-averaged occupancy N(E) to phase-space DF g(x)
-    # 
-    # The MC accumulates: gtime_total[i] = time-weighted occupancy in bin i
-    # This is proportional to N(E) * Δx, where N(E) is the number of stars per energy.
-    # 
-    # For a Kepler potential: N(E) ∝ x^{-5/2} g(x)
-    # Therefore: g(x) ∝ x^{5/2} N(E)
-    # 
-    # We compute: N_x = gtime_total / t0_total (proportional to N(E) per bin)
-    # Then: g(x) ∝ N_x * x^{5/2}
-    
-    N_x = gtime_total / t0_total  # proportional to N(E) per bin
-    
-    # Convert to g(x) using g(x) ∝ x^{5/2} N(E)
-    # Note: We don't divide by DX here; the Δx factor is absorbed in normalization
-    g_unscaled = N_x * (X_BINS ** 2.5)
-    
-    # Find the normalization bin (the one containing X_BOUND = 0.2)
+    # 1. Time-averaged occupancy probability per bin:
+    #    p_x[i] = Prob{star in bin i at a random time}
+    p_x = gtime_total / t0_total
+
+    # Optional diagnostics: should be very close to 1
+    if not np.isfinite(p_x).all():
+        raise RuntimeError("Non-finite values in p_x.")
+    p_sum = p_x.sum()
+    if abs(p_sum - 1.0) > 1e-3:
+        print(f"[diag] warning: sum p_x = {p_sum:.6f} (expected ~1)", file=sys.stderr)
+
+    # 2. Convert to N(E) per unit x using N(E) ∝ p_x / Δx
+    N_E = p_x / DX
+
+    # 3. Convert to phase-space DF g(x) via N(E) ∝ x^{-5/2} g(x)
+    #    ⇒ g(x) ∝ x^{5/2} N(E)
+    g_unscaled = N_E * (X_BINS ** 2.5)
+
+    # 4. Choose normalisation bin: bin that contains X_BOUND = 0.2
     norm_idx = 0
     for i in range(X_EDGES.size - 1):
-        if X_EDGES[i] <= X_BOUND < X_EDGES[i+1]:
+        if X_EDGES[i] <= X_BOUND < X_EDGES[i + 1]:
             norm_idx = i
             break
     # If X_BOUND is exactly at the last edge, use the last bin
     if X_BOUND >= X_EDGES[-1]:
         norm_idx = X_BINS.size - 1
     
-    # Normalize so that g(x_b) = 1 at the boundary bin
     if g_unscaled[norm_idx] <= 0:
         raise RuntimeError(f"g_unscaled[{norm_idx}] <= 0; cannot normalise.")
+
     gbar_norm = g_unscaled / g_unscaled[norm_idx]
-    
-    # Store raw version (before normalization) for diagnostics
-    gbar_raw = g_unscaled.copy()
+    gbar_raw  = g_unscaled.copy()
+
+    # Diagnostic: print sum of p_x (should be ~1)
+    if show_progress:
+        print(f"[diag] sum p_x = {p_sum:.6f}", file=sys.stderr)
+        
+        # Estimate power-law slope from log g vs log x between x∈[1, 100]
+        mask = (X_BINS >= 1.0) & (X_BINS <= 100.0) & np.isfinite(gbar_norm) & (gbar_norm > 0)
+        if mask.sum() >= 2:
+            logx = np.log10(X_BINS[mask])
+            logg = np.log10(gbar_norm[mask])
+            p_fit, _ = np.polyfit(logx, logg, 1)
+            print(f"[diag] best-fit g(x) ∝ x^{p_fit:.3f} in 1≲x≲100", file=sys.stderr)
 
     return gbar_norm, gbar_raw
 
