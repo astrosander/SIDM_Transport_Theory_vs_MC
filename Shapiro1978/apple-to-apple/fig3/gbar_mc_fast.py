@@ -98,9 +98,11 @@ mask = (X_G0 >= X_BOUND) & (X_G0 <= XMAX) & (G0_TAB > 0)
 XG  = X_G0[mask]
 G0  = G0_TAB[mask]
 
-# Build an inverse-CDF w.r.t. x by integrating the *DF* g0(x) itself.
-# This matches the way Shapiro & Marchant test their code against
-# the BW II steady-state solution in the noloss experiment.
+# Build an inverse-CDF over x for the *field-star distribution function*
+# g0(x) tabulated by Bahcall & Wolf (BW II).
+# In the noloss experiment Shapiro & Marchant start their streams with
+# energies drawn from g0(x) itself (cf. their description of using the
+# 1D BW solution g0(E) as the initial DF).
 cdf_x = np.zeros_like(XG)
 cdf_x[1:] = np.cumsum(
     0.5 * (G0[1:] + G0[:-1]) * (XG[1:] - XG[:-1])
@@ -770,9 +772,14 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
         gexp = 2.5  # Force canonical exponent for calibration
     
     # Set x_max cap to prevent runaway deep diffusion.
-    # We keep all runs (including noloss) within the BW grid.
+    # For noloss calibration runs we only care about matching the BW
+    # solution over 0.2 ≲ x ≲ O(10^2), so a moderate cap is enough and
+    # avoids stars diffusing to x ≫ 10^2 where dt0 becomes microscopic.
     if x_max is None:
-        x_max = XMAX   # Use full BW grid for all runs
+        if noloss:
+            x_max = 300.0  # cap well above the plotted range
+        else:
+            x_max = XMAX   # use full BW grid for canonical runs
     
     if floors is None:
         floors = np.array([10.0**(-k) for k in range(0, 9)], dtype=np.float64)  # 1 ... 1e-8
@@ -928,11 +935,15 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
         # p_MC = time-averaged probability per x-bin from MC (or snapshot fraction)
         p_MC = gtime_total / gtime_total.sum()
 
-        # p_th = theoretical p(x) from g0(x) using N(E) ∝ x^{-5/2} g0(x)
+        # p_th = theoretical p(x_bin) from BW g0(x).
+        # First compute N(x) ∝ x^{-5/2} g0(x) at the bin centres...
         ln1p_x = np.log1p(X_BINS)
         g0_interp = np.interp(ln1p_x, LN1P, G0_TAB)
         N_th = g0_interp * (X_BINS ** (-2.5))
-        p_th = N_th / N_th.sum()
+        # ...then integrate over each bin width Δx to get probability per bin.
+        # This matches what the Monte Carlo histogram measures.
+        p_th = N_th * DX
+        p_th /= p_th.sum()
         
         print("[diag] noloss: direct energy-space comparison p_MC/p_th:", file=sys.stderr)
         for i in range(0, X_BINS.size, max(1, X_BINS.size // 10)):  # Sample ~10 points
