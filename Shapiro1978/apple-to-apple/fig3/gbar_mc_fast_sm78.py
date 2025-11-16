@@ -1,32 +1,44 @@
 #!/usr/bin/env python3
 """
-gbar_mc_fast.py  (Fig. 3 reproduction: ḡ(x) phase-space DF)
+gbar_mc_fast_sm78.py
 
-Canonical 2D MC for a star cluster with a massive central BH, following
-Shapiro–Marchant (1978/79), using the same kernels / rules as the FE*·x
-Monte-Carlo you posted, but focusing on the time-averaged phase-space
-distribution function ḡ(x) in the Fig. 3 energy bins.
+Monte Carlo reproduction of the time–averaged phase–space distribution
+ḡ(x) from Fig. 3 of Shapiro & Marchant (1978), plus a Bahcall–Wolf
+“no–loss–cone” calibration mode.
 
-Key points:
-- Canonical parameters: P* = 0.005, x_D = 1e4, x_b = 0.2 (Eb = -0.2 v0²)
-- Pericenter-only capture check and pericenter-aligned step truncation
-- Creation–annihilation scheme using j² floors with cloning
-- Time is measured in units of t0 = P*(x=1); ḡ(x) is averaged over t0
-- The MC measures time-averaged occupancy N(E), which is converted to
-the phase-space DF g(x) using g(x) ∝ x^{5/2} N(E) for a Kepler potential
-- At the end we normalise ḡ so that ḡ(x_b) = 1 at the boundary bin,
-matching the paper's normalization.
+Key features
+------------
+- 2D (E, J) Monte Carlo with drift and diffusion coefficients from
+  Shapiro–Marchant Table 1 (X_GRID, J_GRID, NEG_E1, E2, J1, J2, ZETA2).
+- Loss cone treated with a pericenter check and j_min(x) from x_D.
+- Creation–annihilation scheme in j² with clones and floors j² = 10^{-k}.
+- Time in units of t0 = P(x=1)/P*, with P* = 0.005 by default.
+- ḡ(x) measured in Shapiro–Marchant’s energy bins and normalised so
+  that ḡ(x_b) = 1 at the outer cusp boundary x_b = 0.2 (E_b = -0.2 v0²).
+- Optional “snapshot” tally mode to mimic their 40 samples per t0
+  averaging procedure.
 
-By default the driver runs with 48 worker processes.
+The default/“canonical” Fig. 3–like run is:
 
-The paper ḡ datapoints from Fig. 3 (your table) are included so you can
-compare MC output directly.
+    python3 gbar_mc_fast_sm78.py \
+        --streams 400 --windows 6 --warmup 2 \
+        --replicates 3 --pstar 0.005 --snapshots
+
+The Bahcall–Wolf “no–loss–cone” diagnostic run is:
+
+    python3 gbar_mc_fast_sm78.py \
+        --streams 200 --windows 10 --warmup 5 \
+        --pstar 0.005 --noloss --gbar-no-clones --gexp 2.5
 """
 
-import math, os, argparse, sys, time
+import argparse
+import math
+import os
+import sys
+import time
 import numpy as np
 
-# -------- try numba ----------
+# -------- numba (optional speedup) --------
 try:
     import numba as nb
     HAVE_NUMBA = True
@@ -34,9 +46,9 @@ except Exception:
     HAVE_NUMBA = False
 
 # ---------------- Canonical parameters ----------------
-X_D    = 1.0e4
-PSTAR  = 0.005
-X_BOUND= 0.2        # Eb = -0.2 v0^2  => x_b = 0.2  (replacement energy)
+X_D    = 1.0e4        # x_D = energy of circular orbit at disruption radius
+PSTAR  = 0.005        # P* parameter
+X_BOUND= 0.2          # outer cusp boundary Eb = -0.2 v0²  => x_b = 0.2
 SEED   = 20251028
 
 # --------- Fig. 3 energy bin centers + geometric edges ----------
@@ -85,6 +97,7 @@ LN1P = np.array([
     3.68, 4.05, 4.42, 4.79, 5.16, 5.53, 5.89, 6.26, 6.63, 7.00,
     7.37, 7.74, 8.11, 8.47, 8.84, 9.21
 ], dtype=np.float64)
+
 G0_TAB = np.array([
     1.00, 1.30, 1.55, 1.79, 2.03, 2.27, 2.53, 2.82, 3.13, 3.48,
     3.88, 4.32, 4.83, 5.43, 6.12, 6.94, 7.93, 9.11, 10.55, 12.29,
@@ -92,35 +105,15 @@ G0_TAB = np.array([
 ], dtype=np.float64)
 
 # Convert ln(1+x) grid -> x grid
-X_G0 = np.expm1(LN1P)              # x >= 0
+X_G0 = np.expm1(LN1P)            # x >= 0
 XMAX = X_EDGES[-1]
 mask = (X_G0 >= X_BOUND) & (X_G0 <= XMAX) & (G0_TAB > 0)
 XG  = X_G0[mask]
 G0  = G0_TAB[mask]
 
 # Build an inverse-CDF over x for the *occupancy*
-#
-# From Shapiro & Marchant (their eqs. 9, 10 and the definition of x):
-#   N(E,J) ∝ J g(E,J) P(E)
-# with P(E) ∝ x^{-3/2} and J_max^2(E) ∝ x^{-1}.
-# After integrating over J we get the isotropized number of stars per
-# unit x:
-#
-#   N_x  ∝ g0(x) P(E) J_max^2(E)
-#        ∝ g0(x) x^{-3/2} x^{-1}
-#        ∝ g0(x) x^{-5/2}.
-#
-# In the original code we accidentally dropped the J_max^2 factor and
-# used weight ∝ g0(x) x^{-3/2}, so that the represented reservoir was
-# biased by
-#
-#   N_MC(x) / N_th(x) ∝ x,
-#
-# which is exactly what shows up in your noloss diagnostic:
-#   p_MC/p_th ≃ const × x^{0.9}.
-#
-# The correct sampling weight must therefore include x^{-5/2}.
-weight = G0 * (XG ** -2.5)   # N_x ∝ g0(x) x^{-5/2}
+# N(x) ∝ x^{-5/2} g0(x) for a Kepler potential.
+weight = G0 * (XG ** -2.5)   # N_x ∝ x^{-5/2} g0(x)
 
 cdf_x = np.zeros_like(XG)
 cdf_x[1:] = np.cumsum(
@@ -145,7 +138,7 @@ J_GRID = np.array([1.000, 0.401, 0.161, 0.065, 0.026], dtype=np.float64)  # desc
 
 NEG_E1 = np.array([
     [ 1.41e-1,  1.40e-1,  1.33e-1,  1.29e-1,  1.29e-1],
-    [-1.47e-3, -4.67e-3, -6.33e-3, -5.52e-3, -4.78e-3],  # Fixed: first entry should be negative
+    [-1.47e-3, -4.67e-3, -6.33e-3, -5.52e-3, -4.78e-3],
     [ 1.96e-3,  1.59e-3,  2.83e-3,  3.38e-3,  3.49e-3],
     [ 3.64e-3,  4.64e-3,  4.93e-3,  4.97e-3,  4.98e-3],
     [ 8.39e-4,  8.53e-4,  8.56e-4,  8.56e-4,  8.56e-4],
@@ -164,7 +157,7 @@ J1 = np.array([
     [-5.03e-3,  5.40e-3,  2.54e-2,  6.95e-2,  1.75e-1],
     [-2.58e-4,  3.94e-4,  1.45e-3,  3.77e-3,  9.45e-3],
     [-4.67e-6,  2.03e-5,  5.99e-5,  1.53e-4,  3.82e-4],
-    [ 3.67e-8,  2.54e-7,  7.09e-7,  1.80e-6,  4.49e-6],  # fixed 2.54e-7
+    [ 3.67e-8,  2.54e-7,  7.09e-7,  1.80e-6,  4.49e-6],
 ], dtype=np.float64)
 
 J2 = np.array([
@@ -172,14 +165,10 @@ J2 = np.array([
     [ 6.71e-2,  9.19e-2,  9.48e-2,  9.53e-2,  9.54e-2],
     [ 1.57e-2,  2.12e-2,  2.20e-2,  2.21e-2,  2.21e-2],
     [ 3.05e-3,  4.25e-3,  4.42e-3,  4.44e-3,  4.45e-3],
-    [ 3.07e-4,  4.59e-4,  4.78e-4,  4.81e-4,  4.82e-4],  # fixed 4.59e-4
+    [ 3.07e-4,  4.59e-4,  4.78e-4,  4.81e-4,  4.82e-4],
 ], dtype=np.float64)
 
-# Verify Table-1 typos are fixed
-assert abs(J1[-1,1] - 2.54e-7) < 1e-12, f"J1[-1,1] should be 2.54e-7, got {J1[-1,1]}"
-assert abs(J2[-1,1] - 4.59e-4) < 1e-12, f"J2[-1,1] should be 4.59e-4, got {J2[-1,1]}"
-
-ZETA2 = np.array([  # ζ*²
+ZETA2 = np.array([
     [1.47e-1, 5.87e-2, 2.40e-2, 9.70e-3, 3.90e-3],
     [2.99e-2, 1.28e-2, 5.22e-3, 2.08e-3, 8.28e-4],
     [1.62e-2, 6.49e-3, 2.54e-3, 1.01e-3, 4.02e-4],
@@ -190,26 +179,30 @@ ZETA2 = np.array([  # ζ*²
 # ---------------- kernels (Numba or pure python) ----------------
 def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
     """Build numba-jitted kernels (or pure-python fallbacks)."""
-    nb_njit = (lambda *a, **k: (lambda f: f))
-    njit = nb.njit if (use_jit and HAVE_NUMBA) else nb_njit
-    fastmath = dict(fastmath=True, nogil=True, cache=True) if (use_jit and HAVE_NUMBA) else {}
+    if use_jit and HAVE_NUMBA:
+        njit = nb.njit
+        fastmath = dict(fastmath=True, nogil=True, cache=True)
+    else:
+        # no-op decorator
+        def njit(*a, **k):
+            def wrap(f):
+                return f
+            return wrap
+        fastmath = {}
 
     @njit(**fastmath)
     def j_min_of_x(x, lc_scale_val, noloss_flag):
         """
         Dimensionless loss-cone boundary j_min(x).
-        In noloss mode (BW II calibration), the loss cone is suppressed:
-        j_min ≡ 0, as described in the paper.
+        In noloss mode, j_min ≡ 0, as in the “no–loss–cone” test.
         """
         if noloss_flag:
             return 0.0
-        
         v = 2.0*x/X_D - (x/X_D)**2
-        jmin = math.sqrt(v) if v > 0.0 else 0.0
-        return lc_scale_val * jmin
+        return lc_scale_val * (math.sqrt(v) if v > 0.0 else 0.0)
 
     @njit(**fastmath)
-    def P_of_x(x):  # orbital period P(E) with E=-x
+    def P_of_x(x):  # orbital period P(E) with E=-x in a Kepler potential
         E = -x
         return 2.0*math.pi/((-2.0*E)**1.5)
 
@@ -217,10 +210,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
 
     @njit(**fastmath)
     def sample_x_from_g0_jit():
-        """
-        Draw x from the BW noloss occupancy N(E) ∝ x^{-5/2} g0(x)
-        using the precomputed (XG, cdf_x) tables.
-        """
+        """Draw x from BW noloss occupancy N(x) ∝ x^{-5/2} g0(x)."""
         u = np.random.random()
         if u <= 0.0:
             return XG[0]
@@ -249,17 +239,21 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
         for i in range(1, X_BINS.size):
             d = abs(X_BINS[i]-x)
             if d < bestd:
-                bestd = d; best = i
+                bestd = d
+                best = i
         return best
 
     @njit(**fastmath)
     def bilinear_coeffs(x, j, pstar_val):
         """
         Paper-faithful bilinear interpolation of Table 1 coefficients.
-        Returns orbital perturbations per radial period P(E) with proper P* scaling.
-        
-        The tables store starred coefficients for canonical P* = 0.005.
-        We scale according to eq. (A8): e1* ∝ P*, e2* ∝ P*^1/2, etc.
+
+        Returns:
+            e1, sigE, j1, sigJ, rho
+
+        where e1, j1 are orbital drifts per radial period P(E), and
+        sigE, sigJ are 1σ diffusion amplitudes per orbit. rho is the
+        correlation coefficient between ΔE and ΔJ.
         """
         # Clamp x to tabulated range
         x_clamp = x
@@ -275,10 +269,13 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
             if X_GRID[k] <= x_clamp <= X_GRID[k+1]:
                 ix = k
                 break
-        x1 = X_GRID[ix]; x2 = X_GRID[ix+1]
+        x1 = X_GRID[ix]
+        x2 = X_GRID[ix+1]
         tx = (lx - math.log10(x1)) / (math.log10(x2) - math.log10(x1) + 1e-30)
-        if tx < 0.0: tx = 0.0
-        if tx > 1.0: tx = 1.0
+        if tx < 0.0:
+            tx = 0.0
+        if tx > 1.0:
+            tx = 1.0
 
         # Clamp j to tabulated range (J_GRID is descending)
         j_clamp = j
@@ -286,17 +283,19 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
             j_clamp = J_GRID[0]
         if j_clamp < J_GRID[-1]:
             j_clamp = J_GRID[-1]
-        
-        # Find j grid index (J_GRID is descending)
+
         ij = 0
         for k in range(J_GRID.size-1):
             if (J_GRID[k] >= j_clamp) and (j_clamp >= J_GRID[k+1]):
                 ij = k
                 break
-        j1 = J_GRID[ij]; j2 = J_GRID[ij+1]
-        tj = (j_clamp - j1) / (j2 - j1 + 1e-30)
-        if tj < 0.0: tj = 0.0
-        if tj > 1.0: tj = 1.0
+        j1g = J_GRID[ij]
+        j2g = J_GRID[ij+1]
+        tj = (j_clamp - j1g) / (j2g - j1g + 1e-30)
+        if tj < 0.0:
+            tj = 0.0
+        if tj > 1.0:
+            tj = 1.0
 
         # Bilinear interpolation helper
         def get(A):
@@ -306,58 +305,57 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
             a2 = a21*(1.0-tj) + a22*tj
             return a1*(1.0-tx) + a2*tx
 
-        # Get starred coefficients from Table 1 (canonical P* = 0.005)
         PSTAR_CANON = 0.005
-        # Table 1 column is "-ε1*", so flip the sign to get ε1*
-        h_star = get(NEG_E1)  # table stores h* = -e1*
-        
-        # Table 1 gives the *second moments* per orbit:
-        #   E2 = <(Δx)^2>,  J2 = <(Δj)^2>,  ZETA2 = <Δx Δj>
-        E2_star = max(get(E2), 0.0)    # <(Δx*)^2>
-        J2_star = max(get(J2), 0.0)    # <(Δj*)^2>
-        j1_star = get(J1)
-        covEJ_star = get(ZETA2)        # <Δx* Δj*>
+
+        # Table 1 column NEG_E1 stores h*; from Appendix A,
+        # e1* = -h* v0^2.  We work in units where v0^2 = 1, so:
+        h_star = get(NEG_E1)
+        e1_star = -h_star
+
+        # Second moments per orbit
+        E2_star = max(get(E2), 0.0)      # <(Δx*)^2>
+        J2_star = max(get(J2), 0.0)      # <(Δj*)^2>
+        j1_star = get(J1)                # drift in j*
+        covEJ_star = get(ZETA2)          # <Δx* Δj*>
 
         # Scale away from canonical P* (eq. A8)
         scale = pstar_val / PSTAR_CANON
-        h_star *= scale           # h* ∝ P* (since h* = -e1*)
-        E2_star *= scale          # <(Δx*)^2> ∝ P*
-        j1_star *= scale          # j1* ∝ P*
-        J2_star *= scale          # <(Δj*)^2> ∝ P*
-        covEJ_star *= scale       # <Δx* Δj*> ∝ P* (since both scale as √P*)
+        e1_star      *= scale            # e1* ∝ P*
+        E2_star      *= scale            # <(Δx*)^2> ∝ P*
+        j1_star      *= scale            # j1* ∝ P*
+        J2_star      *= scale            # <(Δj*)^2> ∝ P*
+        covEJ_star   *= scale            # <Δx* Δj*> ∝ P*
 
-        # Convert to physical perturbations per orbit (v0^2 = 1, Jmax = 1/sqrt(2x))
+        # Convert to physical units (v0^2 = 1, Jmax = 1/sqrt(2x))
         v0_sq = 1.0
         Jmax = 1.0 / math.sqrt(2.0 * x_clamp)
 
-        e1 = -h_star * v0_sq                    # drift in energy
-        sigE_star = math.sqrt(max(E2_star, 0.0))  # σ_E* = √<(Δx*)^2>
-        sigE = sigE_star * v0_sq                 # physical σ_E
-        
-        j1 = j1_star * Jmax                      # drift in angular momentum
-        sigJ_star = math.sqrt(max(J2_star, 0.0))  # σ_J* = √<(Δj*)^2>
-        sigJ = sigJ_star * Jmax                  # physical σ_J
-        
-        # Covariance in physical units
+        e1 = e1_star * v0_sq
+        sigE = math.sqrt(max(E2_star, 0.0)) * v0_sq
+
+        j1 = j1_star * Jmax
+        sigJ = math.sqrt(max(J2_star, 0.0)) * Jmax
+
         covEJ = covEJ_star * v0_sq * Jmax
-        
-        # Correlation coefficient ρ defined by
-        #   <Δx Δj> = ρ σ_E σ_J n  ⇒  ρ = covEJ / (σ_E σ_J)
+
+        # Correlation coefficient
         if sigE > 0.0 and sigJ > 0.0:
             rho = covEJ / (sigE * sigJ)
-            rho = max(-0.999, min(0.999, rho))
+            if rho > 0.999:
+                rho = 0.999
+            if rho < -0.999:
+                rho = -0.999
         else:
             rho = 0.0
 
-        # Return drift and 1σ amplitudes; these are what eqs. (27, 29) use.
         return e1, sigE, j1, sigJ, rho
 
     @njit(**fastmath)
-    def pick_n(x, j, sigE, sigJ, lc_scale_val, noloss_flag, cone_gamma_val, n_min=0.01, n_max=3.0e4):
+    def pick_n(x, j, sigE, sigJ, lc_scale_val, noloss_flag, cone_gamma_val,
+               n_min=0.01, n_max=3.0e4):
         """
         Equation (29): choose n so that each step is a small perturbation.
-        Paper-faithful implementation matching equations 29a-d exactly.
-        sigE and sigJ are the 1σ diffusion amplitudes (standard deviations).
+        sigE and sigJ are 1σ diffusion amplitudes per orbit.
         """
         jmin = j_min_of_x(x, lc_scale_val, noloss_flag)
         E = -x
@@ -384,34 +382,39 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
             n_J_top = n_max
 
         # (29d) limit diffusion into / out of the loss cone
-        # In noloss mode, cone_gamma_val = 0.0 (no LC forcing), but we still
-        # enforce the floor to prevent large steps across the LC region.
         if noloss_flag or jmin <= 0.0 or sigJ == 0.0:
             n_J_lc = n_max
         else:
             Jmin = jmin * Jmax
-            gap = cone_gamma_val * abs(J - Jmin)  # gap = 0 in noloss mode
+            gap = cone_gamma_val * abs(J - Jmin)
             floor = max(gap, 0.10 * Jmin)
             n_J_lc = (floor / sigJ)**2
 
-        n = min(n_E, n_J_iso, n_J_top, n_J_lc, n_max)
-        return max(n_min, n)
+        n = n_E
+        if n_J_iso < n:
+            n = n_J_iso
+        if n_J_top < n:
+            n = n_J_top
+        if n_J_lc < n:
+            n = n_J_lc
+        if n < n_min:
+            n = n_min
+        if n > n_max:
+            n = n_max
+        return n
 
     @njit(**fastmath)
     def correlated_normals(rho, sigE, sigJ):
         """
-        Build correlated Gaussian increments such that <ΔEΔJ> = n ρ σ_E σ_J.
-        Returns (y1, y2) where y1 and y2 are correlated standard normals,
-        to be multiplied by sigE and sigJ respectively.
+        Correlated Gaussians so that <ΔE ΔJ> = n ρ σ_E σ_J.
+        Returns y1, y2 ~ N(0,1) with corr(y1,y2)=ρ.
         """
         z1 = np.random.normal()
         z2 = np.random.normal()
-        
         if abs(rho) < 0.999999:
             y1 = z1
             y2 = rho * z1 + math.sqrt(max(0.0, 1.0 - rho*rho)) * z2
         else:
-            # fall back to uncorrelated steps if rho is at limit
             y1 = z1
             y2 = z2
         return y1, y2
@@ -428,94 +431,88 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
 
     @njit(**fastmath)
     def target_floor_with_hysteresis(j2, floors, current_idx, split_hyst=0.8):
-        # Return the target floor index with hysteresis: only advance if j2 is comfortably
-        # inside the next floor (j2 < split_hyst * floor_value)
-        # This reduces split/unsplit churn at floor boundaries
+        # Return the target floor index with hysteresis: only advance if
+        # j2 is comfortably inside the next floor (j2 < split_hyst * floor_value)
         k = current_idx
         while (k + 1) < floors.size and j2 < split_hyst * floors[k + 1]:
             k += 1
         return k
 
     @njit(**fastmath)
-    def step_one(x, j, phase, pstar_val, noloss_flag, x_max, lc_scale_val, cone_gamma_val):
+    def step_one(x, j, phase, pstar_val, noloss_flag, x_max,
+                 lc_scale_val, cone_gamma_val):
         """
-        Paper-faithful random walk step matching equations (27) and Appendix B.
+        One random–walk step in (E,J) matching eqs. (27) and Appendix B.
+
         Returns (x_new, j_new, phase_new, n_used, captured, crossed_peri).
         """
-        # Get orbital coefficients with proper P* scaling
-        # Returns: e1 (drift), sigE (1σ energy diffusion), j1 (drift), sigJ (1σ angular momentum diffusion), rho (correlation)
+        # drift & diffusion coeffs per orbit
         e1, sigE, j1, sigJ, rho = bilinear_coeffs(x, j, pstar_val)
-        
-        # Choose step size n (fraction of an orbit)
+
+        # pick step fraction n of an orbit
         n_raw = pick_n(x, j, sigE, sigJ, lc_scale_val, noloss_flag, cone_gamma_val)
 
-        # Land exactly on next pericenter if we'd cross it
+        # enforce pericenter alignment
         next_int = math.floor(phase) + 1.0
         crossed_peri = (phase + n_raw >= next_int)
         n = next_int - phase if crossed_peri else n_raw
 
-        # Correlated Gaussian increments
+        # correlated Gaussian increments
         y1, y2 = correlated_normals(rho, sigE, sigJ)
 
-        # Energy update: E = -x, so dE updates E, then x_new = -E_new
+        # energies
         E = -x
         Jmax = 1.0 / math.sqrt(2.0 * x)
         J = j * Jmax
 
-        # Equation (27): ΔE = n e1 + sqrt(n) σ_E y1
+        # energy update (eq. 27a)
         deltaE = n * e1 + math.sqrt(n) * sigE * y1
         E_new = E + deltaE
         if E_new >= -1e-6:
             E_new = -1e-6  # keep bound
         x_new = -E_new
 
-        # Deep-cusp sink at x > x_max ≈ x_D:
-        # treat this as immediate capture; the caller will recycle the star.
-        captured_deep = False
+        # optional hard cap (no capture; just prevents ridiculous x)
         if x_new > x_max:
-            captured_deep = True
             x_new = x_max
             E_new = -x_new
 
-        # Angular momentum update: eq. (27b) or (28)
-        # 2-D RW gate: eq. (28)
-        # Use the 2D isotropic random walk in J-space whenever
-        # sqrt(n) * sigJ exceeds j/4. In that case, the cross-correlation is
-        # neglected (as stated in the paper).
+        # angular momentum update
+        Jmax_new = 1.0 / math.sqrt(2.0 * x_new)
+
+        # 2D random walk gate (eq. 28)
         use_2d = (math.sqrt(n) * sigJ > j / 4.0)
 
-        Jmax_new = 1.0 / math.sqrt(2.0 * x_new)
-        
         if use_2d:
-            # 2D isotropic random walk in physical J-space (eq. 28)
+            # 2D isotropic RW in J-space
             z1 = np.random.normal()
             z2 = np.random.normal()
             J_new = math.sqrt(
-                (J + math.sqrt(n) * z1 * sigJ)**2 +
-                (math.sqrt(n) * z2 * sigJ)**2
+                (J + math.sqrt(n) * sigJ * z1)**2 +
+                (math.sqrt(n) * sigJ * z2)**2
             )
         else:
-            # 1D update with correlated noise (eq. 27b)
-            # ΔJ = n j1 + sqrt(n) σ_J y2
+            # 1D update (eq. 27b)
             J_new = J + n * j1 + math.sqrt(n) * sigJ * y2
 
-        # Reflect at J=0 and J=Jmax (Appendix B)
+        # reflecting boundaries in J
         if J_new < 0.0:
             J_new = -J_new
         if J_new > Jmax_new:
             J_new = 2.0 * Jmax_new - J_new
-            J_new = max(0.0, min(J_new, Jmax_new))
+            if J_new < 0.0:
+                J_new = 0.0
+            if J_new > Jmax_new:
+                J_new = Jmax_new
 
         j_new = J_new / Jmax_new
 
-        # Phase advance
+        # phase advance
         phase_new = phase + n
 
-        # Capture check:
-        #  (i) deep-energy sink at x_max (always active), and
-        #  (ii) loss-cone capture at pericenter (disabled in noloss runs).
-        captured = captured_deep
-        if (not noloss_flag) and (not captured) and crossed_peri:
+        # capture check (only via loss cone, and only when crossing pericenter)
+        captured = False
+        if (not noloss_flag) and crossed_peri:
             j_min_new = j_min_of_x(x_new, lc_scale_val, noloss_flag)
             if j_new < j_min_new:
                 captured = True
@@ -524,21 +521,23 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
 
     @njit(**fastmath)
     def run_stream(n_relax, floors, clones_per_split, x_bins, dx,
-                seed, pstar_val, warmup_t0, x_init,
-                include_clone_gbar=True, use_snapshots=False, noloss=False, use_clones=True, x_max=1e10, lc_scale_val=1.0, cone_gamma_val=0.25):
+                   seed, pstar_val, warmup_t0, x_init,
+                   include_clone_gbar=True, use_snapshots=False,
+                   noloss=False, use_clones=True,
+                   x_max=1e10, lc_scale_val=1.0, cone_gamma_val=0.25):
         """
         Single time-carrying stream + clone tree.
 
         Returns:
-            g_time   : time-weighted occupancy per x-bin (or snapshot counts if use_snapshots=True)
-            total_t0 : total t0 elapsed in measurement window (or snapshot count if use_snapshots=True)
-            crosses  : number of pericenter crossings (diagnostic)
-            caps     : number of capture events (diagnostic)
-            ccount   : clone pool high-water mark (diagnostic)
+            g_time   : time-weighted occupancy per x-bin (or snapshot counts)
+            total_t0 : total t0 elapsed in measurement window (or #snapshots)
+            crosses  : number of pericenter crossings
+            caps     : number of capture events
+            ccount   : clone pool high-water mark
         """
         np.random.seed(seed)
-        SPLIT_HYST = 0.8  # split only when comfortably inside next floor (80% threshold)
-        noloss_flag = noloss  # local flag for use in conditionals
+        SPLIT_HYST = 0.8
+        noloss_flag = noloss
 
         # parent (time carrier) – initialise from BW distribution
         x = x_init
@@ -547,7 +546,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
         w = 1.0  # statistical weight
         parent_floor_idx = floor_index_for_j2(j*j, floors)  # -1 if above floors[0]
 
-        # clone pool (use floor indices, not floor values) - disabled if use_clones=False
+        # clone pool (disabled if use_clones=False)
         if use_clones:
             MAX_CLONES = 2048
         else:
@@ -560,7 +559,6 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
         cactive = np.zeros(MAX_CLONES, dtype=np.uint8)
         ccount = 0
 
-        # small helper
         def bin_index(xv):
             b = 0
             bestd = abs(x_bins[0]-xv)
@@ -571,28 +569,30 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
                     b = bi
             return b
 
-        # ---------- (1) warm-up: evolve, recycle, split — do NOT tally ----------
+        # ---------- warm-up (no tally) ----------
         t0_used = 0.0
         while t0_used < warmup_t0:
             x_prev = x
-            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, pstar_val, noloss, x_max, lc_scale_val, cone_gamma_val)
+            x, j, phase, n_used, cap, crossed = step_one(
+                x, j, phase, pstar_val, noloss, x_max, lc_scale_val, cone_gamma_val
+            )
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
 
-            # capture or escape -> replace from reservoir
+            # capture or escape -> replace
             if cap or (x < X_BOUND):
                 if noloss_flag:
-                    # In noloss calibration, recycle from BW occupancy
                     x = sample_x_from_g0_jit()
                 else:
-                    # Canonical runs: put star back at x_b
                     x = X_BOUND
                 j = math.sqrt(np.random.random())
                 parent_floor_idx = floor_index_for_j2(j * j, floors)
             elif use_clones:
-                # splitting for parent: only when entering a new deeper floor (with hysteresis)
+                # splitting for parent after we know it's still present
                 j2_now = j*j
-                target_idx = target_floor_with_hysteresis(j2_now, floors, parent_floor_idx, SPLIT_HYST)
+                target_idx = target_floor_with_hysteresis(
+                    j2_now, floors, parent_floor_idx, SPLIT_HYST
+                )
                 while parent_floor_idx < target_idx:
                     parent_floor_idx += 1  # new deeper floor
                     if ccount <= MAX_CLONES - clones_per_split:
@@ -608,19 +608,23 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
                             cactive[ccount] = 1
                             ccount += 1
 
-            # evolve clones during warm-up (no tallies) - only if use_clones
+            # evolve clones (warmup; no tallies)
             if use_clones:
                 i = 0
                 while i < ccount:
                     if cactive[i] == 0:
                         i += 1
                         continue
+
                     x_c, j_c, ph_c = cx[i], cj[i], cph[i]
-                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, pstar_val, noloss, x_max, lc_scale_val, cone_gamma_val)
+                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(
+                        x_c, j_c, ph_c, pstar_val, noloss_flag,
+                        x_max, lc_scale_val, cone_gamma_val
+                    )
                     cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
 
+                    # replacement for clones
                     if cap_c or (x_c2 < X_BOUND):
-                        # recycle clone at reservoir
                         if noloss_flag:
                             cx[i] = sample_x_from_g0_jit()
                         else:
@@ -632,7 +636,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
                         i += 1
                         continue
 
-                    # outward across its own floor → remove clone (return weight to parent)
+                    # outward across its own floor -> remove clone, return weight
                     if cfloor_idx[i] >= 0 and j_c2*j_c2 >= floors[cfloor_idx[i]]:
                         w += cw[i]
                         cw[i] = 0.0
@@ -642,7 +646,9 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
 
                     # deeper splitting for clone
                     j2_c = j_c2 * j_c2
-                    target_idx_c = target_floor_with_hysteresis(j2_c, floors, cfloor_idx[i], SPLIT_HYST)
+                    target_idx_c = target_floor_with_hysteresis(
+                        j2_c, floors, cfloor_idx[i], SPLIT_HYST
+                    )
                     while cfloor_idx[i] < target_idx_c:
                         cfloor_idx[i] += 1
                         if ccount <= MAX_CLONES - clones_per_split:
@@ -659,34 +665,35 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
                                 ccount += 1
                     i += 1
 
-        # ---------- (2) zero tallies; measurement window ----------
+        # ---------- measurement window ----------
         g_time = np.zeros(x_bins.size, dtype=np.float64)
         t0_used = 0.0
         total_t0 = 0.0
         crossings = 0
         caps = 0
         max_ccount = ccount
-        
-        # Snapshot bookkeeping (Patch B)
+
         snapshots = 0.0
         g_snap = np.zeros(x_bins.size, dtype=np.float64)
-        t0_next = 1.0  # next snapshot at integer t0 (first snapshot at t0=1.0)
+        t0_next = 1.0  # next snapshot at integer t0
 
         while t0_used < n_relax:
             x_prev = x
-            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, pstar_val, noloss, x_max, lc_scale_val, cone_gamma_val)
-            
+            x, j, phase, n_used, cap, crossed = step_one(
+                x, j, phase, pstar_val, noloss_flag,
+                x_max, lc_scale_val, cone_gamma_val
+            )
+
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
             total_t0 += dt0
 
-            # Patch B: snapshot-based accumulation OR time-weighted accumulation
             if use_snapshots:
-                # Snapshot whenever we cross an integer t0
+                # snapshot whenever total_t0 crosses integer t0
                 while total_t0 >= t0_next:
-                    # snapshot parent
+                    # parent
                     g_snap[bin_index(x)] += w
-                    # and clones (gated by use_clones and include_clone_gbar - Patch A)
+                    # clones
                     if use_clones and include_clone_gbar:
                         for ii in range(ccount):
                             if cactive[ii]:
@@ -694,9 +701,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
                     snapshots += 1.0
                     t0_next += 1.0
             else:
-                # time-weighted occupancy at start of step for parent + clones
+                # time-weighted occupancy at start of step
                 g_time[bin_index(x_prev)] += w * dt0
-                # Patch A: gate clone contribution (only if use_clones is enabled)
                 if use_clones and include_clone_gbar:
                     for ii in range(ccount):
                         if cactive[ii]:
@@ -723,9 +729,10 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
                 j = math.sqrt(np.random.random())
                 parent_floor_idx = floor_index_for_j2(j * j, floors)
             elif use_clones:
-                # splitting after we know we weren't captured / escaped
                 j2_now = j*j
-                target_idx = target_floor_with_hysteresis(j2_now, floors, parent_floor_idx, SPLIT_HYST)
+                target_idx = target_floor_with_hysteresis(
+                    j2_now, floors, parent_floor_idx, SPLIT_HYST
+                )
                 while parent_floor_idx < target_idx:
                     parent_floor_idx += 1
                     if ccount <= MAX_CLONES - clones_per_split:
@@ -743,22 +750,24 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
                             if ccount > max_ccount:
                                 max_ccount = ccount
 
-            # evolve all active clones (sharing the same time variable; do NOT add to t0_used again) - only if use_clones
+            # evolve clones without advancing t0_used
             if use_clones:
                 i = 0
                 while i < ccount:
                     if cactive[i] == 0:
                         i += 1
                         continue
+
                     x_c, j_c, ph_c = cx[i], cj[i], cph[i]
-                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, pstar_val, noloss, x_max, lc_scale_val, cone_gamma_val)
-                    
+                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(
+                        x_c, j_c, ph_c, pstar_val, noloss_flag,
+                        x_max, lc_scale_val, cone_gamma_val
+                    )
                     cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
 
                     if crossed_c:
                         crossings += 1
 
-                    # capture first
                     if cap_c:
                         caps += 1
                         if noloss_flag:
@@ -774,7 +783,6 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
                         i += 1
                         continue
 
-                    # escape replacement
                     if x_c2 < X_BOUND:
                         if noloss_flag:
                             x_c2 = sample_x_from_g0_jit()
@@ -784,7 +792,6 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
                         cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
                         cfloor_idx[i] = floor_index_for_j2(j_c2 * j_c2, floors)
 
-                    # outward crossing of its own floor → annihilate clone, return weight
                     if cfloor_idx[i] >= 0 and j_c2*j_c2 >= floors[cfloor_idx[i]]:
                         w += cw[i]
                         cw[i] = 0.0
@@ -792,9 +799,10 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
                         i += 1
                         continue
 
-                    # deeper splitting
                     j2_c = j_c2 * j_c2
-                    target_idx_c = target_floor_with_hysteresis(j2_c, floors, cfloor_idx[i], SPLIT_HYST)
+                    target_idx_c = target_floor_with_hysteresis(
+                        j2_c, floors, cfloor_idx[i], SPLIT_HYST
+                    )
                     while cfloor_idx[i] < target_idx_c:
                         cfloor_idx[i] += 1
                         if ccount <= MAX_CLONES - clones_per_split:
@@ -813,7 +821,6 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
                                     max_ccount = ccount
                     i += 1
 
-        # Patch B: return snapshot data if using snapshots
         if use_snapshots:
             return g_snap, snapshots, crossings, caps, max_ccount
         else:
@@ -825,57 +832,56 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
 def _worker_one(args):
     (sid, n_relax, floors, clones_per_split,
      stream_seeds, use_jit, pstar_val, warmup_t0, u0,
-     include_clone_gbar, use_snapshots, noloss, use_clones, lc_scale, x_max, cone_gamma) = args
+     include_clone_gbar, use_snapshots, noloss,
+     use_clones, lc_scale, x_max, cone_gamma) = args
 
-    P_of_x, T0, run_stream, sample_x_from_g0_jit = _build_kernels(use_jit=use_jit, noloss=noloss, lc_scale=lc_scale)
+    P_of_x, T0, run_stream, sample_x_from_g0_jit = _build_kernels(
+        use_jit=use_jit, noloss=noloss, lc_scale=lc_scale
+    )
 
-    # Sample initial x from BW distribution using stratified u value
+    # Sample initial x from BW distribution using stratified u
     x_init = sample_x_from_g0(u0)
 
     # tiny warmup to pull kernels from cache
     _ = run_stream(1e-6, floors, clones_per_split, X_BINS, DX,
                    int(stream_seeds[sid] ^ 0xABCDEF), pstar_val, 0.0, x_init,
-                   include_clone_gbar, use_snapshots, noloss, use_clones, x_max, lc_scale, cone_gamma)
+                   include_clone_gbar, use_snapshots, noloss,
+                   use_clones, x_max, lc_scale, cone_gamma)
 
     return run_stream(n_relax, floors, clones_per_split, X_BINS, DX,
                       int(stream_seeds[sid]), pstar_val, warmup_t0, x_init,
-                      include_clone_gbar, use_snapshots, noloss, use_clones, x_max, lc_scale, cone_gamma)
+                      include_clone_gbar, use_snapshots, noloss,
+                      use_clones, x_max, lc_scale, cone_gamma)
 
 # ---------------- parallel driver (ḡ only) ----------------
 def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
-                    procs=48, use_jit=True, seed=SEED, show_progress=True,
-                    pstar=PSTAR, warmup_t0=2.0, replicates=1, gexp=2.5,
-                    include_clone_gbar=True, use_snapshots=False, noloss=False, use_clones=True, lc_scale=1.0, x_max=None, cone_gamma=0.25):
+                      procs=48, use_jit=True, seed=SEED, show_progress=True,
+                      pstar=PSTAR, warmup_t0=2.0, replicates=1, gexp=2.5,
+                      include_clone_gbar=True, use_snapshots=False,
+                      noloss=False, use_clones=True, lc_scale=1.0,
+                      x_max=None, cone_gamma=0.25):
     """
     Run many independent time-carrying streams in parallel and accumulate ḡ(x).
 
     The MC measures time-averaged occupancy N(E), which is converted to the
     phase-space distribution function g(x) using g(x) ∝ x^{gexp} N(E).
-    The default gexp=2.5 is the Keplerian value, but values around 2.2-2.3
-    empirically match Fig. 3 better with the coarse x-binning.
-
-    Returns:
-        gbar_norm : ḡ(x) phase-space DF, normalised so that ḡ(x_b) = 1
-                    at the boundary bin (containing X_BOUND = 0.2)
-        gbar_raw  : unnormalised ḡ(x) before normalization (for diagnostics)
+    For a Kepler potential, gexp = 2.5 is the canonical exponent.
     """
-    # For noloss diagnostics, disable cloning – parent stream is enough
-    # and force gexp to the canonical N↔g exponent so that g_MC can be
-    # compared directly to BW g0(x).
+    # noloss mode: diagnostic vs BW g0(x)
     if noloss:
         use_clones = False
-        gexp = 2.5  # Bahcall–Wolf II test uses the standard g(x) exponent
-        # Eq. (29d) with ε_min = 0: turn off loss-cone forcing in the noloss run.
-        cone_gamma = 0.0
+        gexp = 2.5
+        cone_gamma = 0.0   # no LC forcing in step-size rule
 
-    # Inner energy sink at x_max ≈ x_D:
-    # stars that diffuse to x > x_max are removed and re-injected from
-    # the outer reservoir, as in the FP/BW inner boundary.
+    # default x_max
     if x_max is None:
-        x_max = X_D
-    
+        if noloss:
+            x_max = 300.0
+        else:
+            x_max = X_EDGES[-1]
+
     if floors is None:
-        floors = np.array([10.0**(-k) for k in range(0, 9)], dtype=np.float64)  # 1 ... 1e-8
+        floors = np.array([10.0**(-k) for k in range(0, 9)], dtype=np.float64)
     else:
         floors = np.array(floors, dtype=np.float64)
 
@@ -889,8 +895,11 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
     if show_progress:
         start_time = time.time()
         tot_expected = replicates * n_streams
-        print(f"Running gbar MC with {n_streams} streams × {replicates} replicates "
-            f"on {procs} processes...", file=sys.stderr)
+        print(
+            f"Running gbar MC with {n_streams} streams × {replicates} replicates "
+            f"on {procs} processes...",
+            file=sys.stderr,
+        )
 
     gtime_total = np.zeros_like(X_BINS, dtype=np.float64)
     t0_total    = 0.0
@@ -909,9 +918,10 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
             futs = [
                 ex.submit(
                     _worker_one,
-                (sid, n_relax, floors, clones_per_split,
-                    stream_seeds, use_jit, pstar, warmup_t0, u_strat[sid],
-                    include_clone_gbar, use_snapshots, noloss, use_clones, lc_scale, x_max, cone_gamma)
+                    (sid, n_relax, floors, clones_per_split,
+                     stream_seeds, use_jit, pstar, warmup_t0, u_strat[sid],
+                     include_clone_gbar, use_snapshots,
+                     noloss, use_clones, lc_scale, x_max, cone_gamma)
                 )
                 for sid in range(n_streams)
             ]
@@ -950,31 +960,23 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
     if t0_total <= 0.0:
         raise RuntimeError("No time/snapshots accumulated in measurement window; check parameters.")
 
-    # Build ḡ(x) from occupancy histogram.
-    # First, compute N_x (occupancy per unit x) from either time-weighted or snapshot data.
-    # Then convert to g(x) using g(x) ∝ N_x * x^gexp.
+    # Build N_x from tallies
     if use_snapshots:
-        # Snapshot mode: N_x = (sum of weights per bin) / (# snapshots * Δx)
-        if t0_total <= 0:
-            raise RuntimeError("No snapshots taken; check n_relax.")
-        n_snaps = t0_total  # t0_total contains snapshot count in snapshot mode
+        # N_x = (sum weights per bin) / (# snapshots * Δx)
+        n_snaps = t0_total  # t0_total stores #snapshots in snapshot mode
         N_x = gtime_total / (n_snaps * DX)
     else:
-        # Time-weighted mode: N_x = (time-weighted occupancy) / (total t₀ * Δx)
-        # p_x = fractional time in each bin
+        # time-weighted: p_x = Δt / t0_total; N_x = p_x / Δx
         p_x = gtime_total / t0_total
-        if not np.isfinite(p_x).all():
-            raise RuntimeError("Non-finite values in p_x.")
         p_sum = p_x.sum()
-        if abs(p_sum - 1.0) > 1e-3:
+        if show_progress and abs(p_sum - 1.0) > 1e-3:
             print(f"[diag] warning: sum p_x = {p_sum:.6f} (expected ~1)", file=sys.stderr)
         N_x = p_x / DX
 
-    # Convert N_x to the paper's 1D g(x) using g(x) ∝ N_x * x^gexp
-    # For a Kepler potential, gexp ≈ 2.5 is the canonical value
+    # Convert to g(x) using g(x) ∝ N_x x^{gexp}
     g_unscaled = N_x * (X_BINS ** gexp)
 
-    # Normalize at the boundary bin (X_BINS[0] ≈ 0.225 by construction)
+    # Normalise at outer boundary bin (X_BINS[0] ≈ 0.225)
     norm_idx = 0
     if g_unscaled[norm_idx] <= 0:
         raise RuntimeError(f"g_unscaled[{norm_idx}] <= 0; cannot normalise.")
@@ -982,14 +984,13 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
     gbar_norm = g_unscaled / g_unscaled[norm_idx]
     gbar_raw  = g_unscaled.copy()
 
-    # Diagnostic: print sum of p_x (should be ~1 for time-weighted mode)
+    # diagnostics
     if show_progress:
-        if not use_snapshots:
-            print(f"[diag] sum p_x = {p_sum:.6f}", file=sys.stderr)
-        else:
+        if use_snapshots:
             print(f"[diag] total snapshots = {t0_total:.0f}", file=sys.stderr)
-        
-        # Estimate power-law slope from log g vs log x between x∈[1, 100]
+        else:
+            print(f"[diag] sum p_x = {p_x.sum():.6f}", file=sys.stderr)
+
         mask = (X_BINS >= 1.0) & (X_BINS <= 100.0) & np.isfinite(gbar_norm) & (gbar_norm > 0)
         if mask.sum() >= 2:
             logx = np.log10(X_BINS[mask])
@@ -1000,14 +1001,11 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
                 file=sys.stderr,
             )
 
-    # Optional: compare to the Bahcall–Wolf background g0(x)
-    # Interpolate g0(x) on the same X_BINS grid.
+    # comparison to BW g0(x)
     ln1p_x = np.log1p(X_BINS)
     g0_x = np.interp(ln1p_x, LN1P, G0_TAB)
-    # Normalize g0 to match the same normalization bin as gbar_norm (norm_idx = 0)
     g0_norm = g0_x / g0_x[norm_idx] if g0_x[norm_idx] > 0 else g0_x
 
-    # Print a quick summary in the part of the cusp that matters most.
     print("[diag] comparison to BW g0(x):", file=sys.stderr)
     for xb, gmc, g0n in zip(X_BINS, gbar_norm, g0_norm):
         if xb < 1.0 or xb > 100.0:
@@ -1015,7 +1013,7 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
         ratio = gmc / g0n if g0n > 0 else np.nan
         print(f"[diag] x={xb:6.2f}: g_MC/g0 ≈ {ratio:5.2f}", file=sys.stderr)
 
-    # Patch C: special diagnostics for noloss mode
+    # noloss diagnostics vs BW background
     if noloss:
         print("[diag] noloss mode: comparing g_MC to BW g0(x):", file=sys.stderr)
         for xb, gmc, g0n in zip(X_BINS, gbar_norm, g0_norm):
@@ -1023,30 +1021,18 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
                 continue
             ratio = gmc / g0n if g0n > 0 else np.nan
             print(f"[diag] noloss: x={xb:6.2g}, g_MC/g0 ≈ {ratio:6.3f}", file=sys.stderr)
-        
-        # Direct energy-space diagnostic: compare p_MC vs p_th
-        # p_MC = time-averaged probability per x-bin from MC (or snapshot fraction)
+
+        # Direct energy-space comparison p_MC vs p_th
         p_MC = gtime_total / gtime_total.sum()
 
-        # Theoretical energy-space PDF used for comparison.
-        #
-        # From eq. (9):
-        #   N(E,J) ∝ J g(E,J) P(E),
-        # with P(E) ∝ x^{-3/2} and J_max^2 ∝ x^{-1}.
-        # Integrating over J gives N_x ∝ g0(x) x^{-5/2}.
-        #
-        # To make the noloss test a *sharp* test that the steady state
-        # matches the Bahcall–Wolf reservoir, p_th(x) must use the same
-        # x^{-5/2} dependence that we use in the sampler above.
         ln1p_x = np.log1p(X_BINS)
         g0_interp = np.interp(ln1p_x, LN1P, G0_TAB)
         N_th = g0_interp * (X_BINS ** (-2.5))
-        # Normalize to a proper PDF over the histogram bins.
         p_th = N_th * DX
         p_th /= p_th.sum()
-        
+
         print("[diag] noloss: direct energy-space comparison p_MC/p_th:", file=sys.stderr)
-        for i in range(0, X_BINS.size, max(1, X_BINS.size // 10)):  # Sample ~10 points
+        for i in range(0, X_BINS.size, max(1, X_BINS.size // 10)):
             xb = X_BINS[i]
             if xb < 0.2 or xb > 100.0:
                 continue
@@ -1058,7 +1044,7 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
 # ---------------- CLI ----------------
 def main():
     ap = argparse.ArgumentParser(
-        description="Monte-Carlo reproduction of ḡ(x) from Fig. 3."
+        description="Monte Carlo reproduction of ḡ(x) from Shapiro & Marchant (1978) Fig. 3."
     )
     ap.add_argument("--streams", type=int, default=400,
                     help="number of non-clone time-carrying streams (default: 400)")
@@ -1089,20 +1075,19 @@ def main():
         type=float,
         default=2.5,
         help=("Geometric exponent α in g(x) ∝ x^α N(E); "
-            "α=2.5 is the Keplerian value, but values "
-            "around 2.2–2.3 empirically match Fig. 3 better "
-            "with the coarse x-binning."),
+              "α=2.5 is the Keplerian value."),
     )
     ap.add_argument("--gbar-no-clones", action="store_true",
                     help="For ḡ(x) diagnostics: accumulate ḡ(x) from the parent stream only (ignore clones).")
     ap.add_argument("--snapshots", action="store_true",
-                    help="Use per-t₀ snapshots for ḡ accumulation (closer to paper's procedure) instead of time-weighted integration.")
+                    help="Use per-t₀ snapshots for ḡ accumulation instead of time-weighted integration.")
     ap.add_argument("--noloss", action="store_true",
-                    help="Disable loss-cone capture (for g(x) diagnostics vs BW g0).")
+                    help="Disable loss-cone capture (for BW g0(x) diagnostics).")
     ap.add_argument(
         "--lc_scale", type=float, default=1.0,
         help="Scale factor for the loss-cone boundary j_min; lc_scale<1 shrinks the cone."
     )
+
     args = ap.parse_args()
 
     floors = np.array(
