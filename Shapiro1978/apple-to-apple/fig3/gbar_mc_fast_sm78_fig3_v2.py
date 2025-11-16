@@ -869,10 +869,16 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                                     max_ccount = ccount
                     i += 1
 
+        # Track weight sum for diagnostics (sum over parent + all active clones)
+        weight_sum = w
+        for ii in range(ccount):
+            if cactive[ii]:
+                weight_sum += cw[ii]
+
         if use_snapshots:
-            return g_acc, snapshots, crossings, caps, max_ccount
+            return g_acc, snapshots, crossings, caps, max_ccount, weight_sum
         else:
-            return g_acc, total_t0, crossings, caps, max_ccount
+            return g_acc, total_t0, crossings, caps, max_ccount, weight_sum
 
     return P_of_x, T0, run_stream, sample_x_from_g0_jit
 
@@ -900,12 +906,13 @@ def _worker_one(args):
         x_max, lc_scale, cone_gamma, e1_scale, snaps_per_t0
     )
 
-    return run_stream(
+    result = run_stream(
         n_relax, floors, clones_per_split, X_BINS, DX,
         int(stream_seeds[sid]), pstar_val, warmup_t0, x_init,
         include_clone_gbar, use_snapshots, noloss, use_clones,
         x_max, lc_scale, cone_gamma, e1_scale, snaps_per_t0
     )
+    return result
 
 
 # ---------------- parallel driver (ḡ only) ----------------
@@ -931,6 +938,7 @@ def run_parallel_gbar(
     e1_scale=E1_SCALE_DEFAULT,
     x_max=None,
     cone_gamma=0.25,
+    debug_occupancy_norm=False,
 ):
     """
     Run many independent time-carrying streams in parallel and accumulate ḡ(x).
@@ -984,6 +992,7 @@ def run_parallel_gbar(
     caps_total = 0
     max_ccount = 0
     total_done = 0
+    weight_sums = []  # Track weight sums for diagnostics
 
     for rep in range(replicates):
         stream_seeds = rs.randint(1, 2**31 - 1, size=n_streams, dtype=np.int64)
@@ -1020,11 +1029,12 @@ def run_parallel_gbar(
             ]
 
             for f in cf.as_completed(futs):
-                g_b, measure_b, peri_b, caps_b, ccount_b = f.result()
+                g_b, measure_b, peri_b, caps_b, ccount_b, wsum_b = f.result()
                 g_total += g_b
                 total_measure += measure_b
                 peri_total += peri_b
                 caps_total += caps_b
+                weight_sums.append(wsum_b)
                 if ccount_b > max_ccount:
                     max_ccount = ccount_b
                 total_done += 1
@@ -1056,6 +1066,14 @@ def run_parallel_gbar(
         print(f"[diag] pericenter crossings (total): {peri_total}", file=sys.stderr)
         print(f"[diag] capture events (total):      {caps_total}", file=sys.stderr)
         print(f"[diag] clone pool high-water:       {max_ccount}", file=sys.stderr)
+        if weight_sums:
+            wsum_arr = np.array(weight_sums)
+            print(
+                f"[diag] weight sum stats: min={wsum_arr.min():.6f}, "
+                f"mean={wsum_arr.mean():.6f}, max={wsum_arr.max():.6f}, "
+                f"std={wsum_arr.std():.6f}",
+                file=sys.stderr,
+            )
 
     if total_measure <= 0.0:
         raise RuntimeError("No time/snapshots accumulated; check parameters.")
@@ -1088,39 +1106,74 @@ def run_parallel_gbar(
             print(f"[diag] sum p_x = {p_sum:.6f}", file=sys.stderr)
         N_x = p_x / DX
 
-    # Convert to g(x) with tunable exponent
-    g_unscaled = N_x * (X_BINS ** gexp)
-
-    # Find first bin with positive signal, fall back to 0.225 if possible
-    norm_idx = 0  # default: x=0.225 (first bin)
-    positive_bins = np.where(g_unscaled > 0)[0]
-    if positive_bins.size == 0:
-        # no signal at all; fill zeros and return gracefully
-        gbar_norm = np.zeros_like(g_unscaled)
-        gbar_raw = g_unscaled.copy()
+    # DEBUG MODE: Capture-free occupancy-based normalization
+    # This normalizes on occupancy N_x directly, ignoring capture flux
+    if debug_occupancy_norm:
+        # Find first bin with positive occupancy
+        positive_bins = np.where(N_x > 0)[0]
+        if positive_bins.size == 0:
+            gbar_norm = np.zeros_like(N_x)
+            gbar_raw = N_x.copy()
+            if show_progress:
+                print(
+                    "[diag] debug_occupancy_norm: no positive N_x; returning zeros.",
+                    file=sys.stderr,
+                )
+            return gbar_norm, gbar_raw
+        
+        # Use first positive bin (prefer x=0.225 if available)
+        norm_idx = 0 if N_x[0] > 0 else positive_bins[0]
         if show_progress:
             print(
-                "[diag] no positive g_unscaled; returning zeros for gbar.",
+                f"[diag] debug_occupancy_norm: normalizing on bin {norm_idx} "
+                f"(x={X_BINS[norm_idx]:.3g}, N_x={N_x[norm_idx]:.6e})",
                 file=sys.stderr,
             )
-        return gbar_norm, gbar_raw
-    
-    # Use first positive bin, but prefer x=0.225 if it's positive
-    if g_unscaled[norm_idx] > 0:
-        # x=0.225 is positive, use it
-        pass
+        
+        # Normalize occupancy directly (shape of stationary distribution)
+        gbar_norm = N_x / N_x[norm_idx]
+        gbar_raw = N_x.copy()
+        
+        if show_progress:
+            print(
+                f"[diag] debug_occupancy_norm: using occupancy-based normalization "
+                f"(capture-independent)",
+                file=sys.stderr,
+            )
     else:
-        # x=0.225 is zero/negative, use first positive bin
-        norm_idx = positive_bins[0]
-        if show_progress:
-            print(
-                f"[diag] normalizing gbar on bin {norm_idx} (x={X_BINS[norm_idx]:.3g}) "
-                f"instead of x=0.225",
-                file=sys.stderr,
-            )
-    
-    gbar_norm = g_unscaled / g_unscaled[norm_idx]
-    gbar_raw = g_unscaled.copy()
+        # STANDARD MODE: Convert to g(x) with tunable exponent
+        g_unscaled = N_x * (X_BINS ** gexp)
+
+        # Find first bin with positive signal, fall back to 0.225 if possible
+        norm_idx = 0  # default: x=0.225 (first bin)
+        positive_bins = np.where(g_unscaled > 0)[0]
+        if positive_bins.size == 0:
+            # no signal at all; fill zeros and return gracefully
+            gbar_norm = np.zeros_like(g_unscaled)
+            gbar_raw = g_unscaled.copy()
+            if show_progress:
+                print(
+                    "[diag] no positive g_unscaled; returning zeros for gbar.",
+                    file=sys.stderr,
+                )
+            return gbar_norm, gbar_raw
+        
+        # Use first positive bin, but prefer x=0.225 if it's positive
+        if g_unscaled[norm_idx] > 0:
+            # x=0.225 is positive, use it
+            pass
+        else:
+            # x=0.225 is zero/negative, use first positive bin
+            norm_idx = positive_bins[0]
+            if show_progress:
+                print(
+                    f"[diag] normalizing gbar on bin {norm_idx} (x={X_BINS[norm_idx]:.3g}) "
+                    f"instead of x=0.225",
+                    file=sys.stderr,
+                )
+        
+        gbar_norm = g_unscaled / g_unscaled[norm_idx]
+        gbar_raw = g_unscaled.copy()
 
     # quick slope diagnostic over 1≲x≲100
     if show_progress:
@@ -1274,6 +1327,14 @@ def main():
         default=0.25,
         help="γ factor in eq. 29d for loss-cone step limiting (default: 0.25, matching SM78).",
     )
+    ap.add_argument(
+        "--debug-occupancy-norm",
+        action="store_true",
+        help=(
+            "DEBUG: Use occupancy-based normalization (capture-independent) "
+            "instead of gexp-based conversion. Useful for testing cloning neutrality."
+        ),
+    )
 
     args = ap.parse_args()
 
@@ -1304,6 +1365,7 @@ def main():
         e1_scale=args.e1_scale,
         x_max=None,
         cone_gamma=args.cone_gamma,
+        debug_occupancy_norm=args.debug_occupancy_norm,
     )
 
     # ---- print comparison table ----
