@@ -274,6 +274,16 @@ def _build_kernels(use_jit=True):
         return XG[i - 1] + t * (XG[i] - XG[i - 1])
 
     @njit(**fastmath)
+    def sample_near_boundary(x_b, width=0.1):
+        """
+        Sample a new star near the replacement energy x_b.
+        Uses a simple uniform distribution in [x_b, x_b(1+width)],
+        which is a crude stand-in for a reservoir just outside x_b.
+        """
+        u = np.random.random()
+        return x_b * (1.0 + width * u)
+
+    @njit(**fastmath)
     def which_bin(x):
         best = 0
         bestd = abs(X_BINS[0] - x)
@@ -427,8 +437,9 @@ def _build_kernels(use_jit=True):
             n_J_lc = n_max
         else:
             Jmin = jmin * Jmax
+            # Slightly softer limiter: smaller γ and floor coefficient
             gap = cone_gamma_val * abs(J - Jmin)
-            floor = max(gap, 0.10 * Jmin)
+            floor = max(gap, 0.05 * Jmin)
             n_J_lc = (floor / sigJ) ** 2
 
         n = min(n_E, n_J_iso, n_J_top, n_J_lc, n_max)
@@ -582,7 +593,10 @@ def _build_kernels(use_jit=True):
         parent_floor_idx = floor_index_for_j2(j * j, floors)
 
         # clone pool
-        MAX_CLONES = 2048 if use_clones else 0
+        # More aggressive clone pool for Fig. 3:
+        # - deeper j^2 floors and more clones per split
+        #   give much better statistics in the deep cusp.
+        MAX_CLONES = 4096 if use_clones else 0
         cx = np.zeros(MAX_CLONES, dtype=np.float64)
         cj = np.zeros(MAX_CLONES, dtype=np.float64)
         cph = np.zeros(MAX_CLONES, dtype=np.float64)
@@ -617,7 +631,7 @@ def _build_kernels(use_jit=True):
                 if noloss_flag:
                     x = sample_x_from_g0_jit()
                 else:
-                    x = X_BOUND
+                    x = sample_near_boundary(X_BOUND, 0.1)
                 j = math.sqrt(np.random.random())
                 parent_floor_idx = floor_index_for_j2(j * j, floors)
             elif use_clones:
@@ -662,7 +676,7 @@ def _build_kernels(use_jit=True):
                         if noloss_flag:
                             cx[i] = sample_x_from_g0_jit()
                         else:
-                            cx[i] = X_BOUND
+                            cx[i] = sample_near_boundary(X_BOUND, 0.1)
                         cj[i] = math.sqrt(np.random.random())
                         cph[i] = ph_c2
                         cfloor_idx[i] = floor_index_for_j2(cj[i] * cj[i], floors)
@@ -754,7 +768,7 @@ def _build_kernels(use_jit=True):
                 if noloss_flag:
                     x = sample_x_from_g0_jit()
                 else:
-                    x = X_BOUND
+                    x = sample_near_boundary(X_BOUND, 0.1)
                 j = math.sqrt(np.random.random())
                 parent_floor_idx = floor_index_for_j2(j * j, floors)
             elif use_clones:
@@ -807,7 +821,7 @@ def _build_kernels(use_jit=True):
                         if noloss_flag:
                             cx[i] = sample_x_from_g0_jit()
                         else:
-                            cx[i] = X_BOUND
+                            cx[i] = sample_near_boundary(X_BOUND, 0.1)
                         cj[i] = math.sqrt(np.random.random())
                         cph[i] = ph_c2
                         cfloor_idx[i] = floor_index_for_j2(cj[i] * cj[i], floors)
@@ -1102,8 +1116,8 @@ def main():
     ap.add_argument(
         "--floors_min_exp",
         type=int,
-        default=8,
-        help="min exponent k for floors 10^{-k} (default: 8 => 1e-8)",
+        default=10,
+        help="min exponent k for floors 10^{-k} (default: 10 => 1e-10)",
     )
     ap.add_argument(
         "--floor-step",
@@ -1114,8 +1128,8 @@ def main():
     ap.add_argument(
         "--clones",
         type=int,
-        default=9,
-        help="clones per split (default: 9)",
+        default=14,
+        help="clones per split (default: 14, more aggressive deep-cusp sampling)",
     )
     ap.add_argument(
         "--nojit",
