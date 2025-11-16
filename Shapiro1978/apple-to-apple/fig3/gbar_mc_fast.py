@@ -244,7 +244,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False, lc_scale=1.0):
         return e1, e2v, j1v, j2v, z2v
 
     @njit(**fastmath)
-    def pick_n(x, j, e2v, j2v, cone_gamma_val, noloss_flag, lc_scale_val):
+    def pick_n(x, j, e2v, j2v, cone_gamma_val, lc_scale_val):
         jmin = j_min_of_x(x, lc_scale_val)
         nmax = 1e30
         
@@ -265,14 +265,15 @@ def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False, lc_scale=1.0):
             if v < nmax:
                 nmax = v
 
-            # (29d) distance to loss cone - skip completely if noloss is enabled
-            if not noloss_flag:
-                gap = cone_gamma_val * (j - jmin)
-                floor = max(gap, 0.10 * jmin)
-                if floor > 0.0:
-                    v = (floor / j2v)**2
-                    if v < nmax:
-                        nmax = v
+            # (29d) distance to loss cone
+            # In noloss mode, we still use the same step-size control;
+            # only the capture condition is disabled.
+            gap = cone_gamma_val * (j - jmin)
+            floor = max(gap, 0.10 * jmin)
+            if floor > 0.0:
+                v = (floor / j2v)**2
+                if v < nmax:
+                    nmax = v
 
         # choose n (fraction of an orbit); no artificial 0.5 cap
         n = nmax if nmax > 1e-8 else 1e-8
@@ -314,7 +315,7 @@ def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False, lc_scale=1.0):
     @njit(**fastmath)
     def step_one(x, j, phase, cone_gamma_val, noloss_flag, x_max, lc_scale_val):
         e1, e2v, j1v, j2v, z2v = bilinear_coeffs(x, j)
-        n_raw = pick_n(x, j, e2v, j2v, cone_gamma_val, noloss_flag, lc_scale_val)
+        n_raw = pick_n(x, j, e2v, j2v, cone_gamma_val, lc_scale_val)
 
         # land exactly on next pericenter if we'd cross it
         next_int = math.floor(phase) + 1.0
@@ -329,12 +330,13 @@ def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False, lc_scale=1.0):
         x_new = x - dE
         if x_new < 1e-12:
             x_new = 1e-12
-        # In noloss runs, prevent orbits from diffusing to x ≫ X_EDGES[-1].
-        # That regime isn't plotted in Fig. 3 but makes P(x) tiny and dt0
-        # extremely small, which kills performance. Capping here keeps the
-        # dynamics correct over the plotted range while avoiding a runaway
-        # deep cusp.
-        if noloss_flag and x_new > x_max:
+        
+        # Hard cap on very tightly bound orbits to avoid vanishing dt0
+        # and hung streams. x_max is passed in as XMAX from the BW grid
+        # and is chosen well above the Fig. 3 range (x≲100), so this
+        # does not affect the plotted region but prevents a few
+        # paths from diffusing to x≫XMAX and stalling.
+        if x_new > x_max:
             x_new = x_max
 
         # 2-D RW gate
@@ -682,14 +684,16 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
     if noloss:
         use_clones = False
         gexp = 2.5  # Force canonical exponent for calibration
-        # Set a moderate x_max for noloss to prevent runaway deep diffusion
-        # while still covering the Fig. 3 range (1 ≲ x ≲ 100)
-        if x_max is None:
-            x_max = 300.0
-    else:
-        # For canonical runs, use the full grid maximum
-        if x_max is None:
-            x_max = XMAX
+    
+    # Set x_max cap to prevent runaway deep diffusion
+    # Use a moderate cap (300) for noloss, full XMAX for canonical runs
+    # This prevents streams from diffusing to x≫100 where dt0 becomes
+    # microscopic and streams hang. The cap is well above the Fig. 3 range.
+    if x_max is None:
+        if noloss:
+            x_max = 300.0  # Moderate cap for noloss diagnostics
+        else:
+            x_max = XMAX   # Full grid for canonical runs
     
     if floors is None:
         floors = np.array([10.0**(-k) for k in range(0, 9)], dtype=np.float64)  # 1 ... 1e-8
@@ -832,14 +836,35 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
         ratio = gmc / g0n if g0n > 0 else np.nan
         print(f"[diag] x={xb:6.2f}: g_MC/g0 ≈ {ratio:5.2f}", file=sys.stderr)
     
-    # Patch C: special diagnostics for noloss mode
-    if noloss:
-        print("[diag] noloss mode: comparing g_MC to BW g0(x):", file=sys.stderr)
-        for xb, gmc, g0n in zip(X_BINS, gbar_norm, g0_norm):
-            if xb < 0.2 or xb > 100.0:
-                continue
-            ratio = gmc / g0n if g0n > 0 else np.nan
-            print(f"[diag] noloss: x={xb:6.2g}, g_MC/g0 ≈ {ratio:6.3f}", file=sys.stderr)
+        # Patch C: special diagnostics for noloss mode
+        if noloss:
+            print("[diag] noloss mode: comparing g_MC to BW g0(x):", file=sys.stderr)
+            for xb, gmc, g0n in zip(X_BINS, gbar_norm, g0_norm):
+                if xb < 0.2 or xb > 100.0:
+                    continue
+                ratio = gmc / g0n if g0n > 0 else np.nan
+                print(f"[diag] noloss: x={xb:6.2g}, g_MC/g0 ≈ {ratio:6.3f}", file=sys.stderr)
+            
+            # Direct energy-space diagnostic: compare p_MC vs p_th
+            # p_MC = time-averaged probability per x-bin from MC
+            p_MC = gtime_total / gtime_total.sum()
+            
+            # p_th = theoretical p(x) from g0(x) using N(E) ∝ x^{-5/2} g0(x)
+            # Interpolate g0 onto X_BINS
+            ln1p_x = np.log1p(X_BINS)
+            g0_interp = np.interp(ln1p_x, LN1P, G0_TAB)
+            # N(E) ∝ x^{-5/2} g0(x)
+            N_th = g0_interp * (X_BINS ** (-2.5))
+            # Normalize to get probability distribution
+            p_th = N_th / N_th.sum()
+            
+            print("[diag] noloss: direct energy-space comparison p_MC/p_th:", file=sys.stderr)
+            for i in range(0, X_BINS.size, max(1, X_BINS.size // 10)):  # Sample ~10 points
+                xb = X_BINS[i]
+                if xb < 0.2 or xb > 100.0:
+                    continue
+                ratio = p_MC[i] / p_th[i] if p_th[i] > 0 else np.nan
+                print(f"[occ] x={xb:6.2f}: p_MC/p_th ≈ {ratio:6.3f}", file=sys.stderr)
 
     return gbar_norm, gbar_raw
 
