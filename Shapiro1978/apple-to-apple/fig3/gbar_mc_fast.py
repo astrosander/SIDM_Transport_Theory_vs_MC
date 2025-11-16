@@ -451,8 +451,11 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
             E_new = -1e-6  # keep bound
         x_new = -E_new
 
-        # Hard cap on very tightly bound orbits
+        # Deep-cusp sink at x > x_max ≈ x_D:
+        # treat this as immediate capture; the caller will recycle the star.
+        captured_deep = False
         if x_new > x_max:
+            captured_deep = True
             x_new = x_max
             E_new = -x_new
 
@@ -490,9 +493,11 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
         # Phase advance
         phase_new = phase + n
 
-        # Capture check (only if we hit pericenter and noloss is disabled)
-        captured = False
-        if (not noloss_flag) and crossed_peri:
+        # Capture check:
+        #  (i) deep-energy sink at x_max (always active), and
+        #  (ii) loss-cone capture at pericenter (disabled in noloss runs).
+        captured = captured_deep
+        if (not noloss_flag) and (not captured) and crossed_peri:
             j_min_new = j_min_of_x(x_new, lc_scale_val, noloss_flag)
             if j_new < j_min_new:
                 captured = True
@@ -844,16 +849,12 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
         gexp = 2.5  # Bahcall–Wolf II test uses the standard g(x) exponent
         # Eq. (29d) with ε_min = 0: turn off loss-cone forcing in the noloss run.
         cone_gamma = 0.0
-    
-    # Set x_max cap to prevent runaway deep diffusion.
-    # For noloss calibration runs we only care about matching the BW
-    # solution over 0.2 ≲ x ≲ O(10^2), so a moderate cap is enough and
-    # avoids stars diffusing to x ≫ 10^2 where dt0 becomes microscopic.
+
+    # Inner energy sink at x_max ≈ x_D:
+    # stars that diffuse to x > x_max are removed and re-injected from
+    # the outer reservoir, as in the FP/BW inner boundary.
     if x_max is None:
-        if noloss:
-            x_max = 300.0  # cap well above the plotted range
-        else:
-            x_max = XMAX   # use full BW grid for canonical runs
+        x_max = X_D
     
     if floors is None:
         floors = np.array([10.0**(-k) for k in range(0, 9)], dtype=np.float64)  # 1 ... 1e-8
