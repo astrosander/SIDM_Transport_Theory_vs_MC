@@ -98,15 +98,12 @@ mask = (X_G0 >= X_BOUND) & (X_G0 <= XMAX) & (G0_TAB > 0)
 XG  = X_G0[mask]
 G0  = G0_TAB[mask]
 
-# Build an inverse-CDF over x for the *occupancy* N_x ∝ x^{-5/2} g0(x).
-# For a Kepler potential, the number of stars per unit x is
-# N_x ∝ x^{-5/2} g0(x); sampling from this distribution makes the
-# noloss Bahcall–Wolf solution stationary in the MC.
-w = G0 * XG**(-2.5)  # unnormalised occupancy
-
+# Build an inverse-CDF w.r.t. x by integrating the *DF* g0(x) itself.
+# This matches the way Shapiro & Marchant test their code against
+# the BW II steady-state solution in the noloss experiment.
 cdf_x = np.zeros_like(XG)
 cdf_x[1:] = np.cumsum(
-    0.5 * (w[1:] + w[:-1]) * (XG[1:] - XG[:-1])
+    0.5 * (G0[1:] + G0[:-1]) * (XG[1:] - XG[:-1])
 )
 cdf_x /= cdf_x[-1]  # normalise to 1
 
@@ -177,7 +174,15 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
     fastmath = dict(fastmath=True, nogil=True, cache=True) if (use_jit and HAVE_NUMBA) else {}
 
     @njit(**fastmath)
-    def j_min_of_x(x, lc_scale_val):
+    def j_min_of_x(x, lc_scale_val, noloss_flag):
+        """
+        Dimensionless loss-cone boundary j_min(x).
+        In noloss mode (BW II calibration), the loss cone is suppressed:
+        j_min ≡ 0, as described in the paper.
+        """
+        if noloss_flag:
+            return 0.0
+        
         v = 2.0*x/X_D - (x/X_D)**2
         jmin = math.sqrt(v) if v > 0.0 else 0.0
         return lc_scale_val * jmin
@@ -282,11 +287,12 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
         return e1, e2, j1, j2, z
 
     @njit(**fastmath)
-    def pick_n(x, j, e2, j2, j_lc, noloss_flag, n_min=0.01, n_max=3.0e4):
+    def pick_n(x, j, e2, j2, lc_scale_val, noloss_flag, n_min=0.01, n_max=3.0e4):
         """
         Equation (29): choose n so that each step is a small perturbation.
         Paper-faithful implementation matching equations 29a-d exactly.
         """
+        jmin = j_min_of_x(x, lc_scale_val, noloss_flag)
         E = -x
         Jmax = 1.0 / math.sqrt(2.0 * x)
         J = j * Jmax
@@ -311,12 +317,13 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
             n_J_top = n_max
 
         # (29d) limit diffusion into / out of the loss cone
-        if noloss_flag or j_lc <= 0.0 or j2 == 0.0:
+        if noloss_flag or jmin <= 0.0 or j2 == 0.0:
             n_J_lc = n_max
         else:
-            Jlc = j_lc * Jmax
-            delta_lc = max(0.25 * abs(J - Jlc), 0.10 * Jlc)
-            n_J_lc = (delta_lc / j2)**2
+            Jmin = jmin * Jmax
+            gap = 0.25 * abs(J - Jmin)  # cone_gamma = 0.25 default
+            floor = max(gap, 0.10 * Jmin)
+            n_J_lc = (floor / j2)**2
 
         n = min(n_E, n_J_iso, n_J_top, n_J_lc, n_max)
         return max(n_min, n)
@@ -362,7 +369,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
         return k
 
     @njit(**fastmath)
-    def step_one(x, j, phase, pstar_val, j_lc, noloss_flag, x_max, lc_scale_val):
+    def step_one(x, j, phase, pstar_val, noloss_flag, x_max, lc_scale_val):
         """
         Paper-faithful random walk step matching equations (27) and Appendix B.
         Returns (x_new, j_new, phase_new, n_used, captured, crossed_peri).
@@ -371,7 +378,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
         e1, e2, j1, j2, z = bilinear_coeffs(x, j, pstar_val)
         
         # Choose step size n (fraction of an orbit)
-        n_raw = pick_n(x, j, e2, j2, j_lc, noloss_flag)
+        n_raw = pick_n(x, j, e2, j2, lc_scale_val, noloss_flag)
 
         # Land exactly on next pericenter if we'd cross it
         next_int = math.floor(phase) + 1.0
@@ -398,12 +405,26 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
             x_new = x_max
             E_new = -x_new
 
-        # Angular momentum update: ΔJ = n j1 + sqrt(n) j2 y2 (with correlation)
-        # The correlation is already handled in correlated_normals
-        deltaJ = n * j1 + math.sqrt(n) * j2 * y2
+        # Angular momentum update: eq. (27b) or (28)
+        # 2-D RW gate: eq. (28)
+        # Use the 2D isotropic random walk in J-space whenever
+        # sqrt(n) * j2 exceeds j/4. In that case, the cross-correlation ζ2
+        # is neglected (as stated in the paper).
+        use_2d = (math.sqrt(n) * j2 > j / 4.0)
 
         Jmax_new = 1.0 / math.sqrt(2.0 * x_new)
-        J_new = J + deltaJ
+        
+        if use_2d:
+            # 2D isotropic random walk in physical J-space (eq. 28)
+            z1 = np.random.normal()
+            z2 = np.random.normal()
+            J_new = math.sqrt(
+                (J + math.sqrt(n) * z1 * j2)**2 +
+                (math.sqrt(n) * z2 * j2)**2
+            )
+        else:
+            # 1D update with correlated noise (eq. 27b)
+            J_new = J + n * j1 + math.sqrt(n) * j2 * y2
 
         # Reflect at J=0 and J=Jmax (Appendix B)
         if J_new < 0.0:
@@ -420,7 +441,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
         # Capture check (only if we hit pericenter and noloss is disabled)
         captured = False
         if (not noloss_flag) and crossed_peri:
-            j_min_new = j_min_of_x(x_new, lc_scale_val)
+            j_min_new = j_min_of_x(x_new, lc_scale_val, noloss_flag)
             if j_new < j_min_new:
                 captured = True
 
@@ -478,8 +499,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
         t0_used = 0.0
         while t0_used < warmup_t0:
             x_prev = x
-            j_lc = j_min_of_x(x, lc_scale_val)
-            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, pstar_val, j_lc, noloss, x_max, lc_scale_val)
+            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, pstar_val, noloss, x_max, lc_scale_val)
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
 
@@ -515,8 +535,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
                         i += 1
                         continue
                     x_c, j_c, ph_c = cx[i], cj[i], cph[i]
-                    j_lc_c = j_min_of_x(x_c, lc_scale_val)
-                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, pstar_val, j_lc_c, noloss, x_max, lc_scale_val)
+                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, pstar_val, noloss, x_max, lc_scale_val)
                     cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
 
                     if cap_c or (x_c2 < X_BOUND):
@@ -571,8 +590,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
 
         while t0_used < n_relax:
             x_prev = x
-            j_lc = j_min_of_x(x, lc_scale_val)
-            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, pstar_val, j_lc, noloss, x_max, lc_scale_val)
+            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, pstar_val, noloss, x_max, lc_scale_val)
             
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -642,8 +660,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
                         i += 1
                         continue
                     x_c, j_c, ph_c = cx[i], cj[i], cph[i]
-                    j_lc_c = j_min_of_x(x_c, lc_scale_val)
-                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, pstar_val, j_lc_c, noloss, x_max, lc_scale_val)
+                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, pstar_val, noloss, x_max, lc_scale_val)
                     
                     cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
 
