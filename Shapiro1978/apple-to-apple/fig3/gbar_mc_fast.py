@@ -98,16 +98,17 @@ mask = (X_G0 >= X_BOUND) & (X_G0 <= XMAX) & (G0_TAB > 0)
 XG  = X_G0[mask]
 G0  = G0_TAB[mask]
 
-# Build an inverse-CDF over x for the *field-star distribution function*
-# g0(x) tabulated by Bahcall & Wolf (BW II).
-# In the noloss experiment Shapiro & Marchant start their streams with
-# energies drawn from g0(x) itself (cf. their description of using the
-# 1D BW solution g0(E) as the initial DF).
+# Build an inverse-CDF over x for the *occupancy*
+# N(E) ∝ x^{-5/2} g0(x). For a Kepler potential, the number
+# of stars per unit x is N_x ∝ x^{-5/2} g0(x); sampling from
+# this makes the noloss Bahcall–Wolf solution stationary.
+weight = G0 * (XG ** -2.5)   # N_x ∝ x^{-5/2} g0(x)
+
 cdf_x = np.zeros_like(XG)
 cdf_x[1:] = np.cumsum(
-    0.5 * (G0[1:] + G0[:-1]) * (XG[1:] - XG[:-1])
+    0.5 * (weight[1:] + weight[:-1]) * (XG[1:] - XG[:-1])
 )
-cdf_x /= cdf_x[-1]  # normalise to 1
+cdf_x /= cdf_x[-1]  # normalize to 1
 
 def sample_x_from_g0(u):
     """Monotone piecewise-linear inverse CDF for the BW II reservoir DF."""
@@ -197,33 +198,31 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
     T0 = P_of_x(1.0)/PSTAR  # t0 from P*(x=1)
 
     @njit(**fastmath)
-    def sample_x_from_g0_jit(u, cdf_x_arr, xg_arr):
+    def sample_x_from_g0_jit():
         """
-        Numba version of sample_x_from_g0(u), using the BW II
-        reservoir DF g0(x). Takes the CDF and x-grid arrays as parameters.
+        Draw x from the BW noloss occupancy N(E) ∝ x^{-5/2} g0(x)
+        using the precomputed (XG, cdf_x) tables.
         """
-        if cdf_x_arr.size == 0 or xg_arr.size == 0:
-            return X_BOUND  # fallback if arrays not provided
-        
+        u = np.random.random()
         if u <= 0.0:
-            return xg_arr[0]
+            return XG[0]
         if u >= 1.0:
-            return xg_arr[-1]
+            return XG[-1]
 
-        # Manual search (Numba-friendly replacement for searchsorted)
         i = 1
-        while i < cdf_x_arr.size and cdf_x_arr[i] < u:
+        while i < cdf_x.size and cdf_x[i] < u:
             i += 1
-        if i >= cdf_x_arr.size:
-            i = cdf_x_arr.size - 1
+        if i >= cdf_x.size:
+            i = cdf_x.size - 1
+        if i < 1:
+            i = 1
 
-        c_lo = cdf_x_arr[i-1]
-        c_hi = cdf_x_arr[i]
-        t = (u - c_lo) / (c_hi - c_lo + 1e-30)
+        denom = cdf_x[i] - cdf_x[i - 1]
+        if denom <= 0.0:
+            return XG[i - 1]
 
-        x_lo = xg_arr[i-1]
-        x_hi = xg_arr[i]
-        return x_lo + t * (x_hi - x_lo)
+        t = (u - cdf_x[i - 1]) / denom
+        return XG[i - 1] + t * (XG[i] - XG[i - 1])
 
     @njit(**fastmath)
     def which_bin(x):
@@ -481,8 +480,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
     @njit(**fastmath)
     def run_stream(n_relax, floors, clones_per_split, x_bins, dx,
                 seed, pstar_val, warmup_t0, x_init,
-                include_clone_gbar=True, use_snapshots=False, noloss=False, use_clones=True, x_max=1e10, lc_scale_val=1.0,
-                cdf_x_arr=None, xg_arr=None):
+                include_clone_gbar=True, use_snapshots=False, noloss=False, use_clones=True, x_max=1e10, lc_scale_val=1.0):
         """
         Single time-carrying stream + clone tree.
 
@@ -536,16 +534,16 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
 
-            # capture or escape → replace at reservoir
+            # capture or escape -> replace from reservoir
             if cap or (x < X_BOUND):
-                if noloss_flag and cdf_x_arr.size > 0 and xg_arr.size > 0:
-                    # In noloss mode, feed from the BW II reservoir g0(x)
-                    x = sample_x_from_g0_jit(np.random.random(), cdf_x_arr, xg_arr)
+                if noloss_flag:
+                    # In noloss calibration, recycle from BW occupancy
+                    x = sample_x_from_g0_jit()
                 else:
-                    # Canonical loss-cone case: inject at the replacement energy x_b
+                    # Canonical runs: put star back at x_b
                     x = X_BOUND
                 j = math.sqrt(np.random.random())
-                parent_floor_idx = floor_index_for_j2(j*j, floors)
+                parent_floor_idx = floor_index_for_j2(j * j, floors)
             elif use_clones:
                 # splitting for parent: only when entering a new deeper floor (with hysteresis)
                 j2_now = j*j
@@ -578,13 +576,13 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
 
                     if cap_c or (x_c2 < X_BOUND):
                         # recycle clone at reservoir
-                        if noloss_flag and cdf_x_arr.size > 0 and xg_arr.size > 0:
-                            cx[i] = sample_x_from_g0_jit(np.random.random(), cdf_x_arr, xg_arr)
+                        if noloss_flag:
+                            cx[i] = sample_x_from_g0_jit()
                         else:
                             cx[i] = X_BOUND
                         cj[i]  = math.sqrt(np.random.random())
                         cph[i] = ph_c2
-                        cfloor_idx[i] = floor_index_for_j2(cj[i]*cj[i], floors)
+                        cfloor_idx[i] = floor_index_for_j2(cj[i] * cj[i], floors)
                         cactive[i] = 1
                         i += 1
                         continue
@@ -665,19 +663,20 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
             # handle parent capture / escape / splitting
             if cap:
                 caps += 1
-                if noloss_flag and cdf_x_arr.size > 0 and xg_arr.size > 0:
-                    x = sample_x_from_g0_jit(np.random.random(), cdf_x_arr, xg_arr)
+                if noloss_flag:
+                    x = sample_x_from_g0_jit()
                 else:
                     x = X_BOUND
                 j = math.sqrt(np.random.random())
-                parent_floor_idx = floor_index_for_j2(j*j, floors)
+                parent_floor_idx = floor_index_for_j2(j * j, floors)
+
             elif x < X_BOUND:
-                if noloss_flag and cdf_x_arr.size > 0 and xg_arr.size > 0:
-                    x = sample_x_from_g0_jit(np.random.random(), cdf_x_arr, xg_arr)
+                if noloss_flag:
+                    x = sample_x_from_g0_jit()
                 else:
                     x = X_BOUND
                 j = math.sqrt(np.random.random())
-                parent_floor_idx = floor_index_for_j2(j*j, floors)
+                parent_floor_idx = floor_index_for_j2(j * j, floors)
             elif use_clones:
                 # splitting after we know we weren't captured / escaped
                 j2_now = j*j
@@ -717,13 +716,13 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
                     # capture first
                     if cap_c:
                         caps += 1
-                        if noloss_flag and cdf_x_arr.size > 0 and xg_arr.size > 0:
-                            x_c2 = sample_x_from_g0_jit(np.random.random(), cdf_x_arr, xg_arr)
+                        if noloss_flag:
+                            cx[i] = sample_x_from_g0_jit()
                         else:
-                            x_c2 = X_BOUND
-                        j_c2 = math.sqrt(np.random.random())
-                        cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
-                        cfloor_idx[i] = floor_index_for_j2(j_c2*j_c2, floors)
+                            cx[i] = X_BOUND
+                        cj[i]  = math.sqrt(np.random.random())
+                        cph[i] = ph_c2
+                        cfloor_idx[i] = floor_index_for_j2(cj[i] * cj[i], floors)
                         cactive[i] = 1
                         if ccount > max_ccount:
                             max_ccount = ccount
@@ -732,13 +731,13 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
 
                     # escape replacement
                     if x_c2 < X_BOUND:
-                        if noloss_flag and cdf_x_arr.size > 0 and xg_arr.size > 0:
-                            x_c2 = sample_x_from_g0_jit(np.random.random(), cdf_x_arr, xg_arr)
+                        if noloss_flag:
+                            x_c2 = sample_x_from_g0_jit()
                         else:
                             x_c2 = X_BOUND
                         j_c2 = math.sqrt(np.random.random())
                         cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
-                        cfloor_idx[i] = floor_index_for_j2(j_c2*j_c2, floors)
+                        cfloor_idx[i] = floor_index_for_j2(j_c2 * j_c2, floors)
 
                     # outward crossing of its own floor → annihilate clone, return weight
                     if cfloor_idx[i] >= 0 and j_c2*j_c2 >= floors[cfloor_idx[i]]:
@@ -788,25 +787,14 @@ def _worker_one(args):
     # Sample initial x from BW distribution using stratified u value
     x_init = sample_x_from_g0(u0)
 
-    # Pass CDF arrays for noloss reservoir sampling
-    # Use empty arrays when not needed (numba doesn't handle None well)
-    if noloss:
-        cdf_x_arr = cdf_x
-        xg_arr = XG
-    else:
-        cdf_x_arr = np.array([], dtype=np.float64)
-        xg_arr = np.array([], dtype=np.float64)
-
     # tiny warmup to pull kernels from cache
     _ = run_stream(1e-6, floors, clones_per_split, X_BINS, DX,
                    int(stream_seeds[sid] ^ 0xABCDEF), pstar_val, 0.0, x_init,
-                   include_clone_gbar, use_snapshots, noloss, use_clones, x_max, lc_scale,
-                   cdf_x_arr, xg_arr)
+                   include_clone_gbar, use_snapshots, noloss, use_clones, x_max, lc_scale)
 
     return run_stream(n_relax, floors, clones_per_split, X_BINS, DX,
                       int(stream_seeds[sid]), pstar_val, warmup_t0, x_init,
-                      include_clone_gbar, use_snapshots, noloss, use_clones, x_max, lc_scale,
-                      cdf_x_arr, xg_arr)
+                      include_clone_gbar, use_snapshots, noloss, use_clones, x_max, lc_scale)
 
 # ---------------- parallel driver (ḡ only) ----------------
 def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
