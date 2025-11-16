@@ -84,10 +84,14 @@ PSTAR   = 0.005      # canonical P*
 X_BOUND = 0.2        # replacement energy x_b (Eb = -0.2 v0^2)
 SEED    = 20251028   # base RNG seed
 
-# Energy drift scaling factor (empirical adjustment to match SM78)
-# Reduces the systematic inward drift to better match the canonical solution.
-# Typical values: 0.2-0.4. Lower values reduce drift strength.
-E1_SCALE = 0.3
+# -------- tunable "physics knobs" ----------
+# Scale factor for the energy drift coefficient e1.
+# e1_scale < 1 weakens the systematic inward energy drift.
+E1_SCALE_DEFAULT = 0.3  # you can tune this later via CLI
+
+# Default scale for the loss-cone boundary j_min(x).
+# lc_scale < 1 shrinks the loss cone, allowing a deeper cusp.
+LC_SCALE_DEFAULT = 1.0
 
 # --------- Fig. 3 energy bin centers + geometric edges ----------
 X_BINS = np.array([
@@ -222,7 +226,8 @@ assert abs(J2[-1, 1] - 4.59e-4) < 1e-12
 
 
 # ---------------- kernels (Numba or pure python) ----------------
-def _build_kernels(use_jit=True):
+def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
+                   e1_scale=E1_SCALE_DEFAULT):
     """Build numba-jitted kernels (or pure-python fallbacks)."""
     if use_jit and HAVE_NUMBA:
         njit = nb.njit
@@ -290,7 +295,7 @@ def _build_kernels(use_jit=True):
         return best
 
     @njit(**fastmath)
-    def bilinear_coeffs(x, j, pstar_val):
+    def bilinear_coeffs(x, j, pstar_val, e1_scale_val):
         """
         Bilinear interpolation of Table-1 starred coefficients.
 
@@ -378,7 +383,7 @@ def _build_kernels(use_jit=True):
         Jmax = 1.0 / math.sqrt(2.0 * x_clamp)
 
         # Apply empirical scaling to energy drift to match SM78 canonical solution
-        e1 = E1_SCALE * e1_star * v0_sq
+        e1 = -e1_scale_val * e1_star * v0_sq
         sigE_star = math.sqrt(max(E2_star, 0.0))
         sigE = sigE_star * v0_sq
 
@@ -476,7 +481,7 @@ def _build_kernels(use_jit=True):
 
     @njit(**fastmath)
     def step_one(x, j, phase, pstar_val, noloss_flag, x_max,
-                 lc_scale_val, cone_gamma_val):
+                 lc_scale_val, cone_gamma_val, e1_scale_val):
         """
         One MC step (possibly fractional orbit) with pericenter-aligned
         truncation. Returns:
@@ -484,7 +489,7 @@ def _build_kernels(use_jit=True):
             x_new, j_new, phase_new, n_used, captured, crossed_peri
         """
         # orbital coefficients
-        e1, sigE, j1, sigJ, rho = bilinear_coeffs(x, j, pstar_val)
+        e1, sigE, j1, sigJ, rho = bilinear_coeffs(x, j, pstar_val, e1_scale_val)
 
         # step length
         n_raw = pick_n(x, j, sigE, sigJ, lc_scale_val, noloss_flag,
@@ -567,6 +572,7 @@ def _build_kernels(use_jit=True):
                    x_max=1e10,
                    lc_scale_val=1.0,
                    cone_gamma_val=0.25,
+                   e1_scale_val=0.3,
                    snaps_per_t0=40):
         """
         Single time-carrying stream + clone tree.
@@ -618,7 +624,7 @@ def _build_kernels(use_jit=True):
             x_prev = x
             x, j, phase, n_used, cap, crossed = step_one(
                 x, j, phase, pstar_val, noloss_flag, x_max,
-                lc_scale_val, cone_gamma_val
+                lc_scale_val, cone_gamma_val, e1_scale_val
             )
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -664,7 +670,7 @@ def _build_kernels(use_jit=True):
                     ph_c = cph[i]
                     x_c2, j_c2, ph_c2, n_c, cap_c, cross_c = step_one(
                         x_c, j_c, ph_c, pstar_val, noloss_flag, x_max,
-                        lc_scale_val, cone_gamma_val
+                        lc_scale_val, cone_gamma_val, e1_scale_val
                     )
                     cx[i] = x_c2
                     cj[i] = j_c2
@@ -733,7 +739,7 @@ def _build_kernels(use_jit=True):
             x_prev = x
             x, j, phase, n_used, cap, crossed = step_one(
                 x, j, phase, pstar_val, noloss_flag, x_max,
-                lc_scale_val, cone_gamma_val
+                lc_scale_val, cone_gamma_val, e1_scale_val
             )
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -807,7 +813,7 @@ def _build_kernels(use_jit=True):
                     ph_c = cph[i]
                     x_c2, j_c2, ph_c2, n_c, cap_c, cross_c = step_one(
                         x_c, j_c, ph_c, pstar_val, noloss_flag, x_max,
-                        lc_scale_val, cone_gamma_val
+                        lc_scale_val, cone_gamma_val, e1_scale_val
                     )
 
                     cx[i] = x_c2
@@ -876,10 +882,11 @@ def _worker_one(args):
     (sid, n_relax, floors, clones_per_split,
      stream_seeds, use_jit, pstar_val, warmup_t0, u0,
      include_clone_gbar, use_snapshots, snaps_per_t0,
-     noloss, use_clones, lc_scale, x_max, cone_gamma) = args
+     noloss, use_clones, lc_scale, e1_scale, x_max, cone_gamma) = args
 
     P_of_x, T0, run_stream, sample_x_from_g0_jit = _build_kernels(
-        use_jit=use_jit
+        use_jit=use_jit, noloss=noloss, lc_scale=lc_scale,
+        e1_scale=e1_scale
     )
 
     # initial x from BW distribution (stratified)
@@ -890,14 +897,14 @@ def _worker_one(args):
         1e-6, floors, clones_per_split, X_BINS, DX,
         int(stream_seeds[sid] ^ 0xABCDEF), pstar_val, 0.0, x_init,
         include_clone_gbar, use_snapshots, noloss, use_clones,
-        x_max, lc_scale, cone_gamma, snaps_per_t0
+        x_max, lc_scale, cone_gamma, e1_scale, snaps_per_t0
     )
 
     return run_stream(
         n_relax, floors, clones_per_split, X_BINS, DX,
         int(stream_seeds[sid]), pstar_val, warmup_t0, x_init,
         include_clone_gbar, use_snapshots, noloss, use_clones,
-        x_max, lc_scale, cone_gamma, snaps_per_t0
+        x_max, lc_scale, cone_gamma, e1_scale, snaps_per_t0
     )
 
 
@@ -920,7 +927,8 @@ def run_parallel_gbar(
     snaps_per_t0=40,
     noloss=False,
     use_clones=True,
-    lc_scale=1.0,
+    lc_scale=LC_SCALE_DEFAULT,
+    e1_scale=E1_SCALE_DEFAULT,
     x_max=None,
     cone_gamma=0.25,
 ):
@@ -1003,6 +1011,7 @@ def run_parallel_gbar(
                         noloss,
                         use_clones,
                         lc_scale,
+                        e1_scale,
                         x_max,
                         cone_gamma,
                     ),
@@ -1208,10 +1217,16 @@ def main():
         help="Disable loss-cone capture (for BW g0 diagnostics).",
     )
     ap.add_argument(
+        "--e1-scale",
+        type=float,
+        default=E1_SCALE_DEFAULT,
+        help="Scale factor for energy drift e1 (default: %.3f)" % E1_SCALE_DEFAULT,
+    )
+    ap.add_argument(
         "--lc_scale",
         type=float,
-        default=1.0,
-        help="Scale factor for loss-cone boundary j_min; <1 shrinks the cone.",
+        default=LC_SCALE_DEFAULT,
+        help="Scale factor for loss-cone boundary j_min (default: %.3f; <1 shrinks the cone)" % LC_SCALE_DEFAULT,
     )
     ap.add_argument(
         "--cone-gamma",
@@ -1246,6 +1261,7 @@ def main():
         noloss=args.noloss,
         use_clones=(not args.noloss and not args.gbar_no_clones),
         lc_scale=args.lc_scale,
+        e1_scale=args.e1_scale,
         x_max=None,
         cone_gamma=args.cone_gamma,
     )
