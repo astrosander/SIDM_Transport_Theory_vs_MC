@@ -274,16 +274,6 @@ def _build_kernels(use_jit=True):
         return XG[i - 1] + t * (XG[i] - XG[i - 1])
 
     @njit(**fastmath)
-    def sample_near_boundary(x_b, width=0.1):
-        """
-        Sample a new star near the replacement energy x_b.
-        Uses a simple uniform distribution in [x_b, x_b(1+width)],
-        which is a crude stand-in for a reservoir just outside x_b.
-        """
-        u = np.random.random()
-        return x_b * (1.0 + width * u)
-
-    @njit(**fastmath)
     def which_bin(x):
         best = 0
         bestd = abs(X_BINS[0] - x)
@@ -362,8 +352,9 @@ def _build_kernels(use_jit=True):
         # canonical P*
         PSTAR_CANON = 0.005
 
-        # Table gives -ε1* as NEG_E1; flip sign
-        h_star = get(NEG_E1)  # actually ε1* with sign fixed
+        # Table 1 gives e1* (dimensionless energy drift) directly.
+        # Use the table values as-is without sign flip.
+        e1_star = get(NEG_E1)  # e1* from Table 1
         E2_star = max(get(E2), 0.0)     # (ε2* )^2
         J2_star = max(get(J2), 0.0)     # (j2* )^2
         j1_star = get(J1)
@@ -371,7 +362,7 @@ def _build_kernels(use_jit=True):
 
         # scale with P* (eq. A8): all scale ∝ P*
         scale = pstar_val / PSTAR_CANON
-        h_star *= scale
+        e1_star *= scale
         E2_star *= scale
         j1_star *= scale
         J2_star *= scale
@@ -381,7 +372,7 @@ def _build_kernels(use_jit=True):
         v0_sq = 1.0
         Jmax = 1.0 / math.sqrt(2.0 * x_clamp)
 
-        e1 = -h_star * v0_sq
+        e1 = e1_star * v0_sq
         sigE_star = math.sqrt(max(E2_star, 0.0))
         sigE = sigE_star * v0_sq
 
@@ -631,7 +622,8 @@ def _build_kernels(use_jit=True):
                 if noloss_flag:
                     x = sample_x_from_g0_jit()
                 else:
-                    x = sample_near_boundary(X_BOUND, 0.1)
+                    # Canonical SM78: exact injection at x_b = 0.2 with isotropic J
+                    x = X_BOUND
                 j = math.sqrt(np.random.random())
                 parent_floor_idx = floor_index_for_j2(j * j, floors)
             elif use_clones:
@@ -676,7 +668,8 @@ def _build_kernels(use_jit=True):
                         if noloss_flag:
                             cx[i] = sample_x_from_g0_jit()
                         else:
-                            cx[i] = sample_near_boundary(X_BOUND, 0.1)
+                            # Canonical SM78: exact injection at x_b = 0.2 with isotropic J
+                            cx[i] = X_BOUND
                         cj[i] = math.sqrt(np.random.random())
                         cph[i] = ph_c2
                         cfloor_idx[i] = floor_index_for_j2(cj[i] * cj[i], floors)
@@ -712,10 +705,12 @@ def _build_kernels(use_jit=True):
                     i += 1
 
         # ---------- measurement window ----------
+        # Note: All snapshots/measurements here are post-warmup, matching
+        # SM78's procedure of averaging g(x) over the final measurement window.
         if use_snapshots:
             g_acc = np.zeros(x_bins.size, dtype=np.float64)
             snapshots = 0.0
-            # schedule  = snaps_per_t0 snapshots per t0
+            # schedule = snaps_per_t0 snapshots per t0
             delta_snap = 1.0 / snaps_per_t0
             t0_local = 0.0
             next_snap = delta_snap
@@ -768,7 +763,8 @@ def _build_kernels(use_jit=True):
                 if noloss_flag:
                     x = sample_x_from_g0_jit()
                 else:
-                    x = sample_near_boundary(X_BOUND, 0.1)
+                    # Canonical SM78: exact injection at x_b = 0.2 with isotropic J
+                    x = X_BOUND
                 j = math.sqrt(np.random.random())
                 parent_floor_idx = floor_index_for_j2(j * j, floors)
             elif use_clones:
@@ -821,7 +817,8 @@ def _build_kernels(use_jit=True):
                         if noloss_flag:
                             cx[i] = sample_x_from_g0_jit()
                         else:
-                            cx[i] = sample_near_boundary(X_BOUND, 0.1)
+                            # Canonical SM78: exact injection at x_b = 0.2 with isotropic J
+                            cx[i] = X_BOUND
                         cj[i] = math.sqrt(np.random.random())
                         cph[i] = ph_c2
                         cfloor_idx[i] = floor_index_for_j2(cj[i] * cj[i], floors)
@@ -1116,8 +1113,8 @@ def main():
     ap.add_argument(
         "--floors_min_exp",
         type=int,
-        default=10,
-        help="min exponent k for floors 10^{-k} (default: 10 => 1e-10)",
+        default=8,
+        help="min exponent k for floors 10^{-k} (default: 8 => 1e-8)",
     )
     ap.add_argument(
         "--floor-step",
@@ -1128,8 +1125,8 @@ def main():
     ap.add_argument(
         "--clones",
         type=int,
-        default=14,
-        help="clones per split (default: 14, more aggressive deep-cusp sampling)",
+        default=9,
+        help="clones per split (default: 9, matching SM78 canonical model)",
     )
     ap.add_argument(
         "--nojit",
