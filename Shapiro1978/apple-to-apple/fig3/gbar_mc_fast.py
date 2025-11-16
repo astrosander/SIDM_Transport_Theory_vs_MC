@@ -290,37 +290,56 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
 
         # Get starred coefficients from Table 1 (canonical P* = 0.005)
         PSTAR_CANON = 0.005
+        # Table 1 column is "-ε1*", so flip the sign to get ε1*
         h_star = get(NEG_E1)  # table stores h* = -e1*
-        e2_star2 = get(E2)    # (e2*)^2
+        
+        # Table 1 gives the *second moments* per orbit:
+        #   E2 = <(Δx)^2>,  J2 = <(Δj)^2>,  ZETA2 = <Δx Δj>
+        E2_star = max(get(E2), 0.0)    # <(Δx*)^2>
+        J2_star = max(get(J2), 0.0)    # <(Δj*)^2>
         j1_star = get(J1)
-        j2_star2 = get(J2)    # (j2*)^2
-        z_star2 = get(ZETA2)  # (ζ*)^2
+        covEJ_star = get(ZETA2)        # <Δx* Δj*>
 
         # Scale away from canonical P* (eq. A8)
         scale = pstar_val / PSTAR_CANON
         h_star *= scale           # h* ∝ P* (since h* = -e1*)
-        e2_star2 *= scale         # (e2*)^2 ∝ P*
+        E2_star *= scale          # <(Δx*)^2> ∝ P*
         j1_star *= scale          # j1* ∝ P*
-        j2_star2 *= scale         # (j2*)^2 ∝ P*
-        z_star2 *= scale*scale    # (ζ*)^2 ∝ P*^2 (since ζ* ∝ P*)
+        J2_star *= scale          # <(Δj*)^2> ∝ P*
+        covEJ_star *= scale       # <Δx* Δj*> ∝ P* (since both scale as √P*)
 
         # Convert to physical perturbations per orbit (v0^2 = 1, Jmax = 1/sqrt(2x))
         v0_sq = 1.0
         Jmax = 1.0 / math.sqrt(2.0 * x_clamp)
 
-        e1 = -h_star * v0_sq                    # table stores h* = -e1*
-        e2 = math.sqrt(max(e2_star2, 0.0)) * v0_sq
-        j1 = j1_star * Jmax
-        j2 = math.sqrt(max(j2_star2, 0.0)) * Jmax
-        z = math.sqrt(max(z_star2, 0.0)) * math.sqrt(Jmax) * math.sqrt(v0_sq)
+        e1 = -h_star * v0_sq                    # drift in energy
+        sigE_star = math.sqrt(max(E2_star, 0.0))  # σ_E* = √<(Δx*)^2>
+        sigE = sigE_star * v0_sq                 # physical σ_E
+        
+        j1 = j1_star * Jmax                      # drift in angular momentum
+        sigJ_star = math.sqrt(max(J2_star, 0.0))  # σ_J* = √<(Δj*)^2>
+        sigJ = sigJ_star * Jmax                  # physical σ_J
+        
+        # Covariance in physical units
+        covEJ = covEJ_star * v0_sq * Jmax
+        
+        # Correlation coefficient ρ defined by
+        #   <Δx Δj> = ρ σ_E σ_J n  ⇒  ρ = covEJ / (σ_E σ_J)
+        if sigE > 0.0 and sigJ > 0.0:
+            rho = covEJ / (sigE * sigJ)
+            rho = max(-0.999, min(0.999, rho))
+        else:
+            rho = 0.0
 
-        return e1, e2, j1, j2, z
+        # Return drift and 1σ amplitudes; these are what eqs. (27, 29) use.
+        return e1, sigE, j1, sigJ, rho
 
     @njit(**fastmath)
-    def pick_n(x, j, e2, j2, lc_scale_val, noloss_flag, n_min=0.01, n_max=3.0e4):
+    def pick_n(x, j, sigE, sigJ, lc_scale_val, noloss_flag, cone_gamma_val, n_min=0.01, n_max=3.0e4):
         """
         Equation (29): choose n so that each step is a small perturbation.
         Paper-faithful implementation matching equations 29a-d exactly.
+        sigE and sigJ are the 1σ diffusion amplitudes (standard deviations).
         """
         jmin = j_min_of_x(x, lc_scale_val, noloss_flag)
         E = -x
@@ -328,52 +347,53 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
         J = j * Jmax
 
         # (29a) limit fractional energy change
-        if e2 > 0.0:
-            n_E = (0.15 * abs(E) / e2)**2
+        if sigE > 0.0:
+            n_E = (0.15 * abs(E) / sigE)**2
         else:
             n_E = n_max
 
         # (29b) limit change in J relative to Jmax
-        if j2 > 0.0:
-            n_J_iso = (0.10 * Jmax / j2)**2
+        if sigJ > 0.0:
+            n_J_iso = (0.10 * Jmax / sigJ)**2
         else:
             n_J_iso = n_max
 
         # (29c) limit change near J ≈ Jmax
-        if j2 > 0.0:
+        if sigJ > 0.0:
             delta_top = max(1e-6 * Jmax, 1.0075 * Jmax - J)
-            n_J_top = (0.40 * delta_top / j2)**2
+            n_J_top = (0.40 * delta_top / sigJ)**2
         else:
             n_J_top = n_max
 
         # (29d) limit diffusion into / out of the loss cone
-        if noloss_flag or jmin <= 0.0 or j2 == 0.0:
+        # In noloss mode, cone_gamma_val = 0.0 (no LC forcing), but we still
+        # enforce the floor to prevent large steps across the LC region.
+        if noloss_flag or jmin <= 0.0 or sigJ == 0.0:
             n_J_lc = n_max
         else:
             Jmin = jmin * Jmax
-            gap = 0.25 * abs(J - Jmin)  # cone_gamma = 0.25 default
+            gap = cone_gamma_val * abs(J - Jmin)  # gap = 0 in noloss mode
             floor = max(gap, 0.10 * Jmin)
-            n_J_lc = (floor / j2)**2
+            n_J_lc = (floor / sigJ)**2
 
         n = min(n_E, n_J_iso, n_J_top, n_J_lc, n_max)
         return max(n_min, n)
 
     @njit(**fastmath)
-    def correlated_normals(e2, j2, z):
+    def correlated_normals(rho, sigE, sigJ):
         """
-        Build correlated Gaussian increments such that <ΔEΔJ> = n z.
-        Paper-faithful correlation handling.
+        Build correlated Gaussian increments such that <ΔEΔJ> = n ρ σ_E σ_J.
+        Returns (y1, y2) where y1 and y2 are correlated standard normals,
+        to be multiplied by sigE and sigJ respectively.
         """
         z1 = np.random.normal()
         z2 = np.random.normal()
         
-        if e2 > 0.0 and j2 > 0.0 and z > 0.0:
-            rho = z / (e2 * j2)
-            rho = max(-0.999999, min(0.999999, rho))
+        if abs(rho) < 0.999999:
             y1 = z1
             y2 = rho * z1 + math.sqrt(max(0.0, 1.0 - rho*rho)) * z2
         else:
-            # fall back to uncorrelated steps if z is tiny
+            # fall back to uncorrelated steps if rho is at limit
             y1 = z1
             y2 = z2
         return y1, y2
@@ -399,16 +419,17 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
         return k
 
     @njit(**fastmath)
-    def step_one(x, j, phase, pstar_val, noloss_flag, x_max, lc_scale_val):
+    def step_one(x, j, phase, pstar_val, noloss_flag, x_max, lc_scale_val, cone_gamma_val):
         """
         Paper-faithful random walk step matching equations (27) and Appendix B.
         Returns (x_new, j_new, phase_new, n_used, captured, crossed_peri).
         """
         # Get orbital coefficients with proper P* scaling
-        e1, e2, j1, j2, z = bilinear_coeffs(x, j, pstar_val)
+        # Returns: e1 (drift), sigE (1σ energy diffusion), j1 (drift), sigJ (1σ angular momentum diffusion), rho (correlation)
+        e1, sigE, j1, sigJ, rho = bilinear_coeffs(x, j, pstar_val)
         
         # Choose step size n (fraction of an orbit)
-        n_raw = pick_n(x, j, e2, j2, lc_scale_val, noloss_flag)
+        n_raw = pick_n(x, j, sigE, sigJ, lc_scale_val, noloss_flag, cone_gamma_val)
 
         # Land exactly on next pericenter if we'd cross it
         next_int = math.floor(phase) + 1.0
@@ -416,15 +437,15 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
         n = next_int - phase if crossed_peri else n_raw
 
         # Correlated Gaussian increments
-        y1, y2 = correlated_normals(e2, j2, z)
+        y1, y2 = correlated_normals(rho, sigE, sigJ)
 
         # Energy update: E = -x, so dE updates E, then x_new = -E_new
         E = -x
         Jmax = 1.0 / math.sqrt(2.0 * x)
         J = j * Jmax
 
-        # Equation (27): ΔE = n e1 + sqrt(n) e2 y1
-        deltaE = n * e1 + math.sqrt(n) * e2 * y1
+        # Equation (27): ΔE = n e1 + sqrt(n) σ_E y1
+        deltaE = n * e1 + math.sqrt(n) * sigE * y1
         E_new = E + deltaE
         if E_new >= -1e-6:
             E_new = -1e-6  # keep bound
@@ -438,9 +459,9 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
         # Angular momentum update: eq. (27b) or (28)
         # 2-D RW gate: eq. (28)
         # Use the 2D isotropic random walk in J-space whenever
-        # sqrt(n) * j2 exceeds j/4. In that case, the cross-correlation ζ2
-        # is neglected (as stated in the paper).
-        use_2d = (math.sqrt(n) * j2 > j / 4.0)
+        # sqrt(n) * sigJ exceeds j/4. In that case, the cross-correlation is
+        # neglected (as stated in the paper).
+        use_2d = (math.sqrt(n) * sigJ > j / 4.0)
 
         Jmax_new = 1.0 / math.sqrt(2.0 * x_new)
         
@@ -449,12 +470,13 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
             z1 = np.random.normal()
             z2 = np.random.normal()
             J_new = math.sqrt(
-                (J + math.sqrt(n) * z1 * j2)**2 +
-                (math.sqrt(n) * z2 * j2)**2
+                (J + math.sqrt(n) * z1 * sigJ)**2 +
+                (math.sqrt(n) * z2 * sigJ)**2
             )
         else:
             # 1D update with correlated noise (eq. 27b)
-            J_new = J + n * j1 + math.sqrt(n) * j2 * y2
+            # ΔJ = n j1 + sqrt(n) σ_J y2
+            J_new = J + n * j1 + math.sqrt(n) * sigJ * y2
 
         # Reflect at J=0 and J=Jmax (Appendix B)
         if J_new < 0.0:
@@ -480,7 +502,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
     @njit(**fastmath)
     def run_stream(n_relax, floors, clones_per_split, x_bins, dx,
                 seed, pstar_val, warmup_t0, x_init,
-                include_clone_gbar=True, use_snapshots=False, noloss=False, use_clones=True, x_max=1e10, lc_scale_val=1.0):
+                include_clone_gbar=True, use_snapshots=False, noloss=False, use_clones=True, x_max=1e10, lc_scale_val=1.0, cone_gamma_val=0.25):
         """
         Single time-carrying stream + clone tree.
 
@@ -530,7 +552,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
         t0_used = 0.0
         while t0_used < warmup_t0:
             x_prev = x
-            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, pstar_val, noloss, x_max, lc_scale_val)
+            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, pstar_val, noloss, x_max, lc_scale_val, cone_gamma_val)
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
 
@@ -571,7 +593,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
                         i += 1
                         continue
                     x_c, j_c, ph_c = cx[i], cj[i], cph[i]
-                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, pstar_val, noloss, x_max, lc_scale_val)
+                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, pstar_val, noloss, x_max, lc_scale_val, cone_gamma_val)
                     cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
 
                     if cap_c or (x_c2 < X_BOUND):
@@ -629,7 +651,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
 
         while t0_used < n_relax:
             x_prev = x
-            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, pstar_val, noloss, x_max, lc_scale_val)
+            x, j, phase, n_used, cap, crossed = step_one(x, j, phase, pstar_val, noloss, x_max, lc_scale_val, cone_gamma_val)
             
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -706,7 +728,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
                         i += 1
                         continue
                     x_c, j_c, ph_c = cx[i], cj[i], cph[i]
-                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, pstar_val, noloss, x_max, lc_scale_val)
+                    x_c2, j_c2, ph_c2, n_c, cap_c, crossed_c = step_one(x_c, j_c, ph_c, pstar_val, noloss, x_max, lc_scale_val, cone_gamma_val)
                     
                     cx[i], cj[i], cph[i] = x_c2, j_c2, ph_c2
 
@@ -780,7 +802,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=1.0):
 def _worker_one(args):
     (sid, n_relax, floors, clones_per_split,
      stream_seeds, use_jit, pstar_val, warmup_t0, u0,
-     include_clone_gbar, use_snapshots, noloss, use_clones, lc_scale, x_max) = args
+     include_clone_gbar, use_snapshots, noloss, use_clones, lc_scale, x_max, cone_gamma) = args
 
     P_of_x, T0, run_stream, sample_x_from_g0_jit = _build_kernels(use_jit=use_jit, noloss=noloss, lc_scale=lc_scale)
 
@@ -790,17 +812,17 @@ def _worker_one(args):
     # tiny warmup to pull kernels from cache
     _ = run_stream(1e-6, floors, clones_per_split, X_BINS, DX,
                    int(stream_seeds[sid] ^ 0xABCDEF), pstar_val, 0.0, x_init,
-                   include_clone_gbar, use_snapshots, noloss, use_clones, x_max, lc_scale)
+                   include_clone_gbar, use_snapshots, noloss, use_clones, x_max, lc_scale, cone_gamma)
 
     return run_stream(n_relax, floors, clones_per_split, X_BINS, DX,
                       int(stream_seeds[sid]), pstar_val, warmup_t0, x_init,
-                      include_clone_gbar, use_snapshots, noloss, use_clones, x_max, lc_scale)
+                      include_clone_gbar, use_snapshots, noloss, use_clones, x_max, lc_scale, cone_gamma)
 
 # ---------------- parallel driver (ḡ only) ----------------
 def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=9,
                     procs=48, use_jit=True, seed=SEED, show_progress=True,
                     pstar=PSTAR, warmup_t0=2.0, replicates=1, gexp=2.5,
-                    include_clone_gbar=True, use_snapshots=False, noloss=False, use_clones=True, lc_scale=1.0, x_max=None):
+                    include_clone_gbar=True, use_snapshots=False, noloss=False, use_clones=True, lc_scale=1.0, x_max=None, cone_gamma=0.25):
     """
     Run many independent time-carrying streams in parallel and accumulate ḡ(x).
 
@@ -819,7 +841,9 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
     # compared directly to BW g0(x).
     if noloss:
         use_clones = False
-        gexp = 2.5  # Force canonical exponent for calibration
+        gexp = 2.5  # Bahcall–Wolf II test uses the standard g(x) exponent
+        # Eq. (29d) with ε_min = 0: turn off loss-cone forcing in the noloss run.
+        cone_gamma = 0.0
     
     # Set x_max cap to prevent runaway deep diffusion.
     # For noloss calibration runs we only care about matching the BW
@@ -868,7 +892,7 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
                     _worker_one,
                 (sid, n_relax, floors, clones_per_split,
                     stream_seeds, use_jit, pstar, warmup_t0, u_strat[sid],
-                    include_clone_gbar, use_snapshots, noloss, use_clones, lc_scale, x_max)
+                    include_clone_gbar, use_snapshots, noloss, use_clones, lc_scale, x_max, cone_gamma)
                 )
                 for sid in range(n_streams)
             ]
