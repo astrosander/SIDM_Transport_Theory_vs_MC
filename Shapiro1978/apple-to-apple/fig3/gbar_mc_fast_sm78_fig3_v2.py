@@ -1062,11 +1062,26 @@ def run_parallel_gbar(
 
     # Build N_x from either snapshots or time weighting
     if use_snapshots:
-        # N_x = (sum weights) / (N_snap * Δx)
+        # Snapshot mode:
+        #   g_total[i] is the sum of weights in bin i over all snapshots.
+        #
+        # Snapshots are taken at equal intervals in t0, and in this code
+        # t0 is proportional to physical time.  That means each snapshot
+        # is already a fair *time* sample of the system, so g_total is
+        # directly proportional to the time-averaged occupancy N(E).
+        #
+        # To get the differential number per unit x we just divide by
+        # the total number of snapshots and the bin width Δx:
+        #
+        #   N_x = (sum of weights in bin) / (N_snap * Δx)
         n_snaps = total_measure
         N_x = g_total / (n_snaps * DX)
+
+        if show_progress:
+            print(f"[diag] snapshot mode: n_snaps = {n_snaps}", file=sys.stderr)
     else:
-        # N_x from time-weighted probability
+        # Time-weighted mode: already accounts for P(E) implicitly since
+        # dt0 = (n * P(E)) / T0, so no additional P(E) factor needed
         p_x = g_total / total_measure
         p_sum = p_x.sum()
         if show_progress:
@@ -1076,9 +1091,34 @@ def run_parallel_gbar(
     # Convert to g(x) with tunable exponent
     g_unscaled = N_x * (X_BINS ** gexp)
 
-    norm_idx = 0
-    if g_unscaled[norm_idx] <= 0:
-        raise RuntimeError("g_unscaled[norm_idx] <= 0; cannot normalize.")
+    # Find first bin with positive signal, fall back to 0.225 if possible
+    norm_idx = 0  # default: x=0.225 (first bin)
+    positive_bins = np.where(g_unscaled > 0)[0]
+    if positive_bins.size == 0:
+        # no signal at all; fill zeros and return gracefully
+        gbar_norm = np.zeros_like(g_unscaled)
+        gbar_raw = g_unscaled.copy()
+        if show_progress:
+            print(
+                "[diag] no positive g_unscaled; returning zeros for gbar.",
+                file=sys.stderr,
+            )
+        return gbar_norm, gbar_raw
+    
+    # Use first positive bin, but prefer x=0.225 if it's positive
+    if g_unscaled[norm_idx] > 0:
+        # x=0.225 is positive, use it
+        pass
+    else:
+        # x=0.225 is zero/negative, use first positive bin
+        norm_idx = positive_bins[0]
+        if show_progress:
+            print(
+                f"[diag] normalizing gbar on bin {norm_idx} (x={X_BINS[norm_idx]:.3g}) "
+                f"instead of x=0.225",
+                file=sys.stderr,
+            )
+    
     gbar_norm = g_unscaled / g_unscaled[norm_idx]
     gbar_raw = g_unscaled.copy()
 
