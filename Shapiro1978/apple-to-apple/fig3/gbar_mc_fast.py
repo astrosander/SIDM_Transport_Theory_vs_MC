@@ -98,12 +98,12 @@ mask = (X_G0 >= X_BOUND) & (X_G0 <= XMAX) & (G0_TAB > 0)
 XG  = X_G0[mask]
 G0  = G0_TAB[mask]
 
-# Build an inverse-CDF w.r.t. x by integrating the *DF* g0(x) itself.
-# This matches the way Shapiro & Marchant test their code against
-# the BW II steady-state solution in the noloss experiment.
-cdf_x   = np.zeros_like(XG)
+# Build an inverse-CDF w.r.t. x by integrating the *occupancy* N(x) ∝ x^{-5/2} g0(x).
+# This matches the BW II steady-state N(E) used for the noloss calibration.
+cdf_x = np.zeros_like(XG)
+w = G0 * (XG ** (-2.5))  # N(x) ∝ x^{-5/2} g0(x)
 cdf_x[1:] = np.cumsum(
-    0.5*(G0[1:] + G0[:-1])*(XG[1:] - XG[:-1])
+    0.5 * (w[1:] + w[:-1]) * (XG[1:] - XG[:-1])
 )
 cdf_x /= cdf_x[-1]  # normalise to 1
 
@@ -236,7 +236,8 @@ def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False, lc_scale=1.0):
             a2 = a21*(1.0-tj) + a22*tj
             return a1*(1.0-tx) + a2*tx
 
-        e1  = -get(NEG_E1)   # table lists -ε1*; need ε1*
+        # Table stores -ε1*; convert back to ε1* (drift in energy E)
+        e1  = -get(NEG_E1)
         e2v =  get(E2)
         j1v =  get(J1)
         j2v =  get(J2)
@@ -325,8 +326,12 @@ def _build_kernels(use_jit=True, cone_gamma=0.25, noloss=False, lc_scale=1.0):
         # correlated normals
         y1, y2 = correlated_normals(e2v, j2v, z2v)
 
-        # energy update (x = -E)
+        # energy update (x = -E, so E = -x)
+        # dE = drift + diffusion noise
+        # For steady state, drift should balance diffusion
         dE = n*e1 + math.sqrt(n)*y1*e2v
+        # Since x = -E, if dE > 0 (energy increases), x decreases
+        # If dE < 0 (energy decreases, more bound), x increases
         x_new = x - dE
         if x_new < 1e-12:
             x_new = 1e-12
@@ -835,36 +840,33 @@ def run_parallel_gbar(n_streams=400, n_relax=6.0, floors=None, clones_per_split=
             continue
         ratio = gmc / g0n if g0n > 0 else np.nan
         print(f"[diag] x={xb:6.2f}: g_MC/g0 ≈ {ratio:5.2f}", file=sys.stderr)
-    
-        # Patch C: special diagnostics for noloss mode
-        if noloss:
-            print("[diag] noloss mode: comparing g_MC to BW g0(x):", file=sys.stderr)
-            for xb, gmc, g0n in zip(X_BINS, gbar_norm, g0_norm):
-                if xb < 0.2 or xb > 100.0:
-                    continue
-                ratio = gmc / g0n if g0n > 0 else np.nan
-                print(f"[diag] noloss: x={xb:6.2g}, g_MC/g0 ≈ {ratio:6.3f}", file=sys.stderr)
-            
-            # Direct energy-space diagnostic: compare p_MC vs p_th
-            # p_MC = time-averaged probability per x-bin from MC
-            p_MC = gtime_total / gtime_total.sum()
-            
-            # p_th = theoretical p(x) from g0(x) using N(E) ∝ x^{-5/2} g0(x)
-            # Interpolate g0 onto X_BINS
-            ln1p_x = np.log1p(X_BINS)
-            g0_interp = np.interp(ln1p_x, LN1P, G0_TAB)
-            # N(E) ∝ x^{-5/2} g0(x)
-            N_th = g0_interp * (X_BINS ** (-2.5))
-            # Normalize to get probability distribution
-            p_th = N_th / N_th.sum()
-            
-            print("[diag] noloss: direct energy-space comparison p_MC/p_th:", file=sys.stderr)
-            for i in range(0, X_BINS.size, max(1, X_BINS.size // 10)):  # Sample ~10 points
-                xb = X_BINS[i]
-                if xb < 0.2 or xb > 100.0:
-                    continue
-                ratio = p_MC[i] / p_th[i] if p_th[i] > 0 else np.nan
-                print(f"[occ] x={xb:6.2f}: p_MC/p_th ≈ {ratio:6.3f}", file=sys.stderr)
+
+    # Patch C: special diagnostics for noloss mode
+    if noloss:
+        print("[diag] noloss mode: comparing g_MC to BW g0(x):", file=sys.stderr)
+        for xb, gmc, g0n in zip(X_BINS, gbar_norm, g0_norm):
+            if xb < 0.2 or xb > 100.0:
+                continue
+            ratio = gmc / g0n if g0n > 0 else np.nan
+            print(f"[diag] noloss: x={xb:6.2g}, g_MC/g0 ≈ {ratio:6.3f}", file=sys.stderr)
+        
+        # Direct energy-space diagnostic: compare p_MC vs p_th
+        # p_MC = time-averaged probability per x-bin from MC (or snapshot fraction)
+        p_MC = gtime_total / gtime_total.sum()
+
+        # p_th = theoretical p(x) from g0(x) using N(E) ∝ x^{-5/2} g0(x)
+        ln1p_x = np.log1p(X_BINS)
+        g0_interp = np.interp(ln1p_x, LN1P, G0_TAB)
+        N_th = g0_interp * (X_BINS ** (-2.5))
+        p_th = N_th / N_th.sum()
+        
+        print("[diag] noloss: direct energy-space comparison p_MC/p_th:", file=sys.stderr)
+        for i in range(0, X_BINS.size, max(1, X_BINS.size // 10)):  # Sample ~10 points
+            xb = X_BINS[i]
+            if xb < 0.2 or xb > 100.0:
+                continue
+            ratio = p_MC[i] / p_th[i] if p_th[i] > 0 else np.nan
+            print(f"[occ] x={xb:6.2f}: p_MC/p_th ≈ {ratio:6.3f}", file=sys.stderr)
 
     return gbar_norm, gbar_raw
 
