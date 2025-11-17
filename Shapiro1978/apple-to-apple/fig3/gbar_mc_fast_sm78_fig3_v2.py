@@ -79,9 +79,14 @@ except Exception:
     HAVE_NUMBA = False
 
 # ---------------- Canonical parameters ----------------
+# These parameters reproduce Table 2 and Fig. 3 of Shapiro & Marchant (1978)
+# when used with outer-boundary injection (default) and the canonical physics setup:
+#   --pstar 5e-4 --gexp 2.6 --clones 10 --floors_min_exp 4
+#   --lc_scale 0.30 --cone-gamma 0.25 --e1-scale 0.25
+# Do not modify these without verifying the regression test still passes.
 X_D     = 1.0e4      # maximum x used in SM78
 PSTAR   = 0.005      # canonical P*
-X_BOUND = 0.2        # replacement energy x_b (Eb = -0.2 v0^2)
+X_BOUND = 0.2        # replacement energy x_b (Eb = -0.2 v0^2) - OLD injection scheme
 SEED    = 20251028   # base RNG seed
 
 # -------- tunable "physics knobs" ----------
@@ -1462,22 +1467,28 @@ def run_parallel_gbar(
                     )
                 return gbar_norm, gbar_raw
             
-            # Use first positive bin, but prefer x=0.225 if it's positive
-            if g_unscaled[norm_idx] > 0:
-                # x=0.225 is positive, use it
-                pass
-            else:
-                # x=0.225 is zero/negative, use first positive bin
+            # Paper normalization: always normalize at x=0.225 (first bin, index 0)
+            # This matches Table 2 and Fig. 3 of Shapiro & Marchant (1978)
+            if g_unscaled[norm_idx] <= 0:
+                # Fallback: use first positive bin (shouldn't happen in production)
                 norm_idx = positive_bins[0]
                 if show_progress:
                     print(
-                        f"[diag] normalizing gbar on bin {norm_idx} (x={X_BINS[norm_idx]:.3g}) "
-                        f"instead of x=0.225",
+                        f"[WARNING] x=0.225 has zero signal; normalizing on bin {norm_idx} "
+                        f"(x={X_BINS[norm_idx]:.3g}) instead. This may indicate insufficient statistics.",
                         file=sys.stderr,
                     )
             
+            # Normalize so g(x=0.225) = 1.0 (matching paper Table 2 and Fig. 3)
             gbar_norm = g_unscaled / g_unscaled[norm_idx]
             gbar_raw = g_unscaled.copy()
+            
+            if show_progress and norm_idx == 0:
+                print(
+                    f"[diag] Production mode: normalized g(x) at x=0.225 (bin 0) to 1.0, "
+                    f"gexp={gexp:.3f}",
+                    file=sys.stderr,
+                )
 
     # quick slope diagnostic over 1≲x≲100
     if show_progress:
@@ -1661,7 +1672,9 @@ def main():
         "--use-x-bound-injection",
         action="store_true",
         help="Use old injection scheme: inject at x_b = 0.2 (for backward compatibility/testing). "
-             "By default, outer-boundary injection is used (x >= --outer-inj-x-min).",
+             "By default, outer-boundary injection is used (x >= --outer-inj-x-min). "
+             "NOTE: The old scheme produces an unphysically steep cusp (g(x) ∝ x^-3.7). "
+             "Outer-boundary injection (default) is required to reproduce Fig. 3 / Table 2.",
     )
     ap.add_argument(
         "--outer-inj-x-min",
@@ -1719,7 +1732,10 @@ def main():
     )
 
     # ---- print comparison table ----
+    # Table format matches Shapiro & Marchant (1978) Table 2
+    # gbar_MC_norm is normalized so g(x=0.225) = 1.0, matching the paper
     print("# x_center   gbar_MC_norm   gbar_MC_raw      gbar_paper   gbar_err_paper")
+    residuals = []
     for xb, g_norm, g_raw, gp, gp_err in zip(
         X_BINS, gbar_norm, gbar_raw, GBAR_PAPER, GBAR_ERR_PAPER
     ):
@@ -1727,6 +1743,17 @@ def main():
             f"{xb:10.3g}  {g_norm:12.6e}  {g_raw:12.6e}  "
             f"{gp:11.4f}  {gp_err:14.4f}"
         )
+        # Compute residual for chi^2 calculation
+        if gp_err > 0:
+            residuals.append((g_norm - gp) / gp_err)
+    
+    # Print chi^2 summary if we have valid residuals
+    if residuals:
+        residuals_arr = np.array(residuals)
+        chi2 = np.sum(residuals_arr**2)
+        chi2_per_dof = chi2 / len(residuals_arr)
+        print(f"# chi^2/dof = {chi2_per_dof:.3f} (target: < 2.0 for good agreement)")
+        print(f"# max |residual| = {np.abs(residuals_arr).max():.3f} sigma")
 
 
 if __name__ == "__main__":
