@@ -635,7 +635,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                    lc_floor_frac=0.10,
                    lc_gap_scale=-1.0,
                    enable_cap_inj_diag=False,
-                   outer_injection=False,
+                   outer_injection=True,  # Default: use outer-boundary injection (physically correct)
                    outer_inj_x_min=10.0):
         """
         Single time-carrying stream + clone tree.
@@ -723,8 +723,16 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 if noloss_flag:
                     x = sample_x_from_g0_jit()
                 else:
-                    # Canonical SM78: exact injection at x_b = 0.2 with isotropic J
-                    x = X_BOUND
+                    # Injection: use outer-boundary injection by default (set via outer_injection parameter)
+                    if outer_injection:
+                        # Outer-boundary injection: draw from reservoir distribution
+                        # but restrict to x >= outer_inj_x_min to match outer boundary
+                        x = sample_x_from_g0_jit()
+                        while x < outer_inj_x_min:
+                            x = sample_x_from_g0_jit()
+                    else:
+                        # Old scheme: exact injection at x_b = 0.2 (for backward compatibility)
+                        x = X_BOUND
                 j = math.sqrt(np.random.random())
                 parent_floor_idx = floor_index_for_j2(j * j, floors)
             elif use_clones:
@@ -772,8 +780,17 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                         if noloss_flag:
                             cx[i] = sample_x_from_g0_jit()
                         else:
-                            # Canonical SM78: exact injection at x_b = 0.2 with isotropic J
-                            cx[i] = X_BOUND
+                            # Injection: use outer-boundary injection by default (set via outer_injection parameter)
+                            if outer_injection:
+                                # Outer-boundary injection: draw from reservoir distribution
+                                # but restrict to x >= outer_inj_x_min to match outer boundary
+                                x_inj = sample_x_from_g0_jit()
+                                while x_inj < outer_inj_x_min:
+                                    x_inj = sample_x_from_g0_jit()
+                                cx[i] = x_inj
+                            else:
+                                # Old scheme: exact injection at x_b = 0.2 (for backward compatibility)
+                                cx[i] = X_BOUND
                         cj[i] = math.sqrt(np.random.random())
                         cph[i] = ph_c2
                         cfloor_idx[i] = floor_index_for_j2(cj[i] * cj[i], floors)
@@ -894,12 +911,13 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                         x = sample_x_from_g0_jit()
                     else:
                         if outer_injection:
-                            # Outer-boundary injection: draw from high-x bins
+                            # Outer-boundary injection (default): draw from reservoir distribution
+                            # but restrict to x >= outer_inj_x_min to match outer boundary
                             x = sample_x_from_g0_jit()
                             while x < outer_inj_x_min:
                                 x = sample_x_from_g0_jit()
                         else:
-                            # Canonical SM78: exact injection at x_b = 0.2 with isotropic J
+                            # Old scheme: exact injection at x_b = 0.2 (for backward compatibility)
                             x = X_BOUND
                 j = math.sqrt(np.random.random())
                 parent_floor_idx = floor_index_for_j2(j * j, floors)
@@ -979,13 +997,14 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                                 cx[i] = sample_x_from_g0_jit()
                             else:
                                 if outer_injection:
-                                    # Outer-boundary injection: draw from high-x bins
+                                    # Outer-boundary injection (default): draw from reservoir distribution
+                                    # but restrict to x >= outer_inj_x_min to match outer boundary
                                     x_inj = sample_x_from_g0_jit()
                                     while x_inj < outer_inj_x_min:
                                         x_inj = sample_x_from_g0_jit()
                                     cx[i] = x_inj
                                 else:
-                                    # Canonical SM78: exact injection at x_b = 0.2 with isotropic J
+                                    # Old scheme: exact injection at x_b = 0.2 (for backward compatibility)
                                     cx[i] = X_BOUND
                         cj[i] = math.sqrt(np.random.random())
                         cph[i] = ph_c2
@@ -1116,8 +1135,8 @@ def run_parallel_gbar(
     lc_floor_frac=0.10,
     lc_gap_scale=None,
     enable_cap_inj_diag=False,
-    outer_injection=False,
-    outer_inj_x_min=10.0,
+    outer_injection=True,  # Default: use outer-boundary injection (physically correct BC)
+    outer_inj_x_min=10.0,  # Default minimum x for outer injection
 ):
     """
     Run many independent time-carrying streams in parallel and accumulate ḡ(x).
@@ -1639,15 +1658,17 @@ def main():
         help="Enable capture/injection diagnostics: histogram captures and injections by x-bin.",
     )
     ap.add_argument(
-        "--outer-injection",
+        "--use-x-bound-injection",
         action="store_true",
-        help="Use outer-boundary injection: inject captured stars at high-x bins (x >= --outer-inj-x-min) instead of x_b.",
+        help="Use old injection scheme: inject at x_b = 0.2 (for backward compatibility/testing). "
+             "By default, outer-boundary injection is used (x >= --outer-inj-x-min).",
     )
     ap.add_argument(
         "--outer-inj-x-min",
         type=float,
         default=10.0,
-        help="Minimum x for outer-boundary injection (default: 10.0). Only used with --outer-injection.",
+        help="Minimum x for outer-boundary injection (default: 10.0). "
+             "Stars are injected from the reservoir distribution with x >= this value.",
     )
     ap.add_argument(
         "--debug-occupancy-norm",
@@ -1693,7 +1714,7 @@ def main():
         lc_floor_frac=args.lc_floor_frac,
         lc_gap_scale=args.lc_gap_scale,
         enable_cap_inj_diag=args.cap_inj_diag,
-        outer_injection=args.outer_injection,
+        outer_injection=not args.use_x_bound_injection,  # Default to outer injection unless flag is set
         outer_inj_x_min=args.outer_inj_x_min,
     )
 
