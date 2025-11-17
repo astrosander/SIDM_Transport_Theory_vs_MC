@@ -512,7 +512,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
     def step_one(x, j, phase, pstar_val, noloss_flag, x_max,
                  lc_scale_val, cone_gamma_val, e1_scale_val,
                  diag_counts=None, disable_capture=False,
-                 lc_floor_frac=0.10, lc_gap_scale=None):
+                 lc_floor_frac=0.10, lc_gap_scale=None,
+                 ghost_cap_hist=None, x_bins=None):
         """
         One MC step (possibly fractional orbit) with pericenter-aligned
         truncation. Returns:
@@ -593,10 +594,27 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
 
         # capture only at pericenter in canonical runs
         captured = False
-        if not disable_capture and (not noloss_flag) and crossed_peri:
+        ghost_captured = False
+        if (not noloss_flag) and crossed_peri:
             j_min_new = j_min_of_x(x_new, lc_scale_val, noloss_flag)
             if j_new < j_min_new:
-                captured = True
+                if not disable_capture:
+                    captured = True
+                else:
+                    # Ghost capture: would have been captured but capture is disabled
+                    ghost_captured = True
+        
+        # Track ghost captures if diagnostics enabled
+        if ghost_cap_hist is not None and ghost_captured:
+            # Find bin for x_new
+            best = 0
+            bestd = abs(x_bins[0] - x_new)
+            for i in range(1, x_bins.size):
+                d = abs(x_bins[i] - x_new)
+                if d < bestd:
+                    bestd = d
+                    best = i
+            ghost_cap_hist[best] += 1
 
         return x_new, j_new, phase_new, n, captured, crossed_peri
 
@@ -615,7 +633,10 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                    enable_diag_counts=False,
                    disable_capture=False,
                    lc_floor_frac=0.10,
-                   lc_gap_scale=-1.0):
+                   lc_gap_scale=-1.0,
+                   enable_cap_inj_diag=False,
+                   outer_injection=False,
+                   outer_inj_x_min=10.0):
         """
         Single time-carrying stream + clone tree.
 
@@ -626,6 +647,9 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             caps     : capture events
             ccount   : clone pool high-water mark
             diag_counts : array[4] counting which eq. 29 constraint wins (if enabled)
+            cap_hist : array[x_bins.size] counting captures per x-bin (if enabled)
+            inj_hist : array[x_bins.size] counting injections per x-bin (if enabled)
+            ghost_cap_hist : array[x_bins.size] counting ghost captures per x-bin (if enabled)
         """
         np.random.seed(seed)
         SPLIT_HYST = 0.8
@@ -636,6 +660,16 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             diag_counts = np.zeros(4, dtype=np.int64)
         else:
             diag_counts = None
+        
+        # Initialize capture/injection diagnostics
+        if enable_cap_inj_diag:
+            cap_hist = np.zeros(x_bins.size, dtype=np.int64)
+            inj_hist = np.zeros(x_bins.size, dtype=np.int64)
+            ghost_cap_hist = np.zeros(x_bins.size, dtype=np.int64)
+        else:
+            cap_hist = None
+            inj_hist = None
+            ghost_cap_hist = None
         
         # Handle lc_gap_scale: -1.0 means use cone_gamma_val, otherwise use the override
         gap_scale_val = None if lc_gap_scale < 0.0 else lc_gap_scale
@@ -678,7 +712,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 x, j, phase, pstar_val, noloss_flag, x_max,
                 lc_scale_val, cone_gamma_val, e1_scale_val,
                 diag_counts=diag_counts, disable_capture=disable_capture,
-                lc_floor_frac=lc_floor_frac, lc_gap_scale=gap_scale_val
+                lc_floor_frac=lc_floor_frac, lc_gap_scale=gap_scale_val,
+                ghost_cap_hist=ghost_cap_hist, x_bins=x_bins
             )
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -726,7 +761,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                         x_c, j_c, ph_c, pstar_val, noloss_flag, x_max,
                         lc_scale_val, cone_gamma_val, e1_scale_val,
                         diag_counts=diag_counts, disable_capture=disable_capture,
-                        lc_floor_frac=lc_floor_frac, lc_gap_scale=gap_scale_val
+                        lc_floor_frac=lc_floor_frac, lc_gap_scale=gap_scale_val,
+                        ghost_cap_hist=ghost_cap_hist, x_bins=x_bins
                     )
                     cx[i] = x_c2
                     cj[i] = j_c2
@@ -797,7 +833,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 x, j, phase, pstar_val, noloss_flag, x_max,
                 lc_scale_val, cone_gamma_val, e1_scale_val,
                 diag_counts=diag_counts, disable_capture=disable_capture,
-                lc_floor_frac=lc_floor_frac, lc_gap_scale=gap_scale_val
+                lc_floor_frac=lc_floor_frac, lc_gap_scale=gap_scale_val,
+                ghost_cap_hist=ghost_cap_hist, x_bins=x_bins
             )
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -830,11 +867,40 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             if cap or (x < X_BOUND):
                 if cap:
                     caps += 1
-                if noloss_flag:
-                    x = sample_x_from_g0_jit()
+                    # Track capture energy distribution
+                    if cap_hist is not None:
+                        cap_hist[bin_index(x_prev)] += 1
+                
+                # Track injection energy distribution
+                if inj_hist is not None:
+                    if outer_injection and not noloss_flag:
+                        # Outer-boundary injection: draw from high-x bins
+                        # Sample from initial distribution but restrict to x >= outer_inj_x_min
+                        x_inj = sample_x_from_g0_jit()
+                        while x_inj < outer_inj_x_min:
+                            x_inj = sample_x_from_g0_jit()
+                        x = x_inj
+                        inj_hist[bin_index(x)] += 1
+                    elif noloss_flag:
+                        x = sample_x_from_g0_jit()
+                        inj_hist[bin_index(x)] += 1
+                    else:
+                        # Canonical SM78: exact injection at x_b = 0.2
+                        x = X_BOUND
+                        inj_hist[bin_index(x)] += 1
                 else:
-                    # Canonical SM78: exact injection at x_b = 0.2 with isotropic J
-                    x = X_BOUND
+                    # Normal injection logic (no diagnostics)
+                    if noloss_flag:
+                        x = sample_x_from_g0_jit()
+                    else:
+                        if outer_injection:
+                            # Outer-boundary injection: draw from high-x bins
+                            x = sample_x_from_g0_jit()
+                            while x < outer_inj_x_min:
+                                x = sample_x_from_g0_jit()
+                        else:
+                            # Canonical SM78: exact injection at x_b = 0.2 with isotropic J
+                            x = X_BOUND
                 j = math.sqrt(np.random.random())
                 parent_floor_idx = floor_index_for_j2(j * j, floors)
             elif use_clones:
@@ -873,7 +939,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                         x_c, j_c, ph_c, pstar_val, noloss_flag, x_max,
                         lc_scale_val, cone_gamma_val, e1_scale_val,
                         diag_counts=diag_counts, disable_capture=disable_capture,
-                        lc_floor_frac=lc_floor_frac, lc_gap_scale=gap_scale_val
+                        lc_floor_frac=lc_floor_frac, lc_gap_scale=gap_scale_val,
+                        ghost_cap_hist=ghost_cap_hist, x_bins=x_bins
                     )
 
                     cx[i] = x_c2
@@ -886,11 +953,40 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                     if cap_c or (x_c2 < X_BOUND):
                         if cap_c:
                             caps += 1
-                        if noloss_flag:
-                            cx[i] = sample_x_from_g0_jit()
+                            # Track capture energy distribution
+                            if cap_hist is not None:
+                                cap_hist[bin_index(x_c)] += 1
+                        
+                        # Track injection energy distribution
+                        if inj_hist is not None:
+                            if outer_injection and not noloss_flag:
+                                # Outer-boundary injection: draw from high-x bins
+                                x_inj = sample_x_from_g0_jit()
+                                while x_inj < outer_inj_x_min:
+                                    x_inj = sample_x_from_g0_jit()
+                                cx[i] = x_inj
+                                inj_hist[bin_index(x_inj)] += 1
+                            elif noloss_flag:
+                                cx[i] = sample_x_from_g0_jit()
+                                inj_hist[bin_index(cx[i])] += 1
+                            else:
+                                # Canonical SM78: exact injection at x_b = 0.2
+                                cx[i] = X_BOUND
+                                inj_hist[bin_index(cx[i])] += 1
                         else:
-                            # Canonical SM78: exact injection at x_b = 0.2 with isotropic J
-                            cx[i] = X_BOUND
+                            # Normal injection logic (no diagnostics)
+                            if noloss_flag:
+                                cx[i] = sample_x_from_g0_jit()
+                            else:
+                                if outer_injection:
+                                    # Outer-boundary injection: draw from high-x bins
+                                    x_inj = sample_x_from_g0_jit()
+                                    while x_inj < outer_inj_x_min:
+                                        x_inj = sample_x_from_g0_jit()
+                                    cx[i] = x_inj
+                                else:
+                                    # Canonical SM78: exact injection at x_b = 0.2 with isotropic J
+                                    cx[i] = X_BOUND
                         cj[i] = math.sqrt(np.random.random())
                         cph[i] = ph_c2
                         cfloor_idx[i] = floor_index_for_j2(cj[i] * cj[i], floors)
@@ -938,11 +1034,17 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         # Return diagnostic counters (or zeros if disabled)
         if diag_counts is None:
             diag_counts = np.zeros(4, dtype=np.int64)
+        if cap_hist is None:
+            cap_hist = np.zeros(x_bins.size, dtype=np.int64)
+        if inj_hist is None:
+            inj_hist = np.zeros(x_bins.size, dtype=np.int64)
+        if ghost_cap_hist is None:
+            ghost_cap_hist = np.zeros(x_bins.size, dtype=np.int64)
         
         if use_snapshots:
-            return g_acc, snapshots, crossings, caps, max_ccount, weight_sum, diag_counts
+            return g_acc, snapshots, crossings, caps, max_ccount, weight_sum, diag_counts, cap_hist, inj_hist, ghost_cap_hist
         else:
-            return g_acc, total_t0, crossings, caps, max_ccount, weight_sum, diag_counts
+            return g_acc, total_t0, crossings, caps, max_ccount, weight_sum, diag_counts, cap_hist, inj_hist, ghost_cap_hist
 
     return P_of_x, T0, run_stream, sample_x_from_g0_jit
 
@@ -953,7 +1055,8 @@ def _worker_one(args):
      stream_seeds, use_jit, pstar_val, warmup_t0, u0,
      include_clone_gbar, use_snapshots, snaps_per_t0,
      noloss, use_clones, lc_scale, e1_scale, x_max, cone_gamma,
-     enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale) = args
+     enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
+     enable_cap_inj_diag, outer_injection, outer_inj_x_min) = args
 
     P_of_x, T0, run_stream, sample_x_from_g0_jit = _build_kernels(
         use_jit=use_jit, noloss=noloss, lc_scale=lc_scale,
@@ -969,7 +1072,8 @@ def _worker_one(args):
         int(stream_seeds[sid] ^ 0xABCDEF), pstar_val, 0.0, x_init,
         include_clone_gbar, use_snapshots, noloss, use_clones,
         x_max, lc_scale, cone_gamma, e1_scale, snaps_per_t0,
-        enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale
+        enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
+        enable_cap_inj_diag, outer_injection, outer_inj_x_min
     )
 
     result = run_stream(
@@ -977,7 +1081,8 @@ def _worker_one(args):
         int(stream_seeds[sid]), pstar_val, warmup_t0, x_init,
         include_clone_gbar, use_snapshots, noloss, use_clones,
         x_max, lc_scale, cone_gamma, e1_scale, snaps_per_t0,
-        enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale
+        enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
+        enable_cap_inj_diag, outer_injection, outer_inj_x_min
     )
     return result
 
@@ -1010,6 +1115,9 @@ def run_parallel_gbar(
     disable_capture=False,
     lc_floor_frac=0.10,
     lc_gap_scale=None,
+    enable_cap_inj_diag=False,
+    outer_injection=False,
+    outer_inj_x_min=10.0,
 ):
     """
     Run many independent time-carrying streams in parallel and accumulate ḡ(x).
@@ -1065,6 +1173,9 @@ def run_parallel_gbar(
     total_done = 0
     weight_sums = []  # Track weight sums for diagnostics
     diag_counts_total = np.zeros(4, dtype=np.int64)  # Track eq. 29 constraint winners
+    cap_hist_total = np.zeros_like(X_BINS, dtype=np.int64)  # Track captures per x-bin
+    inj_hist_total = np.zeros_like(X_BINS, dtype=np.int64)  # Track injections per x-bin
+    ghost_cap_hist_total = np.zeros_like(X_BINS, dtype=np.int64)  # Track ghost captures per x-bin
 
     for rep in range(replicates):
         stream_seeds = rs.randint(1, 2**31 - 1, size=n_streams, dtype=np.int64)
@@ -1099,13 +1210,16 @@ def run_parallel_gbar(
                         disable_capture,
                         lc_floor_frac,
                         lc_gap_scale if lc_gap_scale is not None else -1.0,
+                        enable_cap_inj_diag,
+                        outer_injection,
+                        outer_inj_x_min,
                     ),
                 )
                 for sid in range(n_streams)
             ]
 
             for f in cf.as_completed(futs):
-                g_b, measure_b, peri_b, caps_b, ccount_b, wsum_b, diag_b = f.result()
+                g_b, measure_b, peri_b, caps_b, ccount_b, wsum_b, diag_b, cap_b, inj_b, ghost_b = f.result()
                 g_total += g_b
                 total_measure += measure_b
                 peri_total += peri_b
@@ -1113,6 +1227,10 @@ def run_parallel_gbar(
                 weight_sums.append(wsum_b)
                 if enable_diag_counts:
                     diag_counts_total += diag_b
+                if enable_cap_inj_diag:
+                    cap_hist_total += cap_b
+                    inj_hist_total += inj_b
+                    ghost_cap_hist_total += ghost_b
                 if ccount_b > max_ccount:
                     max_ccount = ccount_b
                 total_done += 1
@@ -1152,6 +1270,31 @@ def run_parallel_gbar(
                 print(f"       29b (J isotropic):     {diag_counts_total[1]:10d} ({100*diag_counts_total[1]/total_steps:5.1f}%)", file=sys.stderr)
                 print(f"       29c (J max boundary):    {diag_counts_total[2]:10d} ({100*diag_counts_total[2]/total_steps:5.1f}%)", file=sys.stderr)
                 print(f"       29d (loss-cone limit):   {diag_counts_total[3]:10d} ({100*diag_counts_total[3]/total_steps:5.1f}%)", file=sys.stderr)
+        if enable_cap_inj_diag:
+            total_caps = cap_hist_total.sum()
+            total_inj = inj_hist_total.sum()
+            total_ghost = ghost_cap_hist_total.sum()
+            if total_caps > 0 or total_inj > 0:
+                print(f"[diag] Capture/Injection diagnostics:", file=sys.stderr)
+                print(f"       Total captures: {total_caps}, Total injections: {total_inj}", file=sys.stderr)
+                if total_ghost > 0:
+                    print(f"       Total ghost captures (with --disable-capture): {total_ghost}", file=sys.stderr)
+                print(f"       x_center    N_cap    N_inj    N_occ    Γ_cap(x)  (Γ = N_cap/N_occ per t0)", file=sys.stderr)
+                # Compute occupancy for rate calculation
+                # g_total is time-weighted occupancy (or snapshot-weighted)
+                # For rate calculation, we want the total occupancy accumulated
+                N_occ = g_total.copy()  # This is already the accumulated occupancy
+                for i in range(X_BINS.size):
+                    if cap_hist_total[i] > 0 or inj_hist_total[i] > 0 or N_occ[i] > 0:
+                        # Capture rate per unit occupancy (normalized by total measure time)
+                        if N_occ[i] > 0 and total_measure > 0:
+                            # Normalize occupancy by total measure to get average occupancy
+                            N_occ_norm = N_occ[i] / total_measure
+                            gamma_cap = cap_hist_total[i] / N_occ_norm if N_occ_norm > 0 else 0.0
+                        else:
+                            gamma_cap = 0.0
+                            N_occ_norm = 0.0
+                        print(f"       {X_BINS[i]:8.2f}  {cap_hist_total[i]:8d}  {inj_hist_total[i]:8d}  {N_occ[i]:8.2e}  {gamma_cap:8.2e}", file=sys.stderr)
         if weight_sums:
             wsum_arr = np.array(weight_sums)
             print(
@@ -1491,6 +1634,22 @@ def main():
         help="Override cone_gamma for eq. 29d gap calculation (default: use --cone-gamma value).",
     )
     ap.add_argument(
+        "--cap-inj-diag",
+        action="store_true",
+        help="Enable capture/injection diagnostics: histogram captures and injections by x-bin.",
+    )
+    ap.add_argument(
+        "--outer-injection",
+        action="store_true",
+        help="Use outer-boundary injection: inject captured stars at high-x bins (x >= --outer-inj-x-min) instead of x_b.",
+    )
+    ap.add_argument(
+        "--outer-inj-x-min",
+        type=float,
+        default=10.0,
+        help="Minimum x for outer-boundary injection (default: 10.0). Only used with --outer-injection.",
+    )
+    ap.add_argument(
         "--debug-occupancy-norm",
         action="store_true",
         help=(
@@ -1533,6 +1692,9 @@ def main():
         disable_capture=args.disable_capture,
         lc_floor_frac=args.lc_floor_frac,
         lc_gap_scale=args.lc_gap_scale,
+        enable_cap_inj_diag=args.cap_inj_diag,
+        outer_injection=args.outer_injection,
+        outer_inj_x_min=args.outer_inj_x_min,
     )
 
     # ---- print comparison table ----
