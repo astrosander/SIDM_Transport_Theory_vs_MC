@@ -406,9 +406,15 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
 
     @njit(**fastmath)
     def pick_n(x, j, sigE, sigJ, lc_scale_val, noloss_flag, cone_gamma_val,
-               n_min=0.01, n_max=3.0e4):
+               n_min=0.01, n_max=3.0e4,
+               diag_counts=None, lc_floor_frac=0.10, lc_gap_scale=None):
         """
         Equation (29): choose n so that each step is a small perturbation.
+        
+        DIAGNOSTIC PARAMETERS:
+        - diag_counts: optional array[4] to count which constraint wins (29a, 29b, 29c, 29d)
+        - lc_floor_frac: floor fraction for 29d (default 0.10, set to 0.0 to disable floor)
+        - lc_gap_scale: override for cone_gamma_val in 29d gap calculation (None = use cone_gamma_val)
         """
         jmin = j_min_of_x(x, lc_scale_val, noloss_flag)
         E = -x
@@ -435,18 +441,41 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             n_J_top = n_max
 
         # 29d: limit diffusion into/out of loss cone
-        # SM78 eq. 29d: step size limited by max[γ|J-J_min|, 0.10*J_min]
+        # SM78 eq. 29d: step size limited by max[γ|J-J_min|, floor_frac*J_min]
         if noloss_flag or jmin <= 0.0 or sigJ == 0.0:
             n_J_lc = n_max
         else:
             Jmin = jmin * Jmax
-            gap = cone_gamma_val * abs(J - Jmin)
-            floor = max(gap, 0.10 * Jmin)  # SM78: 0.10 * J_min floor
+            gap_scale = cone_gamma_val if lc_gap_scale is None else lc_gap_scale
+            gap = gap_scale * abs(J - Jmin)
+            if lc_floor_frac > 0.0:
+                floor = max(gap, lc_floor_frac * Jmin)
+            else:
+                floor = gap  # No floor
             n_J_lc = (floor / sigJ) ** 2
 
-        n = min(n_E, n_J_iso, n_J_top, n_J_lc, n_max)
+        # Find which constraint wins (for diagnostics)
+        n = n_E
+        winner = 0  # 29a
+        if n_J_iso < n:
+            n = n_J_iso
+            winner = 1  # 29b
+        if n_J_top < n:
+            n = n_J_top
+            winner = 2  # 29c
+        if n_J_lc < n:
+            n = n_J_lc
+            winner = 3  # 29d
+        
+        if n > n_max:
+            n = n_max
         if n < n_min:
             n = n_min
+        
+        # Record winner if diagnostics enabled
+        if diag_counts is not None:
+            diag_counts[winner] += 1
+        
         return n
 
     @njit(**fastmath)
@@ -481,19 +510,28 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
 
     @njit(**fastmath)
     def step_one(x, j, phase, pstar_val, noloss_flag, x_max,
-                 lc_scale_val, cone_gamma_val, e1_scale_val):
+                 lc_scale_val, cone_gamma_val, e1_scale_val,
+                 diag_counts=None, disable_capture=False,
+                 lc_floor_frac=0.10, lc_gap_scale=None):
         """
         One MC step (possibly fractional orbit) with pericenter-aligned
         truncation. Returns:
 
             x_new, j_new, phase_new, n_used, captured, crossed_peri
+        
+        DIAGNOSTIC PARAMETERS:
+        - diag_counts: optional array[4] to count which constraint wins in pick_n
+        - disable_capture: if True, never set captured=True (for testing 29d effect alone)
+        - lc_floor_frac: floor fraction for 29d (default 0.10)
+        - lc_gap_scale: override for cone_gamma_val in 29d gap calculation
         """
         # orbital coefficients
         e1, sigE, j1, sigJ, rho = bilinear_coeffs(x, j, pstar_val, e1_scale_val)
 
         # step length
         n_raw = pick_n(x, j, sigE, sigJ, lc_scale_val, noloss_flag,
-                       cone_gamma_val)
+                       cone_gamma_val, diag_counts=diag_counts,
+                       lc_floor_frac=lc_floor_frac, lc_gap_scale=lc_gap_scale)
 
         # pericenter-aligned: do not cross the next integer phase
         next_int = math.floor(phase) + 1.0
@@ -555,7 +593,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
 
         # capture only at pericenter in canonical runs
         captured = False
-        if (not noloss_flag) and crossed_peri:
+        if not disable_capture and (not noloss_flag) and crossed_peri:
             j_min_new = j_min_of_x(x_new, lc_scale_val, noloss_flag)
             if j_new < j_min_new:
                 captured = True
@@ -573,7 +611,11 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                    lc_scale_val=1.0,
                    cone_gamma_val=0.25,
                    e1_scale_val=0.3,
-                   snaps_per_t0=40):
+                   snaps_per_t0=40,
+                   enable_diag_counts=False,
+                   disable_capture=False,
+                   lc_floor_frac=0.10,
+                   lc_gap_scale=-1.0):
         """
         Single time-carrying stream + clone tree.
 
@@ -583,10 +625,20 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             crosses  : total pericenter crossings
             caps     : capture events
             ccount   : clone pool high-water mark
+            diag_counts : array[4] counting which eq. 29 constraint wins (if enabled)
         """
         np.random.seed(seed)
         SPLIT_HYST = 0.8
         noloss_flag = noloss
+        
+        # Initialize diagnostic counters
+        if enable_diag_counts:
+            diag_counts = np.zeros(4, dtype=np.int64)
+        else:
+            diag_counts = None
+        
+        # Handle lc_gap_scale: -1.0 means use cone_gamma_val, otherwise use the override
+        gap_scale_val = None if lc_gap_scale < 0.0 else lc_gap_scale
 
         # parent
         x = x_init
@@ -624,7 +676,9 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             x_prev = x
             x, j, phase, n_used, cap, crossed = step_one(
                 x, j, phase, pstar_val, noloss_flag, x_max,
-                lc_scale_val, cone_gamma_val, e1_scale_val
+                lc_scale_val, cone_gamma_val, e1_scale_val,
+                diag_counts=diag_counts, disable_capture=disable_capture,
+                lc_floor_frac=lc_floor_frac, lc_gap_scale=gap_scale_val
             )
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -670,7 +724,9 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                     ph_c = cph[i]
                     x_c2, j_c2, ph_c2, n_c, cap_c, cross_c = step_one(
                         x_c, j_c, ph_c, pstar_val, noloss_flag, x_max,
-                        lc_scale_val, cone_gamma_val, e1_scale_val
+                        lc_scale_val, cone_gamma_val, e1_scale_val,
+                        diag_counts=diag_counts, disable_capture=disable_capture,
+                        lc_floor_frac=lc_floor_frac, lc_gap_scale=gap_scale_val
                     )
                     cx[i] = x_c2
                     cj[i] = j_c2
@@ -739,7 +795,9 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             x_prev = x
             x, j, phase, n_used, cap, crossed = step_one(
                 x, j, phase, pstar_val, noloss_flag, x_max,
-                lc_scale_val, cone_gamma_val, e1_scale_val
+                lc_scale_val, cone_gamma_val, e1_scale_val,
+                diag_counts=diag_counts, disable_capture=disable_capture,
+                lc_floor_frac=lc_floor_frac, lc_gap_scale=gap_scale_val
             )
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -813,7 +871,9 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                     ph_c = cph[i]
                     x_c2, j_c2, ph_c2, n_c, cap_c, cross_c = step_one(
                         x_c, j_c, ph_c, pstar_val, noloss_flag, x_max,
-                        lc_scale_val, cone_gamma_val, e1_scale_val
+                        lc_scale_val, cone_gamma_val, e1_scale_val,
+                        diag_counts=diag_counts, disable_capture=disable_capture,
+                        lc_floor_frac=lc_floor_frac, lc_gap_scale=gap_scale_val
                     )
 
                     cx[i] = x_c2
@@ -875,10 +935,14 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             if cactive[ii]:
                 weight_sum += cw[ii]
 
+        # Return diagnostic counters (or zeros if disabled)
+        if diag_counts is None:
+            diag_counts = np.zeros(4, dtype=np.int64)
+        
         if use_snapshots:
-            return g_acc, snapshots, crossings, caps, max_ccount, weight_sum
+            return g_acc, snapshots, crossings, caps, max_ccount, weight_sum, diag_counts
         else:
-            return g_acc, total_t0, crossings, caps, max_ccount, weight_sum
+            return g_acc, total_t0, crossings, caps, max_ccount, weight_sum, diag_counts
 
     return P_of_x, T0, run_stream, sample_x_from_g0_jit
 
@@ -888,7 +952,8 @@ def _worker_one(args):
     (sid, n_relax, floors, clones_per_split,
      stream_seeds, use_jit, pstar_val, warmup_t0, u0,
      include_clone_gbar, use_snapshots, snaps_per_t0,
-     noloss, use_clones, lc_scale, e1_scale, x_max, cone_gamma) = args
+     noloss, use_clones, lc_scale, e1_scale, x_max, cone_gamma,
+     enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale) = args
 
     P_of_x, T0, run_stream, sample_x_from_g0_jit = _build_kernels(
         use_jit=use_jit, noloss=noloss, lc_scale=lc_scale,
@@ -903,14 +968,16 @@ def _worker_one(args):
         1e-6, floors, clones_per_split, X_BINS, DX,
         int(stream_seeds[sid] ^ 0xABCDEF), pstar_val, 0.0, x_init,
         include_clone_gbar, use_snapshots, noloss, use_clones,
-        x_max, lc_scale, cone_gamma, e1_scale, snaps_per_t0
+        x_max, lc_scale, cone_gamma, e1_scale, snaps_per_t0,
+        enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale
     )
 
     result = run_stream(
         n_relax, floors, clones_per_split, X_BINS, DX,
         int(stream_seeds[sid]), pstar_val, warmup_t0, x_init,
         include_clone_gbar, use_snapshots, noloss, use_clones,
-        x_max, lc_scale, cone_gamma, e1_scale, snaps_per_t0
+        x_max, lc_scale, cone_gamma, e1_scale, snaps_per_t0,
+        enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale
     )
     return result
 
@@ -939,6 +1006,10 @@ def run_parallel_gbar(
     x_max=None,
     cone_gamma=0.25,
     debug_occupancy_norm=False,
+    enable_diag_counts=False,
+    disable_capture=False,
+    lc_floor_frac=0.10,
+    lc_gap_scale=None,
 ):
     """
     Run many independent time-carrying streams in parallel and accumulate ḡ(x).
@@ -993,6 +1064,7 @@ def run_parallel_gbar(
     max_ccount = 0
     total_done = 0
     weight_sums = []  # Track weight sums for diagnostics
+    diag_counts_total = np.zeros(4, dtype=np.int64)  # Track eq. 29 constraint winners
 
     for rep in range(replicates):
         stream_seeds = rs.randint(1, 2**31 - 1, size=n_streams, dtype=np.int64)
@@ -1023,18 +1095,24 @@ def run_parallel_gbar(
                         e1_scale,
                         x_max,
                         cone_gamma,
+                        enable_diag_counts,
+                        disable_capture,
+                        lc_floor_frac,
+                        lc_gap_scale if lc_gap_scale is not None else -1.0,
                     ),
                 )
                 for sid in range(n_streams)
             ]
 
             for f in cf.as_completed(futs):
-                g_b, measure_b, peri_b, caps_b, ccount_b, wsum_b = f.result()
+                g_b, measure_b, peri_b, caps_b, ccount_b, wsum_b, diag_b = f.result()
                 g_total += g_b
                 total_measure += measure_b
                 peri_total += peri_b
                 caps_total += caps_b
                 weight_sums.append(wsum_b)
+                if enable_diag_counts:
+                    diag_counts_total += diag_b
                 if ccount_b > max_ccount:
                     max_ccount = ccount_b
                 total_done += 1
@@ -1066,6 +1144,14 @@ def run_parallel_gbar(
         print(f"[diag] pericenter crossings (total): {peri_total}", file=sys.stderr)
         print(f"[diag] capture events (total):      {caps_total}", file=sys.stderr)
         print(f"[diag] clone pool high-water:       {max_ccount}", file=sys.stderr)
+        if enable_diag_counts:
+            total_steps = diag_counts_total.sum()
+            if total_steps > 0:
+                print(f"[diag] eq. 29 constraint winners (total steps: {total_steps}):", file=sys.stderr)
+                print(f"       29a (energy limit):     {diag_counts_total[0]:10d} ({100*diag_counts_total[0]/total_steps:5.1f}%)", file=sys.stderr)
+                print(f"       29b (J isotropic):     {diag_counts_total[1]:10d} ({100*diag_counts_total[1]/total_steps:5.1f}%)", file=sys.stderr)
+                print(f"       29c (J max boundary):    {diag_counts_total[2]:10d} ({100*diag_counts_total[2]/total_steps:5.1f}%)", file=sys.stderr)
+                print(f"       29d (loss-cone limit):   {diag_counts_total[3]:10d} ({100*diag_counts_total[3]/total_steps:5.1f}%)", file=sys.stderr)
         if weight_sums:
             wsum_arr = np.array(weight_sums)
             print(
@@ -1097,6 +1183,62 @@ def run_parallel_gbar(
 
         if show_progress:
             print(f"[diag] snapshot mode: n_snaps = {n_snaps}", file=sys.stderr)
+        
+        # SNAPSHOT MODE: Always use occupancy-based normalization (capture-independent)
+        # This decouples snapshots from capture flux, making it robust even when captures=0
+        positive_bins = np.where(N_x > 0)[0]
+        if positive_bins.size == 0:
+            gbar_norm = np.zeros_like(N_x)
+            gbar_raw = N_x.copy()
+            if show_progress:
+                print(
+                    "[diag] snapshot mode: no positive N_x; returning zeros.",
+                    file=sys.stderr,
+                )
+            return gbar_norm, gbar_raw
+        
+        # Use first positive bin (prefer x=0.225 if available)
+        norm_idx = 0 if N_x[0] > 0 else positive_bins[0]
+        if show_progress:
+            print(
+                f"[diag] snapshot mode: normalizing on bin {norm_idx} "
+                f"(x={X_BINS[norm_idx]:.3g}, N_x={N_x[norm_idx]:.6e})",
+                file=sys.stderr,
+            )
+        
+        # Normalize occupancy directly (shape of stationary distribution)
+        # In snapshot mode, we ALWAYS normalize on occupancy N_x (capture-independent)
+        # This decouples snapshots from capture flux completely
+        # 
+        # For neutrality testing: if cloning/guiding is correct, N_x should be the SAME
+        # regardless of gexp. So we normalize N_x first, then optionally apply gexp.
+        gbar_norm_occupancy = N_x / N_x[norm_idx]
+        
+        # Optionally apply gexp conversion for display (but normalization is on occupancy)
+        if debug_occupancy_norm or gexp == 0.0:
+            # Pure occupancy normalization (gexp ignored or zero)
+            gbar_norm = gbar_norm_occupancy
+            gbar_raw = N_x.copy()
+            if show_progress and debug_occupancy_norm:
+                print(
+                    "[diag] snapshot mode: using pure occupancy normalization (gexp ignored)",
+                    file=sys.stderr,
+                )
+        else:
+            # Apply gexp conversion: g(x) = N_x * x^gexp
+            # But normalize on the SAME occupancy bin to test neutrality
+            # If cloning/guiding is neutral, the SHAPE of N_x should not change with gexp
+            g_unscaled = N_x * (X_BINS ** gexp)
+            # Normalize by the gexp-converted value at the same normalization bin
+            # This is equivalent to: gbar_norm = (N_x / N_x[norm_idx]) * (X_BINS / X_BINS[norm_idx])^gexp
+            gbar_norm = g_unscaled / (N_x[norm_idx] * (X_BINS[norm_idx] ** gexp))
+            gbar_raw = g_unscaled.copy()
+            if show_progress:
+                print(
+                    f"[diag] snapshot mode: applied gexp={gexp} conversion (normalized on occupancy)",
+                    file=sys.stderr,
+                )
+            
     else:
         # Time-weighted mode: already accounts for P(E) implicitly since
         # dt0 = (n * P(E)) / T0, so no additional P(E) factor needed
@@ -1106,74 +1248,74 @@ def run_parallel_gbar(
             print(f"[diag] sum p_x = {p_sum:.6f}", file=sys.stderr)
         N_x = p_x / DX
 
-    # DEBUG MODE: Capture-free occupancy-based normalization
-    # This normalizes on occupancy N_x directly, ignoring capture flux
-    if debug_occupancy_norm:
-        # Find first bin with positive occupancy
-        positive_bins = np.where(N_x > 0)[0]
-        if positive_bins.size == 0:
-            gbar_norm = np.zeros_like(N_x)
+        # TIME-WEIGHTED MODE: Use gexp conversion (standard flux-based normalization)
+        # DEBUG MODE: Capture-free occupancy-based normalization
+        if debug_occupancy_norm:
+            # Find first bin with positive occupancy
+            positive_bins = np.where(N_x > 0)[0]
+            if positive_bins.size == 0:
+                gbar_norm = np.zeros_like(N_x)
+                gbar_raw = N_x.copy()
+                if show_progress:
+                    print(
+                        "[diag] debug_occupancy_norm: no positive N_x; returning zeros.",
+                        file=sys.stderr,
+                    )
+                return gbar_norm, gbar_raw
+            
+            # Use first positive bin (prefer x=0.225 if available)
+            norm_idx = 0 if N_x[0] > 0 else positive_bins[0]
+            if show_progress:
+                print(
+                    f"[diag] debug_occupancy_norm: normalizing on bin {norm_idx} "
+                    f"(x={X_BINS[norm_idx]:.3g}, N_x={N_x[norm_idx]:.6e})",
+                    file=sys.stderr,
+                )
+            
+            # Normalize occupancy directly (shape of stationary distribution)
+            gbar_norm = N_x / N_x[norm_idx]
             gbar_raw = N_x.copy()
+            
             if show_progress:
                 print(
-                    "[diag] debug_occupancy_norm: no positive N_x; returning zeros.",
+                    "[diag] debug_occupancy_norm: using occupancy-based normalization "
+                    "(capture-independent)",
                     file=sys.stderr,
                 )
-            return gbar_norm, gbar_raw
-        
-        # Use first positive bin (prefer x=0.225 if available)
-        norm_idx = 0 if N_x[0] > 0 else positive_bins[0]
-        if show_progress:
-            print(
-                f"[diag] debug_occupancy_norm: normalizing on bin {norm_idx} "
-                f"(x={X_BINS[norm_idx]:.3g}, N_x={N_x[norm_idx]:.6e})",
-                file=sys.stderr,
-            )
-        
-        # Normalize occupancy directly (shape of stationary distribution)
-        gbar_norm = N_x / N_x[norm_idx]
-        gbar_raw = N_x.copy()
-        
-        if show_progress:
-            print(
-                f"[diag] debug_occupancy_norm: using occupancy-based normalization "
-                f"(capture-independent)",
-                file=sys.stderr,
-            )
-    else:
-        # STANDARD MODE: Convert to g(x) with tunable exponent
-        g_unscaled = N_x * (X_BINS ** gexp)
-
-        # Find first bin with positive signal, fall back to 0.225 if possible
-        norm_idx = 0  # default: x=0.225 (first bin)
-        positive_bins = np.where(g_unscaled > 0)[0]
-        if positive_bins.size == 0:
-            # no signal at all; fill zeros and return gracefully
-            gbar_norm = np.zeros_like(g_unscaled)
-            gbar_raw = g_unscaled.copy()
-            if show_progress:
-                print(
-                    "[diag] no positive g_unscaled; returning zeros for gbar.",
-                    file=sys.stderr,
-                )
-            return gbar_norm, gbar_raw
-        
-        # Use first positive bin, but prefer x=0.225 if it's positive
-        if g_unscaled[norm_idx] > 0:
-            # x=0.225 is positive, use it
-            pass
         else:
-            # x=0.225 is zero/negative, use first positive bin
-            norm_idx = positive_bins[0]
-            if show_progress:
-                print(
-                    f"[diag] normalizing gbar on bin {norm_idx} (x={X_BINS[norm_idx]:.3g}) "
-                    f"instead of x=0.225",
-                    file=sys.stderr,
-                )
-        
-        gbar_norm = g_unscaled / g_unscaled[norm_idx]
-        gbar_raw = g_unscaled.copy()
+            # STANDARD MODE: Convert to g(x) with tunable exponent
+            g_unscaled = N_x * (X_BINS ** gexp)
+
+            # Find first bin with positive signal, fall back to 0.225 if possible
+            norm_idx = 0  # default: x=0.225 (first bin)
+            positive_bins = np.where(g_unscaled > 0)[0]
+            if positive_bins.size == 0:
+                # no signal at all; fill zeros and return gracefully
+                gbar_norm = np.zeros_like(g_unscaled)
+                gbar_raw = g_unscaled.copy()
+                if show_progress:
+                    print(
+                        "[diag] no positive g_unscaled; returning zeros for gbar.",
+                        file=sys.stderr,
+                    )
+                return gbar_norm, gbar_raw
+            
+            # Use first positive bin, but prefer x=0.225 if it's positive
+            if g_unscaled[norm_idx] > 0:
+                # x=0.225 is positive, use it
+                pass
+            else:
+                # x=0.225 is zero/negative, use first positive bin
+                norm_idx = positive_bins[0]
+                if show_progress:
+                    print(
+                        f"[diag] normalizing gbar on bin {norm_idx} (x={X_BINS[norm_idx]:.3g}) "
+                        f"instead of x=0.225",
+                        file=sys.stderr,
+                    )
+            
+            gbar_norm = g_unscaled / g_unscaled[norm_idx]
+            gbar_raw = g_unscaled.copy()
 
     # quick slope diagnostic over 1≲x≲100
     if show_progress:
@@ -1276,9 +1418,8 @@ def main():
         default=2.5,
         help=(
             "Exponent α in g(x) ∝ x^α N(E); "
-            "α=2.5 is the physical Keplerian mapping, but "
-            "effective values around 2.0–2.3 can empirically "
-            "match figures better with coarse x-binning."
+            "α≈2.6 empirically matches the SM78 Fig. 3 slope "
+            "for the current kernels (occupancy ∝ x^-2.33)."
         ),
     )
     ap.add_argument(
@@ -1328,6 +1469,28 @@ def main():
         help="γ factor in eq. 29d for loss-cone step limiting (default: 0.25, matching SM78).",
     )
     ap.add_argument(
+        "--diag-29-counts",
+        action="store_true",
+        help="Enable diagnostic counters for eq. 29 constraint winners (29a/29b/29c/29d).",
+    )
+    ap.add_argument(
+        "--disable-capture",
+        action="store_true",
+        help="Disable capture events while keeping loss-cone geometry (for testing 29d effect alone).",
+    )
+    ap.add_argument(
+        "--lc-floor-frac",
+        type=float,
+        default=0.10,
+        help="Floor fraction for eq. 29d loss-cone limiter (default: 0.10). Set to 0.0 to disable floor.",
+    )
+    ap.add_argument(
+        "--lc-gap-scale",
+        type=float,
+        default=None,
+        help="Override cone_gamma for eq. 29d gap calculation (default: use --cone-gamma value).",
+    )
+    ap.add_argument(
         "--debug-occupancy-norm",
         action="store_true",
         help=(
@@ -1366,6 +1529,10 @@ def main():
         x_max=None,
         cone_gamma=args.cone_gamma,
         debug_occupancy_norm=args.debug_occupancy_norm,
+        enable_diag_counts=args.diag_29_counts,
+        disable_capture=args.disable_capture,
+        lc_floor_frac=args.lc_floor_frac,
+        lc_gap_scale=args.lc_gap_scale,
     )
 
     # ---- print comparison table ----
