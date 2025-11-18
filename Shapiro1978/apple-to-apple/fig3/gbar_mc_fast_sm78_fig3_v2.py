@@ -24,15 +24,17 @@ This code:
       - or discrete “snapshots” at fixed intervals in t0
         (default 40 snapshots per t0, which is closer to SM78).
 
-  * Converts the time-averaged occupancy N(E) into the
-    isotropized DF g(x) using
+    * Converts the time-averaged occupancy N(E) into the
+    isotropized DF g(x) using the correct physical Jacobian:
 
-        g(x) ∝ x^{gexp} N(E)   with N(E) ∝ p_x / Δx
+        g(x) ∝ x^{5/2} N(E)   with N(E) ∝ p_x / Δx
 
-    For a Kepler potential, the physical mapping gives gexp = 2.5,
-    but this is exposed as a tunable parameter (--gexp) so you can
-    experiment with effective exponents that best match the BW or
-    SM78 figures with coarse binning.
+    This follows from paper eq. (9): g(E) ∝ N(E) / (P(E) * J_max^2),
+    where P(E) ∝ |E|^{-3/2} and J_max^2 ∝ |E|^{-1} for a Kepler potential,
+    giving g(x) ∝ N_x * x^{5/2} exactly.
+    
+    The --gexp parameter is kept for backward compatibility but is no longer
+    used in the conversion (the physical value 2.5 is hardcoded).
 
 Usage examples
 --------------
@@ -1381,28 +1383,31 @@ def run_parallel_gbar(
         # regardless of gexp. So we normalize N_x first, then optionally apply gexp.
         gbar_norm_occupancy = N_x / N_x[norm_idx]
         
-        # Optionally apply gexp conversion for display (but normalization is on occupancy)
-        if debug_occupancy_norm or gexp == 0.0:
-            # Pure occupancy normalization (gexp ignored or zero)
+        # Convert N(E) → g(E) using the correct physical Jacobian
+        # From paper eq. (9) and isotropization: g(E) ∝ N(E) * |E|^{5/2}
+        # In terms of x = -E/v_0^2: g(x) ∝ N_x * x^{5/2}
+        # This is the EXACT Jacobian, not a tunable parameter
+        GEXP_PHYSICAL = 2.5  # Exactly 5/2 from P(E) * J_max^2 scaling
+        
+        if debug_occupancy_norm:
+            # Debug mode: return occupancy only (for slope diagnostics)
             gbar_norm = gbar_norm_occupancy
             gbar_raw = N_x.copy()
-            if show_progress and debug_occupancy_norm:
+            if show_progress:
                 print(
-                    "[diag] snapshot mode: using pure occupancy normalization (gexp ignored)",
+                    "[diag] snapshot mode: returning occupancy N_x only (debug mode)",
                     file=sys.stderr,
                 )
         else:
-            # Apply gexp conversion: g(x) = N_x * x^gexp
-            # But normalize on the SAME occupancy bin to test neutrality
-            # If cloning/guiding is neutral, the SHAPE of N_x should not change with gexp
-            g_unscaled = N_x * (X_BINS ** gexp)
-            # Normalize by the gexp-converted value at the same normalization bin
-            # This is equivalent to: gbar_norm = (N_x / N_x[norm_idx]) * (X_BINS / X_BINS[norm_idx])^gexp
-            gbar_norm = g_unscaled / (N_x[norm_idx] * (X_BINS[norm_idx] ** gexp))
+            # Production mode: apply correct Jacobian to convert N(E) → g(E)
+            g_unscaled = N_x * (X_BINS ** GEXP_PHYSICAL)
+            # Normalize at x=0.225 (matching paper Table 2 and Fig. 3)
+            gbar_norm = g_unscaled / g_unscaled[norm_idx]
             gbar_raw = g_unscaled.copy()
             if show_progress:
                 print(
-                    f"[diag] snapshot mode: applied gexp={gexp} conversion (normalized on occupancy)",
+                    f"[diag] snapshot mode: applied physical Jacobian x^{GEXP_PHYSICAL:.1f} "
+                    f"(N(E) → g(E)), normalized at x=0.225",
                     file=sys.stderr,
                 )
             
@@ -1415,10 +1420,18 @@ def run_parallel_gbar(
             print(f"[diag] sum p_x = {p_sum:.6f}", file=sys.stderr)
         N_x = p_x / DX
 
-        # TIME-WEIGHTED MODE: Use gexp conversion (standard flux-based normalization)
-        # DEBUG MODE: Capture-free occupancy-based normalization
+        # Convert N(E) → g(E) using the correct physical Jacobian
+        # From paper eq. (9) and isotropization: g(E) ∝ N(E) * |E|^{5/2}
+        # In terms of x = -E/v_0^2: g(x) ∝ N_x * x^{5/2}
+        # This is the EXACT Jacobian from P(E) * J_max^2 scaling, not a tunable parameter
+        GEXP_PHYSICAL = 2.5  # Exactly 5/2
+        
+        # Always normalize at x=0.225 (first bin, index 0) to match paper Table 2 and Fig. 3
+        norm_idx = 0  # x=0.225 (first bin)
+        
         if debug_occupancy_norm:
-            # Find first bin with positive occupancy
+            # Debug mode: return occupancy N_x only (for slope diagnostics of N(E))
+            # This is useful for checking that the underlying occupancy distribution is correct
             positive_bins = np.where(N_x > 0)[0]
             if positive_bins.size == 0:
                 gbar_norm = np.zeros_like(N_x)
@@ -1430,31 +1443,23 @@ def run_parallel_gbar(
                     )
                 return gbar_norm, gbar_raw
             
-            # Use first positive bin (prefer x=0.225 if available)
-            norm_idx = 0 if N_x[0] > 0 else positive_bins[0]
-            if show_progress:
-                print(
-                    f"[diag] debug_occupancy_norm: normalizing on bin {norm_idx} "
-                    f"(x={X_BINS[norm_idx]:.3g}, N_x={N_x[norm_idx]:.6e})",
-                    file=sys.stderr,
-                )
-            
-            # Normalize occupancy directly (shape of stationary distribution)
-            gbar_norm = N_x / N_x[norm_idx]
+            # Normalize occupancy for display (but this is N(E), not g(E))
+            norm_idx_occ = norm_idx if N_x[norm_idx] > 0 else positive_bins[0]
+            gbar_norm = N_x / N_x[norm_idx_occ]
             gbar_raw = N_x.copy()
             
             if show_progress:
                 print(
-                    "[diag] debug_occupancy_norm: using occupancy-based normalization "
-                    "(capture-independent)",
+                    f"[diag] debug_occupancy_norm: returning occupancy N_x only "
+                    f"(normalized at x={X_BINS[norm_idx_occ]:.3g}). "
+                    f"This is N(E), not g(E).",
                     file=sys.stderr,
                 )
         else:
-            # STANDARD MODE: Convert to g(x) with tunable exponent
-            g_unscaled = N_x * (X_BINS ** gexp)
-
-            # Find first bin with positive signal, fall back to 0.225 if possible
-            norm_idx = 0  # default: x=0.225 (first bin)
+            # Production mode: apply correct Jacobian to convert N(E) → g(E)
+            # g(x) = N_x * x^{5/2} (exact physical conversion)
+            g_unscaled = N_x * (X_BINS ** GEXP_PHYSICAL)
+            
             positive_bins = np.where(g_unscaled > 0)[0]
             if positive_bins.size == 0:
                 # no signal at all; fill zeros and return gracefully
@@ -1467,8 +1472,7 @@ def run_parallel_gbar(
                     )
                 return gbar_norm, gbar_raw
             
-            # Paper normalization: always normalize at x=0.225 (first bin, index 0)
-            # This matches Table 2 and Fig. 3 of Shapiro & Marchant (1978)
+            # Check if x=0.225 has positive signal (should always be true in production)
             if g_unscaled[norm_idx] <= 0:
                 # Fallback: use first positive bin (shouldn't happen in production)
                 norm_idx = positive_bins[0]
@@ -1485,8 +1489,8 @@ def run_parallel_gbar(
             
             if show_progress and norm_idx == 0:
                 print(
-                    f"[diag] Production mode: normalized g(x) at x=0.225 (bin 0) to 1.0, "
-                    f"gexp={gexp:.3f}",
+                    f"[diag] Production mode: applied physical Jacobian x^{GEXP_PHYSICAL:.1f} "
+                    f"(N(E) → g(E)), normalized at x=0.225 to 1.0",
                     file=sys.stderr,
                 )
 
@@ -1502,10 +1506,17 @@ def run_parallel_gbar(
             logx = np.log10(X_BINS[mask])
             logg = np.log10(gbar_norm[mask])
             p_fit, _ = np.polyfit(logx, logg, 1)
-            print(
-                f"[diag] best-fit g(x) ∝ x^{p_fit:.3f} in 1≲x≲100",
-                file=sys.stderr,
-            )
+            if debug_occupancy_norm:
+                print(
+                    f"[diag] best-fit N(E) ∝ x^{p_fit:.3f} in 1≲x≲100 "
+                    f"(this is occupancy, not g(E))",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[diag] best-fit g(x) ∝ x^{p_fit:.3f} in 1≲x≲100",
+                    file=sys.stderr,
+                )
 
     return gbar_norm, gbar_raw
 
@@ -1590,9 +1601,9 @@ def main():
         type=float,
         default=2.5,
         help=(
-            "Exponent α in g(x) ∝ x^α N(E); "
-            "α≈2.6 empirically matches the SM78 Fig. 3 slope "
-            "for the current kernels (occupancy ∝ x^-2.33)."
+            "DEPRECATED: Exponent is now fixed at 2.5 (5/2) from physical Jacobian. "
+            "This parameter is kept for backward compatibility but not used in the conversion. "
+            "The correct conversion is g(x) ∝ N_x * x^{5/2} from paper eq. (9)."
         ),
     )
     ap.add_argument(
