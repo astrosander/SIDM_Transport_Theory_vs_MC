@@ -246,25 +246,35 @@ if __name__ == "__main__":
         print(f"Successfully extracted {len(N_x)} N_x values")
         print()
         
-        # Run the fit
-        gexp_best, chi2_best, chi2_per_dof_best = fit_gexp(
-            N_x, 
-            gexp_range=(1.6, 2.4), 
-            n_points=161,  # Fine grid for better precision
-            verbose=True
+        # For an apples-to-apples comparison with Shapiro & Marchant (1978),
+        # the exponent is fixed by the paper's derivation (eqs. 9, 11, 13):
+        # g(x) ∝ N(E) x^2, so gexp = 2.0 exactly.
+        # We compute chi² for this fixed value to assess the physics/algorithm
+        # match, not to fit a normalization parameter.
+        gexp_paper = 2.0
+        chi2_best, chi2_per_dof_best, residuals = compute_chi2(
+            gexp_paper, N_x, X_BINS, gbar_paper, gbar_err_paper
         )
         
         print()
         print("=" * 80)
         print("Summary:")
-        print(f"  Occupancy slope (from log): N(E) ∝ x^-1.730")
-        print(f"  Optimal gexp: {gexp_best:.4f}")
-        print(f"  Expected g(x) slope: ~{1.730 + gexp_best:.3f}")
-        print(f"  Paper g(x) slope: ~0.18-0.24")
+        print("  NOTE: For Shapiro & Marchant (1978), the mapping N(E) → g(E)")
+        print("        is fixed by eqs. (9), (11) and (13), which imply g(x) ∝ N(E) x^2.")
+        print(f"  Using gexp = {gexp_paper:.1f} (paper value)")
+        print(f"  Chi²: {chi2_best:.2f}")
         print(f"  Chi²/dof: {chi2_per_dof_best:.3f}")
+        print(f"  (target: chi²/dof < 2.0 for good agreement)")
         print()
-        print("Next step: Run production with:")
-        print(f"  --gexp {gexp_best:.4f}")
+        if residuals is not None:
+            max_residual = np.abs(residuals).max()
+            print(f"  Max |residual|: {max_residual:.2f} sigma")
+            print()
+        print("Next step (paper-literal): run production with")
+        print(f"  --gexp {gexp_paper:.1f}")
+        print()
+        print("If chi²/dof is still large, the discrepancy is in the physics/algorithm")
+        print("(loss-cone treatment, boundary conditions, etc.), not normalization.")
         print("=" * 80)
         
     except FileNotFoundError:
