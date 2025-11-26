@@ -25,16 +25,17 @@ This code:
         (default 40 snapshots per t0, which is closer to SM78).
 
     * Converts the time-averaged occupancy N(E) into the
-    isotropized DF g(x) using the correct physical Jacobian:
+    isotropized DF g(x) following paper eq. (9):
 
         g(x) ∝ x^{5/2} N(E)   with N(E) ∝ p_x / Δx
 
-    This follows from paper eq. (9): g(E) ∝ N(E) / (P(E) * J_max^2),
-    where P(E) ∝ |E|^{-3/2} and J_max^2 ∝ |E|^{-1} for a Kepler potential,
-    giving g(x) ∝ N_x * x^{5/2} exactly.
+    By default, the code uses the physically correct fixed exponent 2.5 (5/2)
+    from paper eq. (9), which relates N(E) to the distribution function f(E)
+    via N(E) ∝ P(E) * J_max^2(E) * f(E) ∝ |E|^{-5/2} f(E).
     
-    The --gexp parameter is kept for backward compatibility but is no longer
-    used in the conversion (the physical value 2.5 is hardcoded).
+    The --gexp parameter is kept for diagnostic/compatibility testing only.
+    Use --use-tunable-gexp to enable tunable exponent mode (not recommended
+    for production runs).
 
 Usage examples
 --------------
@@ -1144,6 +1145,7 @@ def run_parallel_gbar(
     enable_cap_inj_diag=False,
     outer_injection=True,  # Default: use outer-boundary injection (physically correct BC)
     outer_inj_x_min=10.0,  # Default minimum x for outer injection
+    use_paper_literal_mode=True,  # If True, use fixed 2.5 exponent from paper eq. (9); if False, use tunable gexp
 ):
     """
     Run many independent time-carrying streams in parallel and accumulate ḡ(x).
@@ -1383,11 +1385,9 @@ def run_parallel_gbar(
         # regardless of gexp. So we normalize N_x first, then optionally apply gexp.
         gbar_norm_occupancy = N_x / N_x[norm_idx]
         
-        # Convert N(E) → g(E) using the correct physical Jacobian
-        # From paper eq. (9) and isotropization: g(E) ∝ N(E) * |E|^{5/2}
-        # In terms of x = -E/v_0^2: g(x) ∝ N_x * x^{5/2}
-        # This is the EXACT Jacobian, not a tunable parameter
-        GEXP_PHYSICAL = 2.5  # Exactly 5/2 from P(E) * J_max^2 scaling
+        # Convert N(E) → g(E) using either paper-literal mode or tunable exponent
+        # Paper-literal mode: use fixed 2.5 (5/2) from paper eq. (9)
+        # Tunable mode: use gexp parameter (for diagnostic/compatibility)
         
         if debug_occupancy_norm:
             # Debug mode: return occupancy only (for slope diagnostics)
@@ -1398,16 +1398,32 @@ def run_parallel_gbar(
                     "[diag] snapshot mode: returning occupancy N_x only (debug mode)",
                     file=sys.stderr,
                 )
-        else:
-            # Production mode: apply correct Jacobian to convert N(E) → g(E)
-            g_unscaled = N_x * (X_BINS ** GEXP_PHYSICAL)
+        elif use_paper_literal_mode:
+            # Paper-literal mode: use fixed 2.5 exponent from paper eq. (9)
+            # This is the physically correct conversion: g(E) ∝ |E|^{5/2} N(E)
+            # In terms of x = -E/v_0^2: g(x) ∝ x^{5/2} N_x
+            GEXP_PAPER = 2.5  # Fixed: exactly 5/2 from P(E) * J_max^2 scaling
+            g_unscaled = N_x * (X_BINS ** GEXP_PAPER)
             # Normalize at x=0.225 (matching paper Table 2 and Fig. 3)
             gbar_norm = g_unscaled / g_unscaled[norm_idx]
             gbar_raw = g_unscaled.copy()
             if show_progress:
                 print(
-                    f"[diag] snapshot mode: applied physical Jacobian x^{GEXP_PHYSICAL:.1f} "
-                    f"(N(E) → g(E)), normalized at x=0.225",
+                    f"[diag] snapshot mode: paper-literal conversion x^{GEXP_PAPER:.1f} "
+                    f"(N(E) → g(E) per eq. 9), normalized at x=0.225",
+                    file=sys.stderr,
+                )
+        else:
+            # Tunable mode: use gexp parameter (for diagnostic/compatibility)
+            # NOTE: This is NOT the physical conversion; it's for comparison only
+            g_unscaled = N_x * (X_BINS ** gexp)
+            # Normalize at x=0.225 (matching paper Table 2 and Fig. 3)
+            gbar_norm = g_unscaled / g_unscaled[norm_idx]
+            gbar_raw = g_unscaled.copy()
+            if show_progress:
+                print(
+                    f"[diag] snapshot mode: tunable conversion x^{gexp:.2f} "
+                    f"(N(E) → g(E), DIAGNOSTIC MODE - not physical), normalized at x=0.225",
                     file=sys.stderr,
                 )
             
@@ -1420,11 +1436,9 @@ def run_parallel_gbar(
             print(f"[diag] sum p_x = {p_sum:.6f}", file=sys.stderr)
         N_x = p_x / DX
 
-        # Convert N(E) → g(E) using the correct physical Jacobian
-        # From paper eq. (9) and isotropization: g(E) ∝ N(E) * |E|^{5/2}
-        # In terms of x = -E/v_0^2: g(x) ∝ N_x * x^{5/2}
-        # This is the EXACT Jacobian from P(E) * J_max^2 scaling, not a tunable parameter
-        GEXP_PHYSICAL = 2.5  # Exactly 5/2
+        # Convert N(E) → g(E) using either paper-literal mode or tunable exponent
+        # Paper-literal mode: use fixed 2.5 (5/2) from paper eq. (9)
+        # Tunable mode: use gexp parameter (for diagnostic/compatibility)
         
         # Always normalize at x=0.225 (first bin, index 0) to match paper Table 2 and Fig. 3
         norm_idx = 0  # x=0.225 (first bin)
@@ -1455,10 +1469,12 @@ def run_parallel_gbar(
                     f"This is N(E), not g(E).",
                     file=sys.stderr,
                 )
-        else:
-            # Production mode: apply correct Jacobian to convert N(E) → g(E)
-            # g(x) = N_x * x^{5/2} (exact physical conversion)
-            g_unscaled = N_x * (X_BINS ** GEXP_PHYSICAL)
+        elif use_paper_literal_mode:
+            # Paper-literal mode: use fixed 2.5 exponent from paper eq. (9)
+            # This is the physically correct conversion: g(E) ∝ |E|^{5/2} N(E)
+            # In terms of x = -E/v_0^2: g(x) ∝ x^{5/2} N_x
+            GEXP_PAPER = 2.5  # Fixed: exactly 5/2 from P(E) * J_max^2 scaling
+            g_unscaled = N_x * (X_BINS ** GEXP_PAPER)
             
             positive_bins = np.where(g_unscaled > 0)[0]
             if positive_bins.size == 0:
@@ -1489,8 +1505,46 @@ def run_parallel_gbar(
             
             if show_progress and norm_idx == 0:
                 print(
-                    f"[diag] Production mode: applied physical Jacobian x^{GEXP_PHYSICAL:.1f} "
-                    f"(N(E) → g(E)), normalized at x=0.225 to 1.0",
+                    f"[diag] Production mode: paper-literal conversion x^{GEXP_PAPER:.1f} "
+                    f"(N(E) → g(E) per eq. 9), normalized at x=0.225 to 1.0",
+                    file=sys.stderr,
+                )
+        else:
+            # Tunable mode: use gexp parameter (for diagnostic/compatibility)
+            # NOTE: This is NOT the physical conversion; it's for comparison only
+            g_unscaled = N_x * (X_BINS ** gexp)
+            
+            positive_bins = np.where(g_unscaled > 0)[0]
+            if positive_bins.size == 0:
+                # no signal at all; fill zeros and return gracefully
+                gbar_norm = np.zeros_like(g_unscaled)
+                gbar_raw = g_unscaled.copy()
+                if show_progress:
+                    print(
+                        "[diag] no positive g_unscaled; returning zeros for gbar.",
+                        file=sys.stderr,
+                    )
+                return gbar_norm, gbar_raw
+            
+            # Check if x=0.225 has positive signal (should always be true in production)
+            if g_unscaled[norm_idx] <= 0:
+                # Fallback: use first positive bin (shouldn't happen in production)
+                norm_idx = positive_bins[0]
+                if show_progress:
+                    print(
+                        f"[WARNING] x=0.225 has zero signal; normalizing on bin {norm_idx} "
+                        f"(x={X_BINS[norm_idx]:.3g}) instead. This may indicate insufficient statistics.",
+                        file=sys.stderr,
+                    )
+            
+            # Normalize so g(x=0.225) = 1.0 (matching paper Table 2 and Fig. 3)
+            gbar_norm = g_unscaled / g_unscaled[norm_idx]
+            gbar_raw = g_unscaled.copy()
+            
+            if show_progress and norm_idx == 0:
+                print(
+                    f"[diag] Production mode: tunable conversion x^{gexp:.2f} "
+                    f"(N(E) → g(E), DIAGNOSTIC MODE - not physical), normalized at x=0.225 to 1.0",
                     file=sys.stderr,
                 )
 
@@ -1601,9 +1655,19 @@ def main():
         type=float,
         default=2.5,
         help=(
-            "DEPRECATED: Exponent is now fixed at 2.5 (5/2) from physical Jacobian. "
-            "This parameter is kept for backward compatibility but not used in the conversion. "
-            "The correct conversion is g(x) ∝ N_x * x^{5/2} from paper eq. (9)."
+            "DEPRECATED/DIAGNOSTIC: Exponent in g(x) ∝ x^gexp * N(E) conversion. "
+            "Only used if --use-tunable-gexp is set. The physical value from paper "
+            "eq. (9) is 2.5 (5/2), which is used by default in paper-literal mode. "
+            "This parameter is kept for backward compatibility and diagnostic testing only."
+        ),
+    )
+    ap.add_argument(
+        "--use-tunable-gexp",
+        action="store_true",
+        help=(
+            "Use tunable gexp parameter instead of paper-literal fixed 2.5 exponent. "
+            "This is for diagnostic/compatibility testing only. By default, the code "
+            "uses the physically correct fixed exponent 2.5 from paper eq. (9)."
         ),
     )
     ap.add_argument(
@@ -1740,6 +1804,7 @@ def main():
         enable_cap_inj_diag=args.cap_inj_diag,
         outer_injection=not args.use_x_bound_injection,  # Default to outer injection unless flag is set
         outer_inj_x_min=args.outer_inj_x_min,
+        use_paper_literal_mode=not args.use_tunable_gexp,  # Default: use paper-literal mode (fixed 2.5)
     )
 
     # ---- print comparison table ----
