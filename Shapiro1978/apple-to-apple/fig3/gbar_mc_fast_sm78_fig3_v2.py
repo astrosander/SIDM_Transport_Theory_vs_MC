@@ -63,19 +63,24 @@ def make_gbar_from_occupancy(x_centers, N_x, gexp, x_norm):
     return g_norm, g_raw
 
 
-def make_gbar_from_flux(x_centers, N_cap, N_occ, total_measure, gexp, x_norm):
+def make_gbar_from_flux(x_centers, N_cap, N_occ, total_measure, flux_exp, x_norm):
     """
     OPTIONAL: experimental ḡ(E) from capture flux Γ_cap = N_cap / N_occ per t0.
 
-    This uses the same x^{gexp} 'paper mapping' as an approximate full-loss-cone
-    shape, so that ḡ ≈ Γ_cap * x^{gexp}, normalized at x_norm.
+    From the steady-state flux relation (SM78 style):
+        Γ_cap(x) ∝ ḡ(x) / x^flux_exp
+    so to recover ḡ(x) we divide out the x^flux_exp factor:
+        ḡ(x) ∝ Γ_cap(x) / x^flux_exp
+
+    In our implementation Γ_cap(x) already grows ~ x^flux_exp, so we must DIVIDE
+    by x^flux_exp to get a roughly flat ḡ(x) consistent with occupancy-based ḡ.
 
     Args:
         x_centers: Energy bin centers
         N_cap: Total capture counts per bin (raw counts)
         N_occ: Total occupancy counts per bin (raw counts, not normalized)
         total_measure: Total time/snapshots for normalization (to compute N_occ per t0)
-        gexp: Exponent for N(E) → g(E) mapping
+        flux_exp: Exponent for the flux relation (typically 2.5, but can be tuned separately)
         x_norm: x value at which to normalize ḡ to 1
 
     Returns (gbar_norm, gbar_raw).
@@ -87,7 +92,10 @@ def make_gbar_from_flux(x_centers, N_cap, N_occ, total_measure, gexp, x_norm):
     N_occ_norm = np.where(N_occ > 0, N_occ / total_measure, np.inf)
     gamma_cap = N_cap / N_occ_norm
 
-    g_raw = gamma_cap * np.power(x_centers, gexp)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        g_raw = np.zeros_like(x_centers)
+        mask = x_centers > 0.0
+        g_raw[mask] = gamma_cap[mask] / np.power(x_centers[mask], flux_exp)
 
     norm_idx = np.argmin(np.abs(x_centers - x_norm))
     if g_raw[norm_idx] == 0.0:
@@ -1080,6 +1088,7 @@ def run_parallel_gbar(
     E2_x_ref=1.0,
     gbar_from_flux=False,
     gbar_x_norm=0.225,
+    gbar_flux_exp=None,
 ):
     if noloss:
         use_clones = False
@@ -1288,18 +1297,19 @@ def run_parallel_gbar(
                 raise RuntimeError(
                     "--gbar-from-flux requires --cap-inj-diag to accumulate capture statistics."
                 )
+            p_flux = gbar_flux_exp if gbar_flux_exp is not None else gexp
             N_occ = g_total.copy()
             gbar_norm, gbar_raw = make_gbar_from_flux(
                 x_centers=X_BINS,
                 N_cap=cap_hist_total,
                 N_occ=N_occ,
                 total_measure=total_measure,
-                gexp=gexp,
+                flux_exp=p_flux,
                 x_norm=gbar_x_norm,
             )
             if show_progress:
                 print(
-                    f"[diag] ḡ mode: using capture flux Γ_cap(x) * x^{gexp:.2f}, "
+                    f"[diag] ḡ mode: using capture flux Γ_cap(x) / x^{p_flux:.2f}, "
                     f"normalized at x={gbar_x_norm:.3g}",
                     file=sys.stderr,
                 )
@@ -1373,16 +1383,18 @@ def run_parallel_gbar(
                         "--gbar-from-flux requires --cap-inj-diag to accumulate capture statistics."
                     )
                 N_occ = g_total.copy()
+                p_flux = gbar_flux_exp if gbar_flux_exp is not None else gexp
                 gbar_norm, gbar_raw = make_gbar_from_flux(
                     x_centers=X_BINS,
                     N_cap=cap_hist_total,
                     N_occ=N_occ,
-                    gexp=gexp,
+                    total_measure=total_measure,
+                    flux_exp=p_flux,
                     x_norm=gbar_x_norm,
                 )
                 if show_progress:
                     print(
-                        f"[diag] ḡ mode: using capture flux Γ_cap(x) * x^{gexp:.2f}, "
+                        f"[diag] ḡ mode: using capture flux Γ_cap(x) / x^{p_flux:.2f}, "
                         f"normalized at x={gbar_x_norm:.3g}",
                         file=sys.stderr,
                     )
@@ -1694,15 +1706,24 @@ def main():
         default=0.225,
         help="x at which ḡ is normalized to 1 (default: 0.225, matching paper).",
     )
+    ap.add_argument(
+        "--gbar-flux-exp",
+        type=float,
+        default=None,
+        help=(
+            "Exponent p used in Γ_cap/x^p when computing ḡ from capture flux. "
+            "If not set, defaults to gexp. Use this to tune flux-based ḡ to match occupancy-based ḡ."
+        ),
+    )
 
     args = ap.parse_args()
 
-    if getattr(args, "gbar_from_flux", False):
-        raise SystemExit(
-            "ERROR: --gbar-from-flux is not currently consistent with the SM78 "
-            "definition of ḡ. Please drop this flag and use --gbar-x-norm to "
-            "compute ḡ from occupancy instead."
+    if args.gbar_from_flux and not args.cap_inj_diag:
+        print(
+            "[diag] --gbar-from-flux requires --cap-inj-diag; enabling it automatically.",
+            file=sys.stderr,
         )
+        args.cap_inj_diag = True
 
     floors = np.array(
         [10.0 ** (-k) for k in range(0, args.floors_min_exp + 1, args.floor_step)],
@@ -1751,6 +1772,7 @@ def main():
         E2_x_ref=args.E2_x_ref,
         gbar_from_flux=args.gbar_from_flux,
         gbar_x_norm=args.gbar_x_norm,
+        gbar_flux_exp=args.gbar_flux_exp,
     )
 
     print("# x_center   gbar_MC_norm   gbar_MC_raw      gbar_paper   gbar_err_paper")
