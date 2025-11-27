@@ -41,6 +41,64 @@ def _edges_from_centers(c):
 X_EDGES = _edges_from_centers(X_BINS)
 DX = X_EDGES[1:] - X_EDGES[:-1]
 
+
+def make_gbar_from_occupancy(x_centers, N_x, gexp, x_norm):
+    """
+    Map occupancy N(E) → ḡ(E) using paper's N(E) → g(E) ∝ x^{gexp}.
+    Returns (gbar_norm, gbar_raw).
+    """
+    x_centers = np.asarray(x_centers, dtype=float)
+    N_x = np.asarray(N_x, dtype=float)
+
+    g_raw = N_x * np.power(x_centers, gexp)
+
+    norm_idx = np.argmin(np.abs(x_centers - x_norm))
+    if g_raw[norm_idx] == 0.0:
+        raise RuntimeError(
+            f"Normalization bin at x={x_norm} has zero g_raw; "
+            "increase snapshots / streams or choose a different --gbar-x-norm."
+        )
+
+    g_norm = g_raw / g_raw[norm_idx]
+    return g_norm, g_raw
+
+
+def make_gbar_from_flux(x_centers, N_cap, N_occ, total_measure, gexp, x_norm):
+    """
+    OPTIONAL: experimental ḡ(E) from capture flux Γ_cap = N_cap / N_occ per t0.
+
+    This uses the same x^{gexp} 'paper mapping' as an approximate full-loss-cone
+    shape, so that ḡ ≈ Γ_cap * x^{gexp}, normalized at x_norm.
+
+    Args:
+        x_centers: Energy bin centers
+        N_cap: Total capture counts per bin (raw counts)
+        N_occ: Total occupancy counts per bin (raw counts, not normalized)
+        total_measure: Total time/snapshots for normalization (to compute N_occ per t0)
+        gexp: Exponent for N(E) → g(E) mapping
+        x_norm: x value at which to normalize ḡ to 1
+
+    Returns (gbar_norm, gbar_raw).
+    """
+    x_centers = np.asarray(x_centers, dtype=float)
+    N_cap = np.asarray(N_cap, dtype=float)
+    N_occ = np.asarray(N_occ, dtype=float)
+
+    N_occ_norm = np.where(N_occ > 0, N_occ / total_measure, np.inf)
+    gamma_cap = N_cap / N_occ_norm
+
+    g_raw = gamma_cap * np.power(x_centers, gexp)
+
+    norm_idx = np.argmin(np.abs(x_centers - x_norm))
+    if g_raw[norm_idx] == 0.0:
+        raise RuntimeError(
+            f"Normalization bin at x={x_norm} has zero g_raw (flux mode); "
+            "need more captures / different x_norm."
+        )
+
+    g_norm = g_raw / g_raw[norm_idx]
+    return g_norm, g_raw
+
 GBAR_X_PAPER = np.array([
     0.2250, 0.3030, 0.4950, 1.0400, 1.2600, 1.6200, 2.3500, 5.0000,
     7.2000, 8.9400, 12.1000, 19.7000, 41.6000, 50.3000, 64.6000, 93.6000,
@@ -1020,6 +1078,8 @@ def run_parallel_gbar(
     covEJ_scale=1.0,
     E2_x_power=0.0,
     E2_x_ref=1.0,
+    gbar_from_flux=False,
+    gbar_x_norm=0.225,
 ):
     if noloss:
         use_clones = False
@@ -1223,31 +1283,54 @@ def run_parallel_gbar(
                 file=sys.stderr,
             )
         
-        gbar_norm_occupancy = N_x / N_x[norm_idx]
-        
-        if debug_occupancy_norm:
-            gbar_norm = gbar_norm_occupancy
+        if gbar_from_flux:
+            if not enable_cap_inj_diag:
+                raise RuntimeError(
+                    "--gbar-from-flux requires --cap-inj-diag to accumulate capture statistics."
+                )
+            N_occ = g_total.copy()
+            gbar_norm, gbar_raw = make_gbar_from_flux(
+                x_centers=X_BINS,
+                N_cap=cap_hist_total,
+                N_occ=N_occ,
+                total_measure=total_measure,
+                gexp=gexp,
+                x_norm=gbar_x_norm,
+            )
+            if show_progress:
+                print(
+                    f"[diag] ḡ mode: using capture flux Γ_cap(x) * x^{gexp:.2f}, "
+                    f"normalized at x={gbar_x_norm:.3g}",
+                    file=sys.stderr,
+                )
+        elif debug_occupancy_norm:
+            norm_idx_occ = norm_idx if N_x[norm_idx] > 0 else positive_bins[0]
+            gbar_norm = N_x / N_x[norm_idx_occ]
             gbar_raw = N_x.copy()
             if show_progress:
                 print(
-                    "[diag] snapshot mode: returning occupancy N_x only (debug mode)",
+                    f"[diag] snapshot mode: returning occupancy N_x only (debug mode), "
+                    f"normalized at x={X_BINS[norm_idx_occ]:.3g}",
                     file=sys.stderr,
                 )
         else:
-            g_unscaled = N_x * (X_BINS ** gexp)
-            gbar_norm = g_unscaled / g_unscaled[norm_idx]
-            gbar_raw = g_unscaled.copy()
+            gbar_norm, gbar_raw = make_gbar_from_occupancy(
+                x_centers=X_BINS,
+                N_x=N_x,
+                gexp=gexp,
+                x_norm=gbar_x_norm,
+            )
             if show_progress:
                 if abs(gexp - 2.5) < 1e-6:
                     print(
-                        "[diag] snapshot mode: applied paper mapping N(E) → g(E) (x^2.5), "
-                        "normalized at x=0.225",
+                        f"[diag] ḡ mode: using snapshot occupancy N(E) * x^2.5, "
+                        f"normalized at x={gbar_x_norm:.3g}",
                         file=sys.stderr,
                     )
                 else:
                     print(
-                        f"[diag] snapshot mode: applied Jacobian x^{gexp:.2f} "
-                        f"(N(E) → g(E), DIAGNOSTIC - paper value is 2.5), normalized at x=0.225",
+                        f"[diag] ḡ mode: using snapshot occupancy N(E) * x^{gexp:.2f} "
+                        f"(DIAGNOSTIC - paper value is 2.5), normalized at x={gbar_x_norm:.3g}",
                         file=sys.stderr,
                     )
             
@@ -1284,44 +1367,45 @@ def run_parallel_gbar(
                     file=sys.stderr,
                 )
         else:
-            g_unscaled = N_x * (X_BINS ** gexp)
-            
-            positive_bins = np.where(g_unscaled > 0)[0]
-            if positive_bins.size == 0:
-                gbar_norm = np.zeros_like(g_unscaled)
-                gbar_raw = g_unscaled.copy()
-                if show_progress:
-                    print(
-                        "[diag] no positive g_unscaled; returning zeros for gbar.",
-                    file=sys.stderr,
+            if gbar_from_flux:
+                if not enable_cap_inj_diag:
+                    raise RuntimeError(
+                        "--gbar-from-flux requires --cap-inj-diag to accumulate capture statistics."
+                    )
+                N_occ = g_total.copy()
+                gbar_norm, gbar_raw = make_gbar_from_flux(
+                    x_centers=X_BINS,
+                    N_cap=cap_hist_total,
+                    N_occ=N_occ,
+                    gexp=gexp,
+                    x_norm=gbar_x_norm,
                 )
-                return gbar_norm, gbar_raw
-            
-            if g_unscaled[norm_idx] <= 0:
-                norm_idx = positive_bins[0]
                 if show_progress:
                     print(
-                        f"[WARNING] x=0.225 has zero signal; normalizing on bin {norm_idx} "
-                        f"(x={X_BINS[norm_idx]:.3g}) instead. This may indicate insufficient statistics.",
+                        f"[diag] ḡ mode: using capture flux Γ_cap(x) * x^{gexp:.2f}, "
+                        f"normalized at x={gbar_x_norm:.3g}",
                         file=sys.stderr,
                     )
-            
-            gbar_norm = g_unscaled / g_unscaled[norm_idx]
-            gbar_raw = g_unscaled.copy()
-            
-            if show_progress and norm_idx == 0:
-                if abs(gexp - 2.5) < 1e-6:
-                    print(
-                        "[diag] Production mode: applied paper mapping N(E) → g(E) (x^2.5), "
-                        "normalized at x=0.225 to 1.0",
-                        file=sys.stderr,
-                    )
-                else:
-                    print(
-                        f"[diag] Production mode: applied Jacobian x^{gexp:.2f} "
-                        f"(N(E) → g(E), DIAGNOSTIC - paper value is 2.5), normalized at x=0.225 to 1.0",
-                        file=sys.stderr,
-                    )
+            else:
+                gbar_norm, gbar_raw = make_gbar_from_occupancy(
+                    x_centers=X_BINS,
+                    N_x=N_x,
+                    gexp=gexp,
+                    x_norm=gbar_x_norm,
+                )
+                if show_progress:
+                    if abs(gexp - 2.5) < 1e-6:
+                        print(
+                            f"[diag] ḡ mode: using production occupancy N(E) * x^2.5, "
+                            f"normalized at x={gbar_x_norm:.3g}",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            f"[diag] ḡ mode: using production occupancy N(E) * x^{gexp:.2f} "
+                            f"(DIAGNOSTIC - paper value is 2.5), normalized at x={gbar_x_norm:.3g}",
+                            file=sys.stderr,
+                        )
 
     if show_progress:
         mask = (
@@ -1599,6 +1683,17 @@ def main():
         default=1.0,
         help="DIAGNOSTIC: Reference energy for --E2-x-power scaling (default: 1.0).",
     )
+    ap.add_argument(
+        "--gbar-from-flux",
+        action="store_true",
+        help="Compute ḡ(x) from capture flux diagnostics instead of snapshot occupancy (experimental).",
+    )
+    ap.add_argument(
+        "--gbar-x-norm",
+        type=float,
+        default=0.225,
+        help="x at which ḡ is normalized to 1 (default: 0.225, matching paper).",
+    )
 
     args = ap.parse_args()
 
@@ -1647,6 +1742,8 @@ def main():
         covEJ_scale=args.covEJ_scale,
         E2_x_power=args.E2_x_power,
         E2_x_ref=args.E2_x_ref,
+        gbar_from_flux=args.gbar_from_flux,
+        gbar_x_norm=args.gbar_x_norm,
     )
 
     print("# x_center   gbar_MC_norm   gbar_MC_raw      gbar_paper   gbar_err_paper")
