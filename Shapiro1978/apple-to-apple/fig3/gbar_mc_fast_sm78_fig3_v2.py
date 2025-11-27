@@ -19,7 +19,7 @@ PSTAR   = 0.005
 X_BOUND = 0.2
 SEED    = 20251028
 
-E1_SCALE_DEFAULT = 0.3
+E1_SCALE_DEFAULT = 1.0
 
 LC_SCALE_DEFAULT = 1.0
 X_BINS = np.array([
@@ -481,7 +481,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                    lc_floor_frac=0.10,
                    lc_gap_scale=-1.0,
                    enable_cap_inj_diag=False,
-                   outer_injection=True,
+                   outer_injection=False,
                    outer_inj_x_min=10.0):
         np.random.seed(seed)
         SPLIT_HYST = 0.8
@@ -509,7 +509,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         w = 1.0
         parent_floor_idx = floor_index_for_j2(j * j, floors)
 
-        MAX_CLONES = 4096 if use_clones else 0
+        MAX_CLONES = 65536 if use_clones else 0
         cx = np.zeros(MAX_CLONES, dtype=np.float64)
         cj = np.zeros(MAX_CLONES, dtype=np.float64)
         cph = np.zeros(MAX_CLONES, dtype=np.float64)
@@ -916,7 +916,7 @@ def run_parallel_gbar(
     lc_floor_frac=0.10,
     lc_gap_scale=None,
     enable_cap_inj_diag=False,
-    outer_injection=True,
+    outer_injection=False,
     outer_inj_x_min=10.0,
 ):
     if noloss:
@@ -1126,16 +1126,16 @@ def run_parallel_gbar(
             gbar_norm = g_unscaled / g_unscaled[norm_idx]
             gbar_raw = g_unscaled.copy()
             if show_progress:
-                if abs(gexp - 2.0) < 1e-6:
+                if abs(gexp - 2.5) < 1e-6:
                     print(
-                        "[diag] snapshot mode: applied paper mapping N(E) → g(E) (x^2), "
+                        "[diag] snapshot mode: applied paper mapping N(E) → g(E) (x^2.5), "
                         "normalized at x=0.225",
                         file=sys.stderr,
                     )
                 else:
                     print(
                         f"[diag] snapshot mode: applied Jacobian x^{gexp:.2f} "
-                        f"(N(E) → g(E), DIAGNOSTIC - paper value is 2.0), normalized at x=0.225",
+                        f"(N(E) → g(E), DIAGNOSTIC - paper value is 2.5), normalized at x=0.225",
                         file=sys.stderr,
                     )
             
@@ -1198,16 +1198,16 @@ def run_parallel_gbar(
             gbar_raw = g_unscaled.copy()
             
             if show_progress and norm_idx == 0:
-                if abs(gexp - 2.0) < 1e-6:
+                if abs(gexp - 2.5) < 1e-6:
                     print(
-                        "[diag] Production mode: applied paper mapping N(E) → g(E) (x^2), "
+                        "[diag] Production mode: applied paper mapping N(E) → g(E) (x^2.5), "
                         "normalized at x=0.225 to 1.0",
                         file=sys.stderr,
                     )
                 else:
                     print(
                         f"[diag] Production mode: applied Jacobian x^{gexp:.2f} "
-                        f"(N(E) → g(E), DIAGNOSTIC - paper value is 2.0), normalized at x=0.225 to 1.0",
+                        f"(N(E) → g(E), DIAGNOSTIC - paper value is 2.5), normalized at x=0.225 to 1.0",
                         file=sys.stderr,
                     )
 
@@ -1314,12 +1314,12 @@ def main():
     ap.add_argument(
         "--gexp",
         type=float,
-        default=2.0,
+        default=2.5,
         help=(
             "Exponent in g(x) ∝ N(E) x^gexp conversion. "
             "For an apples-to-apples comparison with Shapiro & Marchant (1978), "
-            "this should be 2.0 as implied by eqs. (9), (11) and (13). "
-            "The parameter is kept for diagnostic testing only (default: 2.0)."
+            "this should be 2.5 as implied by eqs. (9), (11) and (13). "
+            "The parameter is kept for diagnostic testing only (default: 2.5)."
         ),
     )
     ap.add_argument(
@@ -1327,7 +1327,7 @@ def main():
         action="store_true",
         help=(
             "DEPRECATED: This flag is now a no-op. The code always uses the --gexp "
-            "parameter. For Fig. 3 reproduction, use --gexp 2.0 (the default)."
+            "parameter. For Fig. 3 reproduction, use --gexp 2.5 (the default)."
         ),
     )
     ap.add_argument(
@@ -1404,12 +1404,16 @@ def main():
         help="Enable capture/injection diagnostics: histogram captures and injections by x-bin.",
     )
     ap.add_argument(
+        "--outer-injection",
+        action="store_true",
+        help="Use outer-boundary injection (x >= --outer-inj-x-min from reservoir). "
+             "By default, x-bound injection is used (x_b = 0.2, canonical SM78).",
+    )
+    ap.add_argument(
         "--use-x-bound-injection",
         action="store_true",
-        help="Use old injection scheme: inject at x_b = 0.2 (for backward compatibility/testing). "
-             "By default, outer-boundary injection is used (x >= --outer-inj-x-min). "
-             "NOTE: The old scheme produces an unphysically steep cusp (g(x) ∝ x^-3.7). "
-             "Outer-boundary injection (default) is required to reproduce Fig. 3 / Table 2.",
+        help="DEPRECATED: Use --outer-injection to enable outer-boundary injection. "
+             "By default, x-bound injection (x_b = 0.2) is used for canonical SM78.",
     )
     ap.add_argument(
         "--outer-inj-x-min",
@@ -1462,7 +1466,7 @@ def main():
         lc_floor_frac=args.lc_floor_frac,
         lc_gap_scale=args.lc_gap_scale,
         enable_cap_inj_diag=args.cap_inj_diag,
-        outer_injection=not args.use_x_bound_injection,
+        outer_injection=args.outer_injection if hasattr(args, 'outer_injection') else False,
         outer_inj_x_min=args.outer_inj_x_min,
     )
 
