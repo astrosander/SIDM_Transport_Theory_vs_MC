@@ -1697,6 +1697,13 @@ def main():
 
     args = ap.parse_args()
 
+    if getattr(args, "gbar_from_flux", False):
+        raise SystemExit(
+            "ERROR: --gbar-from-flux is not currently consistent with the SM78 "
+            "definition of ḡ. Please drop this flag and use --gbar-x-norm to "
+            "compute ḡ from occupancy instead."
+        )
+
     floors = np.array(
         [10.0 ** (-k) for k in range(0, args.floors_min_exp + 1, args.floor_step)],
         dtype=np.float64,
