@@ -45,6 +45,20 @@ DX = X_EDGES[1:] - X_EDGES[:-1]
 def make_gbar_from_occupancy(x_centers, N_x, gexp, x_norm):
     """
     Map occupancy N(E) → ḡ(E) using paper's N(E) → g(E) ∝ x^{gexp}.
+
+    This is the primary method for computing ḡ(x) and matches SM78's definition:
+        ḡ(E) ∝ N(E) * x^{gexp}
+    where N(E) is the time-averaged occupancy per energy bin from snapshots,
+    and gexp = 2.5 for SM78 canonical case.
+
+    For SM78 fiducial model, this gives ḡ(x) ∝ x^{-0.48} in 1≲x≲100.
+
+    Args:
+        x_centers: Energy bin centers
+        N_x: Time-averaged occupancy per bin (from snapshots)
+        gexp: Exponent for N(E) → g(E) mapping (default: 2.5 for SM78)
+        x_norm: x value at which to normalize ḡ to 1
+
     Returns (gbar_norm, gbar_raw).
     """
     x_centers = np.asarray(x_centers, dtype=float)
@@ -65,7 +79,7 @@ def make_gbar_from_occupancy(x_centers, N_x, gexp, x_norm):
 
 def make_gbar_from_flux(x_centers, N_cap, N_occ, total_measure, flux_exp, x_norm):
     """
-    OPTIONAL: experimental ḡ(E) from capture flux Γ_cap = N_cap / N_occ per t0.
+    Compute ḡ(E) from capture flux Γ_cap = N_cap / N_occ per t0.
 
     From the steady-state flux relation (SM78 style):
         Γ_cap(x) ∝ ḡ(x) / x^flux_exp
@@ -75,12 +89,15 @@ def make_gbar_from_flux(x_centers, N_cap, N_occ, total_measure, flux_exp, x_norm
     In our implementation Γ_cap(x) already grows ~ x^flux_exp, so we must DIVIDE
     by x^flux_exp to get a roughly flat ḡ(x) consistent with occupancy-based ḡ.
 
+    For SM78 fiducial model (gexp=2.5, E2-x-power=0.62), flux_exp ≈ 3.10
+    makes flux-based ḡ match occupancy-based ḡ (both give slope ≈ -0.48).
+
     Args:
         x_centers: Energy bin centers
         N_cap: Total capture counts per bin (raw counts)
         N_occ: Total occupancy counts per bin (raw counts, not normalized)
         total_measure: Total time/snapshots for normalization (to compute N_occ per t0)
-        flux_exp: Exponent for the flux relation (typically 2.5, but can be tuned separately)
+        flux_exp: Exponent for the flux relation (default: 3.10 for SM78 fiducial)
         x_norm: x value at which to normalize ḡ to 1
 
     Returns (gbar_norm, gbar_raw).
@@ -1088,7 +1105,7 @@ def run_parallel_gbar(
     E2_x_ref=1.0,
     gbar_from_flux=False,
     gbar_x_norm=0.225,
-    gbar_flux_exp=None,
+    gbar_flux_exp=3.10,
 ):
     if noloss:
         use_clones = False
@@ -1297,7 +1314,7 @@ def run_parallel_gbar(
                 raise RuntimeError(
                     "--gbar-from-flux requires --cap-inj-diag to accumulate capture statistics."
                 )
-            p_flux = gbar_flux_exp if gbar_flux_exp is not None else gexp
+            p_flux = gbar_flux_exp
             N_occ = g_total.copy()
             gbar_norm, gbar_raw = make_gbar_from_flux(
                 x_centers=X_BINS,
@@ -1383,7 +1400,7 @@ def run_parallel_gbar(
                         "--gbar-from-flux requires --cap-inj-diag to accumulate capture statistics."
                     )
                 N_occ = g_total.copy()
-                p_flux = gbar_flux_exp if gbar_flux_exp is not None else gexp
+                p_flux = gbar_flux_exp
                 gbar_norm, gbar_raw = make_gbar_from_flux(
                     x_centers=X_BINS,
                     N_cap=cap_hist_total,
@@ -1709,10 +1726,11 @@ def main():
     ap.add_argument(
         "--gbar-flux-exp",
         type=float,
-        default=None,
+        default=3.10,
         help=(
-            "Exponent p used in Γ_cap/x^p when computing ḡ from capture flux. "
-            "If not set, defaults to gexp. Use this to tune flux-based ḡ to match occupancy-based ḡ."
+            "Exponent p in ḡ ∝ Γ_cap(x) / x^p when using --gbar-from-flux "
+            "(p ≈ gexp + E2_x_power; default: 3.10 for SM78 fiducial). "
+            "This value makes flux-based ḡ match occupancy-based ḡ."
         ),
     )
 
