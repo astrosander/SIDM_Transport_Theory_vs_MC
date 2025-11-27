@@ -149,7 +149,8 @@ assert abs(J2[-1, 1] - 4.59e-4) < 1e-12
 def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                    e1_scale=E1_SCALE_DEFAULT, zero_coeffs=False,
                    zero_drift=False, zero_diffusion=False,
-                   step_size_factor=1.0, n_max_override=None):
+                   step_size_factor=1.0, n_max_override=None,
+                   E2_scale=1.0, J2_scale=1.0, covEJ_scale=1.0):
     if use_jit and HAVE_NUMBA:
         njit = nb.njit
         fastmath = dict(fastmath=True, nogil=True, cache=True)
@@ -210,10 +211,14 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         return best
 
     n_max_override_val = n_max_override if n_max_override is not None else 3.0e4
+    E2_scale_val = E2_scale
+    J2_scale_val = J2_scale
+    covEJ_scale_val = covEJ_scale
 
     @njit(**fastmath)
     def bilinear_coeffs(x, j, pstar_val, e1_scale_val, zero_coeffs_flag,
-                        zero_drift_flag, zero_diffusion_flag):
+                        zero_drift_flag, zero_diffusion_flag,
+                        E2_scale_local, J2_scale_local, covEJ_scale_local):
         x_clamp = x
         if x_clamp < X_GRID[0]:
             x_clamp = X_GRID[0]
@@ -291,6 +296,10 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             E2_star = 0.0
             J2_star = 0.0
             covEJ_star = 0.0
+        
+        E2_star *= E2_scale_local
+        J2_star *= J2_scale_local
+        covEJ_star *= covEJ_scale_local
 
         v0_sq = 1.0
         Jmax = 1.0 / math.sqrt(2.0 * x_clamp)
@@ -412,10 +421,16 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                  ghost_cap_hist=None, x_bins=None,
                  zero_coeffs_flag=False, zero_drift_flag=False,
                  zero_diffusion_flag=False, step_size_factor_val=1.0,
-                 n_max_override_val=3.0e4):
+                 n_max_override_val=3.0e4, E2_scale_local=1.0,
+                 J2_scale_local=1.0, covEJ_scale_local=1.0):
+        E2_scale_val = E2_scale_local
+        J2_scale_val = J2_scale_local
+        covEJ_scale_val = covEJ_scale_local
         e1, sigE, j1, sigJ, rho = bilinear_coeffs(x, j, pstar_val, e1_scale_val,
                                                    zero_coeffs_flag, zero_drift_flag,
-                                                   zero_diffusion_flag)
+                                                   zero_diffusion_flag,
+                                                   E2_scale_local, J2_scale_local,
+                                                   covEJ_scale_local)
 
         n_raw = pick_n(x, j, sigE, sigJ, lc_scale_val, noloss_flag,
                        cone_gamma_val, diag_counts=diag_counts,
@@ -517,7 +532,10 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                    zero_drift_flag=False,
                    zero_diffusion_flag=False,
                    step_size_factor=1.0,
-                   n_max_override=None):
+                   n_max_override=None,
+                   E2_scale=1.0,
+                   J2_scale=1.0,
+                   covEJ_scale=1.0):
         np.random.seed(seed)
         SPLIT_HYST = 0.8
         noloss_flag = noloss
@@ -576,7 +594,9 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 zero_coeffs_flag=zero_coeffs_flag, zero_drift_flag=zero_drift_flag,
                 zero_diffusion_flag=zero_diffusion_flag,
                 step_size_factor_val=step_size_factor,
-                n_max_override_val=n_max_override_val
+                n_max_override_val=n_max_override_val,
+                E2_scale_local=E2_scale, J2_scale_local=J2_scale,
+                covEJ_scale_local=covEJ_scale
             )
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -704,7 +724,9 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 zero_coeffs_flag=zero_coeffs_flag, zero_drift_flag=zero_drift_flag,
                 zero_diffusion_flag=zero_diffusion_flag,
                 step_size_factor_val=step_size_factor,
-                n_max_override_val=n_max_override_val
+                n_max_override_val=n_max_override_val,
+                E2_scale_local=E2_scale, J2_scale_local=J2_scale,
+                covEJ_scale_local=covEJ_scale
             )
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -904,13 +926,15 @@ def _worker_one(args):
      noloss, use_clones, lc_scale, e1_scale, x_max, cone_gamma,
      enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
      enable_cap_inj_diag, outer_injection, outer_inj_x_min,
-     zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override) = args
+     zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override,
+     E2_scale, J2_scale, covEJ_scale) = args
 
     P_of_x, T0, run_stream, sample_x_from_g0_jit = _build_kernels(
         use_jit=use_jit, noloss=noloss, lc_scale=lc_scale,
         e1_scale=e1_scale, zero_coeffs=zero_coeffs,
         zero_drift=zero_drift, zero_diffusion=zero_diffusion,
-        step_size_factor=step_size_factor, n_max_override=n_max_override
+        step_size_factor=step_size_factor, n_max_override=n_max_override,
+        E2_scale=E2_scale, J2_scale=J2_scale, covEJ_scale=covEJ_scale
     )
 
     x_init = sample_x_from_g0(u0)
@@ -922,7 +946,8 @@ def _worker_one(args):
         x_max, lc_scale, cone_gamma, e1_scale, snaps_per_t0,
         enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
         enable_cap_inj_diag, outer_injection, outer_inj_x_min,
-        zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override
+        zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override,
+        E2_scale, J2_scale, covEJ_scale
     )
 
     result = run_stream(
@@ -932,7 +957,8 @@ def _worker_one(args):
         x_max, lc_scale, cone_gamma, e1_scale, snaps_per_t0,
         enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
         enable_cap_inj_diag, outer_injection, outer_inj_x_min,
-        zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override
+        zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override,
+        E2_scale, J2_scale, covEJ_scale
     )
     return result
 
@@ -972,6 +998,9 @@ def run_parallel_gbar(
     zero_diffusion=False,
     step_size_factor=1.0,
     n_max_override=None,
+    E2_scale=1.0,
+    J2_scale=1.0,
+    covEJ_scale=1.0,
 ):
     if noloss:
         use_clones = False
@@ -1055,6 +1084,9 @@ def run_parallel_gbar(
                         zero_diffusion,
                         step_size_factor,
                         n_max_override,
+                        E2_scale,
+                        J2_scale,
+                        covEJ_scale,
                     ),
                 )
                 for sid in range(n_streams)
@@ -1516,6 +1548,24 @@ def main():
         default=None,
         help="DIAGNOSTIC: Override maximum step size n_max (default: 3.0e4). Use smaller values to force smaller steps (Step 3).",
     )
+    ap.add_argument(
+        "--E2-scale",
+        type=float,
+        default=1.0,
+        help="DIAGNOSTIC: Scale factor for energy diffusion E2* (default: 1.0). Use to test if missing factor in diffusion.",
+    )
+    ap.add_argument(
+        "--J2-scale",
+        type=float,
+        default=1.0,
+        help="DIAGNOSTIC: Scale factor for angular momentum diffusion J2* (default: 1.0). Use to test if missing factor in diffusion.",
+    )
+    ap.add_argument(
+        "--covEJ-scale",
+        type=float,
+        default=1.0,
+        help="DIAGNOSTIC: Scale factor for E-J covariance ζ*² (default: 1.0). Use to test if missing factor in correlation.",
+    )
 
     args = ap.parse_args()
 
@@ -1559,6 +1609,9 @@ def main():
         zero_diffusion=args.zero_diffusion,
         step_size_factor=args.step_size_factor,
         n_max_override=args.n_max_override,
+        E2_scale=args.E2_scale,
+        J2_scale=args.J2_scale,
+        covEJ_scale=args.covEJ_scale,
     )
 
     print("# x_center   gbar_MC_norm   gbar_MC_raw      gbar_paper   gbar_err_paper")
