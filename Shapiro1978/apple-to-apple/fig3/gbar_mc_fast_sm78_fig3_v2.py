@@ -147,7 +147,9 @@ assert abs(J2[-1, 1] - 4.59e-4) < 1e-12
 
 
 def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
-                   e1_scale=E1_SCALE_DEFAULT):
+                   e1_scale=E1_SCALE_DEFAULT, zero_coeffs=False,
+                   zero_drift=False, zero_diffusion=False,
+                   step_size_factor=1.0, n_max_override=None):
     if use_jit and HAVE_NUMBA:
         njit = nb.njit
         fastmath = dict(fastmath=True, nogil=True, cache=True)
@@ -207,8 +209,11 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 best = i
         return best
 
+    n_max_override_val = n_max_override if n_max_override is not None else 3.0e4
+
     @njit(**fastmath)
-    def bilinear_coeffs(x, j, pstar_val, e1_scale_val):
+    def bilinear_coeffs(x, j, pstar_val, e1_scale_val, zero_coeffs_flag,
+                        zero_drift_flag, zero_diffusion_flag):
         x_clamp = x
         if x_clamp < X_GRID[0]:
             x_clamp = X_GRID[0]
@@ -259,17 +264,33 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
 
         PSTAR_CANON = 0.005
 
-        e1_star = get(NEG_E1)
-        E2_star = max(get(E2), 0.0)
-        J2_star = max(get(J2), 0.0)
-        j1_star = get(J1)
-        covEJ_star = get(ZETA2)
-        scale = pstar_val / PSTAR_CANON
-        e1_star *= scale
-        E2_star *= scale
-        j1_star *= scale
-        J2_star *= scale
-        covEJ_star *= scale
+        if zero_coeffs_flag:
+            e1_star = 0.0
+            E2_star = 0.0
+            J2_star = 0.0
+            j1_star = 0.0
+            covEJ_star = 0.0
+        else:
+            e1_star = get(NEG_E1)
+            E2_star = max(get(E2), 0.0)
+            J2_star = max(get(J2), 0.0)
+            j1_star = get(J1)
+            covEJ_star = get(ZETA2)
+            scale = pstar_val / PSTAR_CANON
+            e1_star *= scale
+            E2_star *= scale
+            j1_star *= scale
+            J2_star *= scale
+            covEJ_star *= scale
+        
+        if zero_drift_flag:
+            e1_star = 0.0
+            j1_star = 0.0
+        
+        if zero_diffusion_flag:
+            E2_star = 0.0
+            J2_star = 0.0
+            covEJ_star = 0.0
 
         v0_sq = 1.0
         Jmax = 1.0 / math.sqrt(2.0 * x_clamp)
@@ -298,25 +319,26 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
     @njit(**fastmath)
     def pick_n(x, j, sigE, sigJ, lc_scale_val, noloss_flag, cone_gamma_val,
                n_min=0.01, n_max=3.0e4,
-               diag_counts=None, lc_floor_frac=0.10, lc_gap_scale=None):
+               diag_counts=None, lc_floor_frac=0.10, lc_gap_scale=None,
+               step_size_factor_val=1.0, n_max_override_val=3.0e4):
         jmin = j_min_of_x(x, lc_scale_val, noloss_flag)
         E = -x
         Jmax = 1.0 / math.sqrt(2.0 * x)
         J = j * Jmax
 
         if sigE > 0.0:
-            n_E = (0.15 * abs(E) / sigE) ** 2
+            n_E = (step_size_factor_val * 0.15 * abs(E) / sigE) ** 2
         else:
             n_E = n_max
 
         if sigJ > 0.0:
-            n_J_iso = (0.10 * Jmax / sigJ) ** 2
+            n_J_iso = (step_size_factor_val * 0.10 * Jmax / sigJ) ** 2
         else:
             n_J_iso = n_max
 
         if sigJ > 0.0:
             delta_top = max(1e-6 * Jmax, 1.0075 * Jmax - J)
-            n_J_top = (0.40 * delta_top / sigJ) ** 2
+            n_J_top = (step_size_factor_val * 0.40 * delta_top / sigJ) ** 2
         else:
             n_J_top = n_max
 
@@ -330,7 +352,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 floor = max(gap, lc_floor_frac * Jmin)
             else:
                 floor = gap
-            n_J_lc = (floor / sigJ) ** 2
+            n_J_lc = (step_size_factor_val * floor / sigJ) ** 2
 
         n = n_E
         winner = 0
@@ -344,8 +366,9 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             n = n_J_lc
             winner = 3
         
-        if n > n_max:
-            n = n_max
+        n_max_actual = n_max_override_val if n_max_override_val < n_max else n_max
+        if n > n_max_actual:
+            n = n_max_actual
         if n < n_min:
             n = n_min
         
@@ -386,12 +409,19 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                  lc_scale_val, cone_gamma_val, e1_scale_val,
                  diag_counts=None, disable_capture=False,
                  lc_floor_frac=0.10, lc_gap_scale=None,
-                 ghost_cap_hist=None, x_bins=None):
-        e1, sigE, j1, sigJ, rho = bilinear_coeffs(x, j, pstar_val, e1_scale_val)
+                 ghost_cap_hist=None, x_bins=None,
+                 zero_coeffs_flag=False, zero_drift_flag=False,
+                 zero_diffusion_flag=False, step_size_factor_val=1.0,
+                 n_max_override_val=3.0e4):
+        e1, sigE, j1, sigJ, rho = bilinear_coeffs(x, j, pstar_val, e1_scale_val,
+                                                   zero_coeffs_flag, zero_drift_flag,
+                                                   zero_diffusion_flag)
 
         n_raw = pick_n(x, j, sigE, sigJ, lc_scale_val, noloss_flag,
                        cone_gamma_val, diag_counts=diag_counts,
-                       lc_floor_frac=lc_floor_frac, lc_gap_scale=lc_gap_scale)
+                       lc_floor_frac=lc_floor_frac, lc_gap_scale=lc_gap_scale,
+                       step_size_factor_val=step_size_factor_val,
+                       n_max_override_val=n_max_override_val)
 
         next_int = math.floor(phase) + 1.0
         crossed_peri = (phase + n_raw >= next_int)
@@ -482,10 +512,16 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                    lc_gap_scale=-1.0,
                    enable_cap_inj_diag=False,
                    outer_injection=False,
-                   outer_inj_x_min=10.0):
+                   outer_inj_x_min=10.0,
+                   zero_coeffs_flag=False,
+                   zero_drift_flag=False,
+                   zero_diffusion_flag=False,
+                   step_size_factor=1.0,
+                   n_max_override=None):
         np.random.seed(seed)
         SPLIT_HYST = 0.8
         noloss_flag = noloss
+        n_max_override_val = n_max_override if n_max_override is not None else 3.0e4
         
         if enable_diag_counts:
             diag_counts = np.zeros(4, dtype=np.int64)
@@ -536,7 +572,11 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 lc_scale_val, cone_gamma_val, e1_scale_val,
                 diag_counts=diag_counts, disable_capture=disable_capture,
                 lc_floor_frac=lc_floor_frac, lc_gap_scale=gap_scale_val,
-                ghost_cap_hist=ghost_cap_hist, x_bins=x_bins
+                ghost_cap_hist=ghost_cap_hist, x_bins=x_bins,
+                zero_coeffs_flag=zero_coeffs_flag, zero_drift_flag=zero_drift_flag,
+                zero_diffusion_flag=zero_diffusion_flag,
+                step_size_factor_val=step_size_factor,
+                n_max_override_val=n_max_override_val
             )
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -660,7 +700,11 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 lc_scale_val, cone_gamma_val, e1_scale_val,
                 diag_counts=diag_counts, disable_capture=disable_capture,
                 lc_floor_frac=lc_floor_frac, lc_gap_scale=gap_scale_val,
-                ghost_cap_hist=ghost_cap_hist, x_bins=x_bins
+                ghost_cap_hist=ghost_cap_hist, x_bins=x_bins,
+                zero_coeffs_flag=zero_coeffs_flag, zero_drift_flag=zero_drift_flag,
+                zero_diffusion_flag=zero_diffusion_flag,
+                step_size_factor_val=step_size_factor,
+                n_max_override_val=n_max_override_val
             )
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -859,11 +903,14 @@ def _worker_one(args):
      include_clone_gbar, use_snapshots, snaps_per_t0,
      noloss, use_clones, lc_scale, e1_scale, x_max, cone_gamma,
      enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
-     enable_cap_inj_diag, outer_injection, outer_inj_x_min) = args
+     enable_cap_inj_diag, outer_injection, outer_inj_x_min,
+     zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override) = args
 
     P_of_x, T0, run_stream, sample_x_from_g0_jit = _build_kernels(
         use_jit=use_jit, noloss=noloss, lc_scale=lc_scale,
-        e1_scale=e1_scale
+        e1_scale=e1_scale, zero_coeffs=zero_coeffs,
+        zero_drift=zero_drift, zero_diffusion=zero_diffusion,
+        step_size_factor=step_size_factor, n_max_override=n_max_override
     )
 
     x_init = sample_x_from_g0(u0)
@@ -874,7 +921,8 @@ def _worker_one(args):
         include_clone_gbar, use_snapshots, noloss, use_clones,
         x_max, lc_scale, cone_gamma, e1_scale, snaps_per_t0,
         enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
-        enable_cap_inj_diag, outer_injection, outer_inj_x_min
+        enable_cap_inj_diag, outer_injection, outer_inj_x_min,
+        zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override
     )
 
     result = run_stream(
@@ -883,7 +931,8 @@ def _worker_one(args):
         include_clone_gbar, use_snapshots, noloss, use_clones,
         x_max, lc_scale, cone_gamma, e1_scale, snaps_per_t0,
         enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
-        enable_cap_inj_diag, outer_injection, outer_inj_x_min
+        enable_cap_inj_diag, outer_injection, outer_inj_x_min,
+        zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override
     )
     return result
 
@@ -918,6 +967,11 @@ def run_parallel_gbar(
     enable_cap_inj_diag=False,
     outer_injection=False,
     outer_inj_x_min=10.0,
+    zero_coeffs=False,
+    zero_drift=False,
+    zero_diffusion=False,
+    step_size_factor=1.0,
+    n_max_override=None,
 ):
     if noloss:
         use_clones = False
@@ -996,6 +1050,11 @@ def run_parallel_gbar(
                         enable_cap_inj_diag,
                         outer_injection,
                         outer_inj_x_min,
+                        zero_coeffs,
+                        zero_drift,
+                        zero_diffusion,
+                        step_size_factor,
+                        n_max_override,
                     ),
                 )
                 for sid in range(n_streams)
@@ -1430,6 +1489,33 @@ def main():
             "instead of gexp-based conversion. Useful for testing cloning neutrality."
         ),
     )
+    ap.add_argument(
+        "--zero-coeffs",
+        action="store_true",
+        help="DIAGNOSTIC: Zero out all drift and diffusion coefficients (Step 1 test).",
+    )
+    ap.add_argument(
+        "--zero-drift",
+        action="store_true",
+        help="DIAGNOSTIC: Zero out drift terms (e1, j1) to test diffusion only (Step 2a).",
+    )
+    ap.add_argument(
+        "--zero-diffusion",
+        action="store_true",
+        help="DIAGNOSTIC: Zero out diffusion terms (E2, J2, covEJ) to test drift only (Step 2b).",
+    )
+    ap.add_argument(
+        "--step-size-factor",
+        type=float,
+        default=1.0,
+        help="DIAGNOSTIC: Scale factor for eq. 29 step-size constants (default: 1.0). Use <1.0 for smaller steps (Step 3).",
+    )
+    ap.add_argument(
+        "--n-max-override",
+        type=float,
+        default=None,
+        help="DIAGNOSTIC: Override maximum step size n_max (default: 3.0e4). Use smaller values to force smaller steps (Step 3).",
+    )
 
     args = ap.parse_args()
 
@@ -1468,6 +1554,11 @@ def main():
         enable_cap_inj_diag=args.cap_inj_diag,
         outer_injection=args.outer_injection if hasattr(args, 'outer_injection') else False,
         outer_inj_x_min=args.outer_inj_x_min,
+        zero_coeffs=args.zero_coeffs,
+        zero_drift=args.zero_drift,
+        zero_diffusion=args.zero_diffusion,
+        step_size_factor=args.step_size_factor,
+        n_max_override=args.n_max_override,
     )
 
     print("# x_center   gbar_MC_norm   gbar_MC_raw      gbar_paper   gbar_err_paper")
