@@ -1723,7 +1723,8 @@ def main():
         default=0.225,
         help="x at which ḡ is normalized to 1 (default: 0.225, matching paper).",
     )
-    ap.add_argument(
+    flux_exp_group = ap.add_mutually_exclusive_group()
+    flux_exp_group.add_argument(
         "--gbar-flux-exp",
         type=float,
         default=3.10,
@@ -1731,6 +1732,15 @@ def main():
             "Exponent p in ḡ ∝ Γ_cap(x) / x^p when using --gbar-from-flux "
             "(p ≈ gexp + E2_x_power; default: 3.10 for SM78 fiducial). "
             "This value makes flux-based ḡ match occupancy-based ḡ."
+        ),
+    )
+    flux_exp_group.add_argument(
+        "--gbar-flux-power",
+        type=float,
+        dest="gbar_flux_exp",
+        help=(
+            "Alias for --gbar-flux-exp. Exponent p in ḡ ∝ Γ_cap(x) / x^p "
+            "when using --gbar-from-flux (default: 3.10)."
         ),
     )
 
