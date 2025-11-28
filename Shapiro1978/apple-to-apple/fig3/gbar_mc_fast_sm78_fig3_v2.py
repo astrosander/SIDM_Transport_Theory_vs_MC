@@ -448,16 +448,11 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             j1_star = 0.0
             covEJ_star = 0.0
         else:
-            if use_sm78_physics:
-                e1_star, E2_star, j1_star, J2_star, covEJ_star = diff_coeffs_sm78_exact_star(
-                    x_clamp, j_clamp
-                )
-            else:
-                e1_star = get(NEG_E1)
-                E2_star = max(get(E2), 0.0)
-                J2_star = max(get(J2), 0.0)
-                j1_star = get(J1)
-                covEJ_star = get(ZETA2)
+            e1_star = get(NEG_E1)
+            E2_star = max(get(E2), 0.0)
+            J2_star = max(get(J2), 0.0)
+            j1_star = get(J1)
+            covEJ_star = get(ZETA2)
 
         scale = pstar_val / PSTAR_CANON
         e1_star *= scale
@@ -1901,6 +1896,19 @@ def main():
     )
 
     args = ap.parse_args()
+
+    if args.use_sm78_physics:
+        args.e1_scale = 1.0
+        args.E2_scale = 1.0
+        args.J2_scale = 1.0
+        args.covEJ_scale = 1.0
+        args.E2_x_power = 0.0
+        args.E2_x_ref = 1.0
+        args.lc_scale = 1.0
+        args.lc_floor_frac = 0.0
+        args.cone_gamma = 1.0
+        args.lc_gap_scale = None
+        args.outer_injection = False
 
     if args.gbar_from_flux and not args.cap_inj_diag:
         print(
