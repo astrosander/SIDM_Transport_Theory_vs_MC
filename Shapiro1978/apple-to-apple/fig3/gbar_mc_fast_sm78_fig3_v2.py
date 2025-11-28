@@ -355,6 +355,30 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
 
     @njit(**fastmath)
     def diff_coeffs_sm78_exact_star(x, j):
+        """
+        Exact SM78 orbit-averaged diffusion coefficients in the SAME
+        normalized units as the original Table 1 ("starred" units).
+
+        That is: this should return the analogs of
+            NEG_E1, E2, J2, J1, ZETA2
+        evaluated at (x, j) for P* = PSTAR_CANON.
+
+        Returns:
+            (e1_star, E2_star, j1_star, J2_star, covEJ_star)
+        all for pstar = PSTAR_CANON, i.e. BEFORE any pstar scaling.
+
+        IMPORTANT: Do NOT include pstar in these formulas; pstar
+        scaling is handled later in bilinear_coeffs().
+        """
+        if x < X_GRID[-1]:
+            x = X_GRID[-1]
+        if x > X_GRID[0]:
+            x = X_GRID[0]
+        if j < 0.0:
+            j = 0.0
+        if j > 1.0:
+            j = 1.0
+
         e1_star = A_e1 * x**ALPHA_e1 * (1.0 + BETA_e1 * j*j)
         E2_star = A_E2 * x**ALPHA_E2 * (1.0 + BETA_E2 * j*j)
         j1_star = A_j1 * x**ALPHA_j1 * j * (1.0 + BETA_j1 * j*j)
@@ -428,44 +452,39 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 e1_star, E2_star, j1_star, J2_star, covEJ_star = diff_coeffs_sm78_exact_star(
                     x_clamp, j_clamp
                 )
-                if pstar_val != PSTAR_CANON:
-                    scale = pstar_val / PSTAR_CANON
-                    e1_star *= scale
-                    E2_star *= scale
-                    j1_star *= scale
-                    J2_star *= scale
-                    covEJ_star *= scale
             else:
                 e1_star = get(NEG_E1)
                 E2_star = max(get(E2), 0.0)
                 J2_star = max(get(J2), 0.0)
                 j1_star = get(J1)
                 covEJ_star = get(ZETA2)
-                scale = pstar_val / PSTAR_CANON
-                e1_star *= scale
-                E2_star *= scale
-                j1_star *= scale
-                J2_star *= scale
-                covEJ_star *= scale
-                
-                if zero_drift_flag:
-                    e1_star = 0.0
-                    j1_star = 0.0
-                
-                if zero_diffusion_flag:
-                    E2_star = 0.0
-                    J2_star = 0.0
-                    covEJ_star = 0.0
-                
-                E2_star *= E2_scale_local
-                J2_star *= J2_scale_local
-                covEJ_star *= covEJ_scale_local
 
-                if abs(E2_x_power_local) > 1e-10:
-                    x_scale = x_clamp / E2_x_ref_local
-                    if x_scale > 100.0 and E2_x_power_local > 0.0:
-                        x_scale = 100.0
-                    E2_star *= (x_scale ** E2_x_power_local)
+        scale = pstar_val / PSTAR_CANON
+        e1_star *= scale
+        E2_star *= scale
+        j1_star *= scale
+        J2_star *= scale
+        covEJ_star *= scale
+
+        if zero_drift_flag:
+            e1_star = 0.0
+            j1_star = 0.0
+
+        if zero_diffusion_flag:
+            E2_star = 0.0
+            J2_star = 0.0
+            covEJ_star = 0.0
+
+        if not use_sm78_physics:
+            E2_star *= E2_scale_local
+            J2_star *= J2_scale_local
+            covEJ_star *= covEJ_scale_local
+
+            if abs(E2_x_power_local) > 1e-10:
+                x_scale = x_clamp / E2_x_ref_local
+                if x_scale > 100.0 and E2_x_power_local > 0.0:
+                    x_scale = 100.0
+                E2_star *= (x_scale ** E2_x_power_local)
 
         v0_sq = 1.0
         Jmax = 1.0 / math.sqrt(2.0 * x_clamp)
@@ -522,16 +541,28 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             n_J_lc = n_max
         else:
             Jmin = jmin * Jmax
+            dJ = abs(J - Jmin)
             if use_sm78_physics:
-                n_J_lc = (step_size_factor_val * abs(J - Jmin) / sigJ) ** 2
+                if sigJ > 0.0 and dJ > 0.0:
+                    n_J_lc = (step_size_factor_val * dJ / sigJ) ** 2
+                    if n_J_lc < 1.0:
+                        n_J_lc = 1.0
+                    if n_J_lc > n_max:
+                        n_J_lc = n_max
+                else:
+                    n_J_lc = n_max
             else:
                 gap_scale = cone_gamma_val if lc_gap_scale is None else lc_gap_scale
-                gap = gap_scale * abs(J - Jmin)
+                gap = gap_scale * dJ
                 if lc_floor_frac > 0.0:
                     floor = max(gap, lc_floor_frac * Jmin)
                 else:
                     floor = gap
                 n_J_lc = (step_size_factor_val * floor / sigJ) ** 2
+                if n_J_lc < 1.0:
+                    n_J_lc = 1.0
+                if n_J_lc > n_max:
+                    n_J_lc = n_max
 
         n = n_E
         winner = 0
