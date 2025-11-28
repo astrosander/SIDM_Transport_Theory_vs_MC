@@ -22,6 +22,33 @@ SEED    = 20251028
 E1_SCALE_DEFAULT = 1.0
 
 LC_SCALE_DEFAULT = 1.0
+
+PSTAR_CANON = 0.005
+
+SM78_LN_LAMBDA = 15.0
+SM78_MSTAR = 1.0
+SM78_MBH = 1.0e6
+SM78_R_INFL = 1.0
+
+SM78_A_e1 = 1.0
+SM78_ALPHA_e1 = 1.0
+SM78_BETA_e1 = 0.0
+
+SM78_A_E2 = 1.0
+SM78_ALPHA_E2 = 1.0
+SM78_BETA_E2 = 0.0
+
+SM78_A_j1 = 1.0
+SM78_ALPHA_j1 = 1.0
+SM78_BETA_j1 = 0.0
+
+SM78_A_J2 = 1.0
+SM78_ALPHA_J2 = 1.0
+SM78_BETA_J2 = 0.0
+
+SM78_A_covEJ = 0.0
+SM78_ALPHA_covEJ = 1.0
+SM78_BETA_covEJ = 0.0
 X_BINS = np.array([
     0.225, 0.303, 0.495, 1.04, 1.26, 1.62, 2.35, 5.00, 7.20, 8.94,
     12.1, 19.7, 41.6, 50.3, 64.6, 93.6, 198., 287., 356., 480.,
@@ -234,7 +261,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                    zero_drift=False, zero_diffusion=False,
                    step_size_factor=1.0, n_max_override=None,
                    E2_scale=1.0, J2_scale=1.0, covEJ_scale=1.0,
-                   E2_x_power=0.0, E2_x_ref=1.0):
+                   E2_x_power=0.0, E2_x_ref=1.0, use_sm78_physics=False):
     if use_jit and HAVE_NUMBA:
         njit = nb.njit
         fastmath = dict(fastmath=True, nogil=True, cache=True)
@@ -246,12 +273,15 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         fastmath = {}
 
     @njit(**fastmath)
-    def j_min_of_x(x, lc_scale_val, noloss_flag):
+    def j_min_of_x(x, lc_scale_val, noloss_flag, use_sm78_physics):
         if noloss_flag:
             return 0.0
         v = 2.0 * x / X_D - (x / X_D) ** 2
         jmin = math.sqrt(v) if v > 0.0 else 0.0
-        return lc_scale_val * jmin
+        if use_sm78_physics:
+            return jmin
+        else:
+            return lc_scale_val * jmin
 
     @njit(**fastmath)
     def P_of_x(x):
@@ -259,6 +289,12 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         return 2.0 * math.pi / ((-2.0 * E) ** 1.5)
 
     T0 = P_of_x(1.0) / PSTAR
+
+    @njit(**fastmath)
+    def inject_star_sm78():
+        x = X_BOUND
+        j = math.sqrt(np.random.random())
+        return x, j
 
     @njit(**fastmath)
     def sample_x_from_g0_jit():
@@ -301,11 +337,38 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
     E2_x_power_val = E2_x_power
     E2_x_ref_val = E2_x_ref
 
+    A_e1 = SM78_A_e1
+    ALPHA_e1 = SM78_ALPHA_e1
+    BETA_e1 = SM78_BETA_e1
+    A_E2 = SM78_A_E2
+    ALPHA_E2 = SM78_ALPHA_E2
+    BETA_E2 = SM78_BETA_E2
+    A_j1 = SM78_A_j1
+    ALPHA_j1 = SM78_ALPHA_j1
+    BETA_j1 = SM78_BETA_j1
+    A_J2 = SM78_A_J2
+    ALPHA_J2 = SM78_ALPHA_J2
+    BETA_J2 = SM78_BETA_J2
+    A_covEJ = SM78_A_covEJ
+    ALPHA_covEJ = SM78_ALPHA_covEJ
+    BETA_covEJ = SM78_BETA_covEJ
+
+    @njit(**fastmath)
+    def diff_coeffs_sm78_exact_star(x, j):
+        e1_star = A_e1 * x**ALPHA_e1 * (1.0 + BETA_e1 * j*j)
+        E2_star = A_E2 * x**ALPHA_E2 * (1.0 + BETA_E2 * j*j)
+        j1_star = A_j1 * x**ALPHA_j1 * j * (1.0 + BETA_j1 * j*j)
+        J2_star = A_J2 * x**ALPHA_J2 * j*j * (1.0 + BETA_J2 * j*j)
+        covEJ_star = A_covEJ * x**ALPHA_covEJ * j * (1.0 + BETA_covEJ * j*j)
+        E2_star = max(E2_star, 0.0)
+        J2_star = max(J2_star, 0.0)
+        return e1_star, E2_star, j1_star, J2_star, covEJ_star
+
     @njit(**fastmath)
     def bilinear_coeffs(x, j, pstar_val, e1_scale_val, zero_coeffs_flag,
                         zero_drift_flag, zero_diffusion_flag,
                         E2_scale_local, J2_scale_local, covEJ_scale_local,
-                        E2_x_power_local, E2_x_ref_local):
+                        E2_x_power_local, E2_x_ref_local, use_sm78_physics):
         x_clamp = x
         if x_clamp < X_GRID[0]:
             x_clamp = X_GRID[0]
@@ -354,8 +417,6 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             a2 = a21 * (1.0 - tj) + a22 * tj
             return a1 * (1.0 - tx) + a2 * tx
 
-        PSTAR_CANON = 0.005
-
         if zero_coeffs_flag:
             e1_star = 0.0
             E2_star = 0.0
@@ -363,36 +424,48 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             j1_star = 0.0
             covEJ_star = 0.0
         else:
-            e1_star = get(NEG_E1)
-            E2_star = max(get(E2), 0.0)
-            J2_star = max(get(J2), 0.0)
-            j1_star = get(J1)
-            covEJ_star = get(ZETA2)
-            scale = pstar_val / PSTAR_CANON
-            e1_star *= scale
-            E2_star *= scale
-            j1_star *= scale
-            J2_star *= scale
-            covEJ_star *= scale
-        
-        if zero_drift_flag:
-            e1_star = 0.0
-            j1_star = 0.0
-        
-        if zero_diffusion_flag:
-            E2_star = 0.0
-            J2_star = 0.0
-            covEJ_star = 0.0
-        
-        E2_star *= E2_scale_local
-        J2_star *= J2_scale_local
-        covEJ_star *= covEJ_scale_local
+            if use_sm78_physics:
+                e1_star, E2_star, j1_star, J2_star, covEJ_star = diff_coeffs_sm78_exact_star(
+                    x_clamp, j_clamp
+                )
+                if pstar_val != PSTAR_CANON:
+                    scale = pstar_val / PSTAR_CANON
+                    e1_star *= scale
+                    E2_star *= scale
+                    j1_star *= scale
+                    J2_star *= scale
+                    covEJ_star *= scale
+            else:
+                e1_star = get(NEG_E1)
+                E2_star = max(get(E2), 0.0)
+                J2_star = max(get(J2), 0.0)
+                j1_star = get(J1)
+                covEJ_star = get(ZETA2)
+                scale = pstar_val / PSTAR_CANON
+                e1_star *= scale
+                E2_star *= scale
+                j1_star *= scale
+                J2_star *= scale
+                covEJ_star *= scale
+                
+                if zero_drift_flag:
+                    e1_star = 0.0
+                    j1_star = 0.0
+                
+                if zero_diffusion_flag:
+                    E2_star = 0.0
+                    J2_star = 0.0
+                    covEJ_star = 0.0
+                
+                E2_star *= E2_scale_local
+                J2_star *= J2_scale_local
+                covEJ_star *= covEJ_scale_local
 
-        if abs(E2_x_power_local) > 1e-10:
-            x_scale = x_clamp / E2_x_ref_local
-            if x_scale > 100.0 and E2_x_power_local > 0.0:
-                x_scale = 100.0
-            E2_star *= (x_scale ** E2_x_power_local)
+                if abs(E2_x_power_local) > 1e-10:
+                    x_scale = x_clamp / E2_x_ref_local
+                    if x_scale > 100.0 and E2_x_power_local > 0.0:
+                        x_scale = 100.0
+                    E2_star *= (x_scale ** E2_x_power_local)
 
         v0_sq = 1.0
         Jmax = 1.0 / math.sqrt(2.0 * x_clamp)
@@ -422,8 +495,9 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
     def pick_n(x, j, sigE, sigJ, lc_scale_val, noloss_flag, cone_gamma_val,
                n_min=0.01, n_max=3.0e4,
                diag_counts=None, lc_floor_frac=0.10, lc_gap_scale=None,
-               step_size_factor_val=1.0, n_max_override_val=3.0e4):
-        jmin = j_min_of_x(x, lc_scale_val, noloss_flag)
+               step_size_factor_val=1.0, n_max_override_val=3.0e4,
+               use_sm78_physics=False):
+        jmin = j_min_of_x(x, lc_scale_val, noloss_flag, use_sm78_physics)
         E = -x
         Jmax = 1.0 / math.sqrt(2.0 * x)
         J = j * Jmax
@@ -448,13 +522,16 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             n_J_lc = n_max
         else:
             Jmin = jmin * Jmax
-            gap_scale = cone_gamma_val if lc_gap_scale is None else lc_gap_scale
-            gap = gap_scale * abs(J - Jmin)
-            if lc_floor_frac > 0.0:
-                floor = max(gap, lc_floor_frac * Jmin)
+            if use_sm78_physics:
+                n_J_lc = (step_size_factor_val * abs(J - Jmin) / sigJ) ** 2
             else:
-                floor = gap
-            n_J_lc = (step_size_factor_val * floor / sigJ) ** 2
+                gap_scale = cone_gamma_val if lc_gap_scale is None else lc_gap_scale
+                gap = gap_scale * abs(J - Jmin)
+                if lc_floor_frac > 0.0:
+                    floor = max(gap, lc_floor_frac * Jmin)
+                else:
+                    floor = gap
+                n_J_lc = (step_size_factor_val * floor / sigJ) ** 2
 
         n = n_E
         winner = 0
@@ -516,7 +593,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                  zero_diffusion_flag=False, step_size_factor_val=1.0,
                  n_max_override_val=3.0e4, E2_scale_local=1.0,
                  J2_scale_local=1.0, covEJ_scale_local=1.0,
-                 E2_x_power_local=0.0, E2_x_ref_local=1.0):
+                 E2_x_power_local=0.0, E2_x_ref_local=1.0,
+                 use_sm78_physics=False):
         E2_scale_val = E2_scale_local
         J2_scale_val = J2_scale_local
         covEJ_scale_val = covEJ_scale_local
@@ -525,13 +603,15 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                                                    zero_diffusion_flag,
                                                    E2_scale_local, J2_scale_local,
                                                    covEJ_scale_local,
-                                                   E2_x_power_local, E2_x_ref_local)
+                                                   E2_x_power_local, E2_x_ref_local,
+                                                   use_sm78_physics)
 
         n_raw = pick_n(x, j, sigE, sigJ, lc_scale_val, noloss_flag,
                        cone_gamma_val, diag_counts=diag_counts,
                        lc_floor_frac=lc_floor_frac, lc_gap_scale=lc_gap_scale,
                        step_size_factor_val=step_size_factor_val,
-                       n_max_override_val=n_max_override_val)
+                       n_max_override_val=n_max_override_val,
+                       use_sm78_physics=use_sm78_physics)
 
         next_int = math.floor(phase) + 1.0
         crossed_peri = (phase + n_raw >= next_int)
@@ -585,7 +665,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         captured = False
         ghost_captured = False
         if (not noloss_flag) and crossed_peri:
-            j_min_new = j_min_of_x(x_new, lc_scale_val, noloss_flag)
+            j_min_new = j_min_of_x(x_new, lc_scale_val, noloss_flag, use_sm78_physics)
             if j_new < j_min_new:
                 if not disable_capture:
                     captured = True
@@ -632,7 +712,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                    J2_scale=1.0,
                    covEJ_scale=1.0,
                    E2_x_power=0.0,
-                   E2_x_ref=1.0):
+                   E2_x_ref=1.0,
+                   use_sm78_physics=False):
         np.random.seed(seed)
         SPLIT_HYST = 0.8
         noloss_flag = noloss
@@ -694,22 +775,26 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 n_max_override_val=n_max_override_val,
                 E2_scale_local=E2_scale, J2_scale_local=J2_scale,
                 covEJ_scale_local=covEJ_scale,
-                E2_x_power_local=E2_x_power, E2_x_ref_local=E2_x_ref
+                E2_x_power_local=E2_x_power, E2_x_ref_local=E2_x_ref,
+                use_sm78_physics=use_sm78_physics
             )
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
 
             if cap or (x < X_BOUND):
-                if noloss_flag:
-                    x = sample_x_from_g0_jit()
+                if use_sm78_physics:
+                    x, j = inject_star_sm78()
                 else:
-                    if outer_injection:
+                    if noloss_flag:
                         x = sample_x_from_g0_jit()
-                        while x < outer_inj_x_min:
-                            x = sample_x_from_g0_jit()
                     else:
-                        x = X_BOUND
-                j = math.sqrt(np.random.random())
+                        if outer_injection:
+                            x = sample_x_from_g0_jit()
+                            while x < outer_inj_x_min:
+                                x = sample_x_from_g0_jit()
+                        else:
+                            x = X_BOUND
+                    j = math.sqrt(np.random.random())
                 parent_floor_idx = floor_index_for_j2(j * j, floors)
             elif use_clones:
                 j2_now = j * j
@@ -745,24 +830,35 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                         lc_scale_val, cone_gamma_val, e1_scale_val,
                         diag_counts=diag_counts, disable_capture=disable_capture,
                         lc_floor_frac=lc_floor_frac, lc_gap_scale=gap_scale_val,
-                        ghost_cap_hist=ghost_cap_hist, x_bins=x_bins
+                        ghost_cap_hist=ghost_cap_hist, x_bins=x_bins,
+                        zero_coeffs_flag=zero_coeffs_flag, zero_drift_flag=zero_drift_flag,
+                        zero_diffusion_flag=zero_diffusion_flag,
+                        step_size_factor_val=step_size_factor,
+                        n_max_override_val=n_max_override_val,
+                        E2_scale_local=E2_scale, J2_scale_local=J2_scale,
+                        covEJ_scale_local=covEJ_scale,
+                        E2_x_power_local=E2_x_power, E2_x_ref_local=E2_x_ref,
+                        use_sm78_physics=use_sm78_physics
                     )
                     cx[i] = x_c2
                     cj[i] = j_c2
                     cph[i] = ph_c2
 
                     if cap_c or (x_c2 < X_BOUND):
-                        if noloss_flag:
-                            cx[i] = sample_x_from_g0_jit()
+                        if use_sm78_physics:
+                            cx[i], cj[i] = inject_star_sm78()
                         else:
-                            if outer_injection:
-                                x_inj = sample_x_from_g0_jit()
-                                while x_inj < outer_inj_x_min:
-                                    x_inj = sample_x_from_g0_jit()
-                                cx[i] = x_inj
+                            if noloss_flag:
+                                cx[i] = sample_x_from_g0_jit()
                             else:
-                                cx[i] = X_BOUND
-                        cj[i] = math.sqrt(np.random.random())
+                                if outer_injection:
+                                    x_inj = sample_x_from_g0_jit()
+                                    while x_inj < outer_inj_x_min:
+                                        x_inj = sample_x_from_g0_jit()
+                                    cx[i] = x_inj
+                                else:
+                                    cx[i] = X_BOUND
+                            cj[i] = math.sqrt(np.random.random())
                         cph[i] = ph_c2
                         cfloor_idx[i] = floor_index_for_j2(cj[i] * cj[i], floors)
                         cactive[i] = 1
@@ -825,7 +921,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 n_max_override_val=n_max_override_val,
                 E2_scale_local=E2_scale, J2_scale_local=J2_scale,
                 covEJ_scale_local=covEJ_scale,
-                E2_x_power_local=E2_x_power, E2_x_ref_local=E2_x_ref
+                E2_x_power_local=E2_x_power, E2_x_ref_local=E2_x_ref,
+                use_sm78_physics=use_sm78_physics
             )
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -857,30 +954,35 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                     if cap_hist is not None:
                         cap_hist[bin_index(x_prev)] += 1
                 
-                if inj_hist is not None:
-                    if outer_injection and not noloss_flag:
-                        x_inj = sample_x_from_g0_jit()
-                        while x_inj < outer_inj_x_min:
-                            x_inj = sample_x_from_g0_jit()
-                        x = x_inj
-                        inj_hist[bin_index(x)] += 1
-                    elif noloss_flag:
-                        x = sample_x_from_g0_jit()
-                        inj_hist[bin_index(x)] += 1
-                    else:
-                        x = X_BOUND
+                if use_sm78_physics:
+                    x, j = inject_star_sm78()
+                    if inj_hist is not None:
                         inj_hist[bin_index(x)] += 1
                 else:
-                    if noloss_flag:
-                        x = sample_x_from_g0_jit()
-                    else:
-                        if outer_injection:
+                    if inj_hist is not None:
+                        if outer_injection and not noloss_flag:
+                            x_inj = sample_x_from_g0_jit()
+                            while x_inj < outer_inj_x_min:
+                                x_inj = sample_x_from_g0_jit()
+                            x = x_inj
+                            inj_hist[bin_index(x)] += 1
+                        elif noloss_flag:
                             x = sample_x_from_g0_jit()
-                            while x < outer_inj_x_min:
-                                x = sample_x_from_g0_jit()
+                            inj_hist[bin_index(x)] += 1
                         else:
                             x = X_BOUND
-                j = math.sqrt(np.random.random())
+                            inj_hist[bin_index(x)] += 1
+                    else:
+                        if noloss_flag:
+                            x = sample_x_from_g0_jit()
+                        else:
+                            if outer_injection:
+                                x = sample_x_from_g0_jit()
+                                while x < outer_inj_x_min:
+                                    x = sample_x_from_g0_jit()
+                            else:
+                                x = X_BOUND
+                    j = math.sqrt(np.random.random())
                 parent_floor_idx = floor_index_for_j2(j * j, floors)
             elif use_clones:
                 j2_now = j * j
@@ -918,7 +1020,15 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                         lc_scale_val, cone_gamma_val, e1_scale_val,
                         diag_counts=diag_counts, disable_capture=disable_capture,
                         lc_floor_frac=lc_floor_frac, lc_gap_scale=gap_scale_val,
-                        ghost_cap_hist=ghost_cap_hist, x_bins=x_bins
+                        ghost_cap_hist=ghost_cap_hist, x_bins=x_bins,
+                        zero_coeffs_flag=zero_coeffs_flag, zero_drift_flag=zero_drift_flag,
+                        zero_diffusion_flag=zero_diffusion_flag,
+                        step_size_factor_val=step_size_factor,
+                        n_max_override_val=n_max_override_val,
+                        E2_scale_local=E2_scale, J2_scale_local=J2_scale,
+                        covEJ_scale_local=covEJ_scale,
+                        E2_x_power_local=E2_x_power, E2_x_ref_local=E2_x_ref,
+                        use_sm78_physics=use_sm78_physics
                     )
 
                     cx[i] = x_c2
@@ -934,31 +1044,36 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                             if cap_hist is not None:
                                 cap_hist[bin_index(x_c)] += 1
                         
-                        if inj_hist is not None:
-                            if outer_injection and not noloss_flag:
-                                x_inj = sample_x_from_g0_jit()
-                                while x_inj < outer_inj_x_min:
-                                    x_inj = sample_x_from_g0_jit()
-                                cx[i] = x_inj
-                                inj_hist[bin_index(x_inj)] += 1
-                            elif noloss_flag:
-                                cx[i] = sample_x_from_g0_jit()
-                                inj_hist[bin_index(cx[i])] += 1
-                            else:
-                                cx[i] = X_BOUND
+                        if use_sm78_physics:
+                            cx[i], cj[i] = inject_star_sm78()
+                            if inj_hist is not None:
                                 inj_hist[bin_index(cx[i])] += 1
                         else:
-                            if noloss_flag:
-                                cx[i] = sample_x_from_g0_jit()
-                            else:
-                                if outer_injection:
+                            if inj_hist is not None:
+                                if outer_injection and not noloss_flag:
                                     x_inj = sample_x_from_g0_jit()
                                     while x_inj < outer_inj_x_min:
                                         x_inj = sample_x_from_g0_jit()
                                     cx[i] = x_inj
+                                    inj_hist[bin_index(x_inj)] += 1
+                                elif noloss_flag:
+                                    cx[i] = sample_x_from_g0_jit()
+                                    inj_hist[bin_index(cx[i])] += 1
                                 else:
                                     cx[i] = X_BOUND
-                        cj[i] = math.sqrt(np.random.random())
+                                    inj_hist[bin_index(cx[i])] += 1
+                            else:
+                                if noloss_flag:
+                                    cx[i] = sample_x_from_g0_jit()
+                                else:
+                                    if outer_injection:
+                                        x_inj = sample_x_from_g0_jit()
+                                        while x_inj < outer_inj_x_min:
+                                            x_inj = sample_x_from_g0_jit()
+                                        cx[i] = x_inj
+                                    else:
+                                        cx[i] = X_BOUND
+                            cj[i] = math.sqrt(np.random.random())
                         cph[i] = ph_c2
                         cfloor_idx[i] = floor_index_for_j2(cj[i] * cj[i], floors)
                         cactive[i] = 1
@@ -1026,7 +1141,7 @@ def _worker_one(args):
      enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
      enable_cap_inj_diag, outer_injection, outer_inj_x_min,
      zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override,
-     E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref) = args
+     E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref, use_sm78_physics) = args
 
     P_of_x, T0, run_stream, sample_x_from_g0_jit = _build_kernels(
         use_jit=use_jit, noloss=noloss, lc_scale=lc_scale,
@@ -1034,7 +1149,7 @@ def _worker_one(args):
         zero_drift=zero_drift, zero_diffusion=zero_diffusion,
         step_size_factor=step_size_factor, n_max_override=n_max_override,
         E2_scale=E2_scale, J2_scale=J2_scale, covEJ_scale=covEJ_scale,
-        E2_x_power=E2_x_power, E2_x_ref=E2_x_ref
+        E2_x_power=E2_x_power, E2_x_ref=E2_x_ref, use_sm78_physics=use_sm78_physics
     )
 
     x_init = sample_x_from_g0(u0)
@@ -1047,7 +1162,7 @@ def _worker_one(args):
         enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
         enable_cap_inj_diag, outer_injection, outer_inj_x_min,
         zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override,
-        E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref
+        E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref, use_sm78_physics
     )
 
     result = run_stream(
@@ -1058,7 +1173,7 @@ def _worker_one(args):
         enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
         enable_cap_inj_diag, outer_injection, outer_inj_x_min,
         zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override,
-        E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref
+        E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref, use_sm78_physics
     )
     return result
 
@@ -1106,6 +1221,7 @@ def run_parallel_gbar(
     gbar_from_flux=False,
     gbar_x_norm=0.225,
     gbar_flux_exp=3.10,
+    use_sm78_physics=False,
 ):
     if noloss:
         use_clones = False
@@ -1194,6 +1310,7 @@ def run_parallel_gbar(
                         covEJ_scale,
                         E2_x_power,
                         E2_x_ref,
+                        use_sm78_physics,
                     ),
                 )
                 for sid in range(n_streams)
@@ -1743,6 +1860,14 @@ def main():
             "when using --gbar-from-flux (default: 3.10)."
         ),
     )
+    ap.add_argument(
+        "--use-sm78-physics",
+        action="store_true",
+        help=(
+            "Use exact SM78 diffusion coefficients, loss cone, and outer boundary "
+            "instead of parametric tunings (E2_x_power, J2_scale, lc_scale, etc.)."
+        ),
+    )
 
     args = ap.parse_args()
 
@@ -1801,6 +1926,7 @@ def main():
         gbar_from_flux=args.gbar_from_flux,
         gbar_x_norm=args.gbar_x_norm,
         gbar_flux_exp=args.gbar_flux_exp,
+        use_sm78_physics=args.use_sm78_physics,
     )
 
     print("# x_center   gbar_MC_norm   gbar_MC_raw      gbar_paper   gbar_err_paper")
