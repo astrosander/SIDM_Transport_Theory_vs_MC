@@ -179,18 +179,35 @@ gbar_new_data = """1.102485487467425307e-01,0.000000000000000000e+00,0.000000000
 
 # Parse the data
 lines = gbar_new_data.strip().split('\n')
-x_new = []
-gbar_new = []
-gbar_err_new = []
+x_new_old = []
+gbar_new_old = []
+gbar_err_new_old = []
 for line in lines:
     parts = line.split(',')
-    x_new.append(float(parts[0]))
-    gbar_new.append(float(parts[1]))
-    gbar_err_new.append(float(parts[2]))
+    x_new_old.append(float(parts[0]))
+    gbar_new_old.append(float(parts[1]))
+    gbar_err_new_old.append(float(parts[2]))
 
-x_new = np.array(x_new, dtype=float)
-gbar_new = np.array(gbar_new, dtype=float)
-gbar_err_new = np.array(gbar_err_new, dtype=float)
+x_new_old = np.array(x_new_old, dtype=float)
+gbar_new_old = np.array(gbar_new_old, dtype=float)
+gbar_err_new_old = np.array(gbar_err_new_old, dtype=float)
+
+# Use occupancy-based gbar data from long run
+x_new = np.array([
+    2.25e-01, 3.03e-01, 4.95e-01, 1.04e+00, 1.26e+00, 1.62e+00, 2.35e+00, 5.00e+00,
+    7.20e+00, 8.94e+00, 1.21e+01, 1.97e+01, 4.16e+01, 5.03e+01, 6.46e+01, 9.36e+01,
+    1.98e+02, 2.87e+02, 3.56e+02, 4.80e+02, 7.84e+02, 1.65e+03, 2.00e+03, 2.57e+03,
+    3.73e+03
+], dtype=float)
+
+gbar_new = np.array([
+    1.0, 0.984677, 1.462338, 3.231451, 3.610337, 4.414472, 5.316525, 9.034042,
+    9.354659, 8.770047, 7.874684, 5.25972, 2.58107, 0.652099, 0.176741, 0.014627,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+], dtype=float)
+
+# Estimate errors as a fraction of the value (5% for non-zero, zero for zero values)
+gbar_err_new = np.where(gbar_new > 0, 0.05 * gbar_new, 0.0)
 
 FE_x     = Fstar * x_vals
 FE_x_err = Fstar_err * x_vals
@@ -242,6 +259,7 @@ pd.DataFrame({"x": new_data_x, "y": new_data_y}).to_csv("/mnt/data/figure3_new_d
 pd.DataFrame({"x": X_line, "g0": g0_line}).to_csv("/mnt/data/figure3_g0_curve.csv", index=False)
 pd.DataFrame({"x": x_mc, "y_mean": y_mean, "y_std": y_std}).to_csv("/mnt/data/figure3_mc_mean_std.csv", index=False)
 pd.DataFrame({"x": x_new, "gbar": gbar_new, "gbar_err": gbar_err_new}).to_csv("/mnt/data/figure3_gbar_new.csv", index=False)
+pd.DataFrame({"x": x_new, "gbar_occ_long": gbar_new, "gbar_err_occ_long": gbar_err_new}).to_csv("/mnt/data/figure3_gbar_occ_long.csv", index=False)
 
 # ---- Plot ----
 plt.figure(figsize=(6,5), dpi=140)
@@ -255,12 +273,18 @@ plt.plot(X_line, g0_line, linewidth=2, label=r"$g_0$ (BW II)")
 mask_g = ~np.isnan(gbar)
 plt.errorbar(x_vals[mask_g], gbar[mask_g], yerr=gbar_err[mask_g],
              fmt="o", markersize=4, capsize=2, label=r"$\bar{g}$")
+for i in range(len(x_vals[mask_g])):
+    print(f"X_val={x_vals[mask_g][i]:.4f}\tgbar[mask_g]={gbar[mask_g][i]:.4f}\tgbar_err[mask_g]={gbar_err[mask_g][i]:.4f}")
 
-# Plot additional gbar data
-mask_g_new = (gbar_new > 0) & (gbar_err_new > 0)  # Only plot non-zero values with errors
+# print(gbar=gbar)
+# print(gbar_err)
+
+
+# Plot additional gbar data (occupancy-based from long run)
+mask_g_new = (gbar_new > 0)  # Only plot non-zero values
 plt.errorbar(x_new[mask_g_new], gbar_new[mask_g_new], yerr=gbar_err_new[mask_g_new],
-             fmt="D", markersize=3, capsize=2, alpha=0.8, color="orange",
-             label=r"$\bar{g}$ (new data)", elinewidth=1.2)
+             fmt="D", markersize=4, capsize=2, alpha=0.8, color="orange",
+             label=r"$\bar{g}$ (occ, long run)", elinewidth=1.2)
 
 mask_f = ~np.isnan(FE_x)
 rel_err = np.zeros_like(FE_x)
