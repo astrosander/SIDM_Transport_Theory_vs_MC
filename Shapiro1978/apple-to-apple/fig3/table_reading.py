@@ -268,11 +268,14 @@ plt.yscale("log")
 plt.xlim(1e-1, 1e4)
 plt.ylim(1e-3, 1e2)
 
-plt.plot(X_line, g0_line, linewidth=2, label=r"$g_0$ (BW II)")
+# Theory line: sophisticated dark blue-gray
+plt.plot(X_line, g0_line, linewidth=2, color="#2C3E50", label=r"$g_0$ (BW II)", alpha=0.9)
 
 mask_g = ~np.isnan(gbar)
+# Paper gbar: professional blue
 plt.errorbar(x_vals[mask_g], gbar[mask_g], yerr=gbar_err[mask_g],
-             fmt="o", markersize=4, capsize=2, label=r"$\bar{g}$")
+             fmt="o", markersize=4, capsize=2, color="#3498DB", 
+             label=r"$\bar{g}$ (SM78)", elinewidth=1.2, alpha=0.85)
 for i in range(len(x_vals[mask_g])):
     print(f"X_val={x_vals[mask_g][i]:.4f}\tgbar[mask_g]={gbar[mask_g][i]:.4f}\tgbar_err[mask_g]={gbar_err[mask_g][i]:.4f}")
 
@@ -281,10 +284,11 @@ for i in range(len(x_vals[mask_g])):
 
 
 # Plot additional gbar data (occupancy-based from long run)
+# Simulation gbar: vibrant coral/salmon (complementary to blue)
 mask_g_new = (gbar_new > 0)  # Only plot non-zero values
 plt.errorbar(x_new[mask_g_new], gbar_new[mask_g_new], yerr=gbar_err_new[mask_g_new],
-             fmt="D", markersize=4, capsize=2, alpha=0.8, color="orange",
-             label=r"$\bar{g}$ (occ, long run)", elinewidth=1.2)
+             fmt="D", markersize=4, capsize=2, alpha=0.85, color="#E74C3C",
+             label=r"$\bar{g}$ (simulation)", elinewidth=1.2)
 
 mask_f = ~np.isnan(FE_x)
 rel_err = np.zeros_like(FE_x)
@@ -292,16 +296,19 @@ rel_err[mask_f] = (FE_x_err[mask_f] / np.maximum(FE_x[mask_f], 1e-99))
 large = mask_f & (rel_err >= 0.6)
 small = mask_f & ~large
 
+# Paper flux: teal/cyan
 plt.errorbar(x_vals[small], FE_x[small], yerr=FE_x_err[small],
-             fmt="s", markersize=4, capsize=2, label=r"$F_E^*\cdot X$ (table)")
-plt.errorbar(x_vals[large], FE_x[large], yerr=FE_x_err[large],
-             fmt="s", mfc="none", markersize=5, capsize=2, label="large-error points")
+             fmt="s", markersize=4, capsize=2, color="#16A085", 
+             label=r"$F_E^*\cdot X$ (MS78)", elinewidth=1.2, alpha=0.85)
+# plt.errorbar(x_vals[large], FE_x[large], yerr=FE_x_err[large],
+#              fmt="s", mfc="none", markersize=5, capsize=2, label="large-error points")
 
 # Plot MC data with mean ± std error bars
+# Simulation flux: vibrant magenta (complementary to teal)
 mask_mc = ~np.isnan(y_mean) & (y_mean > 0)  # Only plot non-zero, non-NaN values
 plt.errorbar(x_mc[mask_mc], y_mean[mask_mc], yerr=y_std[mask_mc],
              fmt="^", markersize=5, capsize=3, capthick=1.5,
-             label=r"$F_E^*\cdot X$ (MC)", alpha=0.8, color="purple", elinewidth=1.5)
+             label=r"$F_E^*\cdot X$ (simulation)", alpha=0.85, color="#9B59B6", elinewidth=1.5)
 
 # plt.annotate(r"$x_{\rm crit}=10$", xy=(10, 1e-1), xytext=(12, 2e-1),
 #              arrowprops=dict(arrowstyle="->", lw=1))
