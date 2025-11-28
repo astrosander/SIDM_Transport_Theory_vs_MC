@@ -538,11 +538,22 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             Jmin = jmin * Jmax
             dJ = abs(J - Jmin)
             if use_sm78_physics:
+                # SM78 / exact-physics branch:
+                # Enforce that the RMS diffusive step per substep is
+                # at most dJ / step_size_factor_val.
+                # Per-substep RMS = sigJ / sqrt(n), so we need:
+                # sigJ / sqrt(n) <= dJ / step_size_factor_val
+                # => sqrt(n) >= step_size_factor_val * sigJ / dJ
+                # => n >= (step_size_factor_val * sigJ / dJ)^2
                 if sigJ > 0.0 and dJ > 0.0:
-                    n_J_lc = (step_size_factor_val * dJ / sigJ) ** 2
+                    # Optional: floor dJ to avoid n blowing up when J is
+                    # numerically extremely close to Jmin (before clamping to n_max)
+                    dJ_eff = max(dJ, 1e-6 * Jmin)
+                    ratio = step_size_factor_val * sigJ / dJ_eff
+                    n_J_lc = ratio * ratio
                     if n_J_lc < 1.0:
                         n_J_lc = 1.0
-                    if n_J_lc > n_max:
+                    elif n_J_lc > n_max:
                         n_J_lc = n_max
                 else:
                     n_J_lc = n_max
