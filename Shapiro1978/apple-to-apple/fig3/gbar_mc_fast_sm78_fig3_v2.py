@@ -943,6 +943,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         crossings = 0
         caps = 0
         max_ccount = ccount
+        cap_E_sum = 0.0  # sum of binding energy x at captures, weighted by stream/clone weight
 
         while t0_used < n_relax:
             x_prev = x
@@ -990,6 +991,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                     caps += 1
                     if cap_hist is not None:
                         cap_hist[bin_index(x_prev)] += 1
+                    # binding energy removed by this capture (weight * x at start of step)
+                    cap_E_sum += w * x_prev
                 
                 if use_sm78_physics:
                     x, j = inject_star_sm78()
@@ -1080,6 +1083,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                             caps += 1
                             if cap_hist is not None:
                                 cap_hist[bin_index(x_c)] += 1
+                            # binding energy removed by this clone capture
+                            cap_E_sum += cw[i] * x_c
                         
                         if use_sm78_physics:
                             cx[i], cj[i] = inject_star_sm78()
@@ -1163,9 +1168,37 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             ghost_cap_hist = np.zeros(x_bins.size, dtype=np.int64)
         
         if use_snapshots:
-            return g_acc, snapshots, crossings, caps, max_ccount, weight_sum, diag_counts, cap_hist, inj_hist, ghost_cap_hist
+            # measure_b = snapshots, t0_b = t0_used
+            return (
+                g_acc,
+                snapshots,
+                t0_used,
+                crossings,
+                caps,
+                cap_E_sum,
+                max_ccount,
+                weight_sum,
+                diag_counts,
+                cap_hist,
+                inj_hist,
+                ghost_cap_hist,
+            )
         else:
-            return g_acc, total_t0, crossings, caps, max_ccount, weight_sum, diag_counts, cap_hist, inj_hist, ghost_cap_hist
+            # measure_b = total_t0, t0_b = total_t0
+            return (
+                g_acc,
+                total_t0,
+                total_t0,
+                crossings,
+                caps,
+                cap_E_sum,
+                max_ccount,
+                weight_sum,
+                diag_counts,
+                cap_hist,
+                inj_hist,
+                ghost_cap_hist,
+            )
 
     return P_of_x, T0, run_stream, sample_x_from_g0_jit
 
@@ -1292,8 +1325,10 @@ def run_parallel_gbar(
 
     g_total = np.zeros_like(X_BINS, dtype=np.float64)
     total_measure = 0.0
+    total_t0_measured = 0.0   # actual time in units of t0 (for capture/energy rates)
     peri_total = 0
     caps_total = 0
+    capE_total = 0.0          # total binding energy removed by captures (sum w*x)
     max_ccount = 0
     total_done = 0
     weight_sums = []
@@ -1354,11 +1389,27 @@ def run_parallel_gbar(
             ]
 
             for f in cf.as_completed(futs):
-                g_b, measure_b, peri_b, caps_b, ccount_b, wsum_b, diag_b, cap_b, inj_b, ghost_b = f.result()
+                (
+                    g_b,
+                    measure_b,
+                    t0_b,
+                    peri_b,
+                    caps_b,
+                    capE_b,
+                    ccount_b,
+                    wsum_b,
+                    diag_b,
+                    cap_b,
+                    inj_b,
+                    ghost_b,
+                ) = f.result()
+
                 g_total += g_b
-                total_measure += measure_b
+                total_measure += measure_b       # snapshots or total t0, as before
+                total_t0_measured += t0_b        # always total time in units of t0
                 peri_total += peri_b
                 caps_total += caps_b
+                capE_total += capE_b
                 weight_sums.append(wsum_b)
                 if enable_diag_counts:
                     diag_counts_total += diag_b
@@ -1431,6 +1482,41 @@ def run_parallel_gbar(
                 f"[diag] weight sum stats: min={wsum_arr.min():.6f}, "
                 f"mean={wsum_arr.mean():.6f}, max={wsum_arr.max():.6f}, "
                 f"std={wsum_arr.std():.6f}",
+                file=sys.stderr,
+            )
+        # --- Global capture & energy-outflow diagnostics (for comparison to SM78 eqs. 31 & 33) ---
+        if total_t0_measured > 0.0 and caps_total > 0:
+            F_mc = caps_total / total_t0_measured          # capture rate per t0
+            E_cap_mean = capE_total / caps_total           # mean binding energy (in x units) per capture
+            Edot_mc = capE_total / total_t0_measured       # energy outflow per t0 (sum x / Δt0)
+
+            print(
+                f"[diag] capture/heating diagnostics:",
+                file=sys.stderr,
+            )
+            print(
+                f"       total_t0_measured = {total_t0_measured:.3e}",
+                file=sys.stderr,
+            )
+            print(
+                f"       total captures    = {caps_total:d}",
+                file=sys.stderr,
+            )
+            print(
+                f"       F_MC (captures per t0)     = {F_mc:.3e}",
+                file=sys.stderr,
+            )
+            print(
+                f"       <x>_cap (mean binding x)   = {E_cap_mean:.3e}",
+                file=sys.stderr,
+            )
+            print(
+                f"       Ė_MC (sum x per t0)        = {Edot_mc:.3e}",
+                file=sys.stderr,
+            )
+        elif total_t0_measured > 0.0 and caps_total == 0:
+            print(
+                f"[diag] capture/heating diagnostics: total_t0_measured={total_t0_measured:.3e}, no captures recorded.",
                 file=sys.stderr,
             )
 
@@ -1532,14 +1618,14 @@ def run_parallel_gbar(
                 if show_progress:
                     print(
                         "[diag] debug_occupancy_norm: no positive N_x; returning zeros.",
-                    file=sys.stderr,
-                )
-            return gbar_norm, gbar_raw
-            
+                        file=sys.stderr,
+                    )
+                return gbar_norm, gbar_raw
+
             norm_idx_occ = norm_idx if N_x[norm_idx] > 0 else positive_bins[0]
             gbar_norm = N_x / N_x[norm_idx_occ]
             gbar_raw = N_x.copy()
-            
+
             if show_progress:
                 print(
                     f"[diag] debug_occupancy_norm: returning occupancy N_x only "
@@ -1547,6 +1633,7 @@ def run_parallel_gbar(
                     f"This is N(E), not g(E).",
                     file=sys.stderr,
                 )
+            return gbar_norm, gbar_raw
         else:
             if gbar_from_flux:
                 if not enable_cap_inj_diag:
