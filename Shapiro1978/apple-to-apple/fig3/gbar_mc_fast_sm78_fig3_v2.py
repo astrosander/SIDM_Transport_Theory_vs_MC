@@ -261,7 +261,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                    zero_drift=False, zero_diffusion=False,
                    step_size_factor=1.0, n_max_override=None,
                    E2_scale=1.0, J2_scale=1.0, covEJ_scale=1.0,
-                   E2_x_power=0.0, E2_x_ref=1.0, use_sm78_physics=False):
+                   E2_x_power=0.0, E2_x_ref=1.0, use_sm78_physics=False,
+                   lc_strength_scale=1.0):
     if use_jit and HAVE_NUMBA:
         njit = nb.njit
         fastmath = dict(fastmath=True, nogil=True, cache=True)
@@ -336,6 +337,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
     covEJ_scale_val = covEJ_scale
     E2_x_power_val = E2_x_power
     E2_x_ref_val = E2_x_ref
+    lc_strength_scale_val = lc_strength_scale
 
     A_e1 = SM78_A_e1
     ALPHA_e1 = SM78_ALPHA_e1
@@ -510,7 +512,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                n_min=0.01, n_max=3.0e4,
                diag_counts=None, lc_floor_frac=0.10, lc_gap_scale=None,
                step_size_factor_val=1.0, n_max_override_val=3.0e4,
-               use_sm78_physics=False):
+               use_sm78_physics=False, lc_strength_scale=1.0):
         """
         Compute step size n using SM78 eq. (29) constraints in dimensionless form.
         
@@ -568,7 +570,11 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                     d_allowed = max(gap_scale * abs(j - jmin), floor * jmin)
 
                 if d_allowed > 0.0:
-                    n_J_lc = (step_size_factor_val * d_allowed / J2_star) ** 2
+                    # Apply loss-cone strength scaling: stronger loss cone (lc_strength_scale > 1)
+                    # means smaller allowed step size (divide d_allowed by the scale factor).
+                    # This makes eq. (29d) bite more strongly, increasing capture probability.
+                    d_allowed_scaled = d_allowed / lc_strength_scale
+                    n_J_lc = (step_size_factor_val * d_allowed_scaled / J2_star) ** 2
                 else:
                     n_J_lc = HUGE
                 # CRITICAL: Do NOT enforce n_J_lc >= 1.0 here.
@@ -642,7 +648,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                  n_max_override_val=3.0e4, E2_scale_local=1.0,
                  J2_scale_local=1.0, covEJ_scale_local=1.0,
                  E2_x_power_local=0.0, E2_x_ref_local=1.0,
-                 use_sm78_physics=False):
+                 use_sm78_physics=False, lc_strength_scale=1.0):
         E2_scale_val = E2_scale_local
         J2_scale_val = J2_scale_local
         covEJ_scale_val = covEJ_scale_local
@@ -659,7 +665,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                        lc_floor_frac=lc_floor_frac, lc_gap_scale=lc_gap_scale,
                        step_size_factor_val=step_size_factor_val,
                        n_max_override_val=n_max_override_val,
-                       use_sm78_physics=use_sm78_physics)
+                       use_sm78_physics=use_sm78_physics,
+                       lc_strength_scale=lc_strength_scale_val)
 
         E = -x
         Jmax = 1.0 / math.sqrt(2.0 * x)
@@ -826,7 +833,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                    covEJ_scale=1.0,
                    E2_x_power=0.0,
                    E2_x_ref=1.0,
-                   use_sm78_physics=False):
+                   use_sm78_physics=False,
+                   lc_strength_scale=1.0):
         np.random.seed(seed)
         SPLIT_HYST = 0.8
         noloss_flag = noloss
@@ -889,7 +897,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 E2_scale_local=E2_scale, J2_scale_local=J2_scale,
                 covEJ_scale_local=covEJ_scale,
                 E2_x_power_local=E2_x_power, E2_x_ref_local=E2_x_ref,
-                use_sm78_physics=use_sm78_physics
+                use_sm78_physics=use_sm78_physics,
+                lc_strength_scale=lc_strength_scale
             )
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -951,7 +960,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                         E2_scale_local=E2_scale, J2_scale_local=J2_scale,
                         covEJ_scale_local=covEJ_scale,
                         E2_x_power_local=E2_x_power, E2_x_ref_local=E2_x_ref,
-                        use_sm78_physics=use_sm78_physics
+                        use_sm78_physics=use_sm78_physics,
+                        lc_strength_scale=lc_strength_scale
                     )
                     cx[i] = x_c2
                     cj[i] = j_c2
@@ -1036,7 +1046,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 E2_scale_local=E2_scale, J2_scale_local=J2_scale,
                 covEJ_scale_local=covEJ_scale,
                 E2_x_power_local=E2_x_power, E2_x_ref_local=E2_x_ref,
-                use_sm78_physics=use_sm78_physics
+                use_sm78_physics=use_sm78_physics,
+                lc_strength_scale=lc_strength_scale
             )
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -1144,7 +1155,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                         E2_scale_local=E2_scale, J2_scale_local=J2_scale,
                         covEJ_scale_local=covEJ_scale,
                         E2_x_power_local=E2_x_power, E2_x_ref_local=E2_x_ref,
-                        use_sm78_physics=use_sm78_physics
+                        use_sm78_physics=use_sm78_physics,
+                        lc_strength_scale=lc_strength_scale
                     )
 
                     cx[i] = x_c2
@@ -1287,7 +1299,8 @@ def _worker_one(args):
      enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
      enable_cap_inj_diag, outer_injection, outer_inj_x_min,
      zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override,
-     E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref, use_sm78_physics) = args
+     E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref, use_sm78_physics,
+     lc_strength_scale) = args
 
     P_of_x, T0, run_stream, sample_x_from_g0_jit = _build_kernels(
         use_jit=use_jit, noloss=noloss, lc_scale=lc_scale,
@@ -1295,7 +1308,8 @@ def _worker_one(args):
         zero_drift=zero_drift, zero_diffusion=zero_diffusion,
         step_size_factor=step_size_factor, n_max_override=n_max_override,
         E2_scale=E2_scale, J2_scale=J2_scale, covEJ_scale=covEJ_scale,
-        E2_x_power=E2_x_power, E2_x_ref=E2_x_ref, use_sm78_physics=use_sm78_physics
+        E2_x_power=E2_x_power, E2_x_ref=E2_x_ref, use_sm78_physics=use_sm78_physics,
+        lc_strength_scale=lc_strength_scale
     )
 
     x_init = sample_x_from_g0(u0)
@@ -1308,7 +1322,8 @@ def _worker_one(args):
         enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
         enable_cap_inj_diag, outer_injection, outer_inj_x_min,
         zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override,
-        E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref, use_sm78_physics
+        E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref, use_sm78_physics,
+        lc_strength_scale
     )
 
     result = run_stream(
@@ -1319,7 +1334,8 @@ def _worker_one(args):
         enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
         enable_cap_inj_diag, outer_injection, outer_inj_x_min,
         zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override,
-        E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref, use_sm78_physics
+        E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref, use_sm78_physics,
+        lc_strength_scale
     )
     return result
 
@@ -1368,6 +1384,7 @@ def run_parallel_gbar(
     gbar_x_norm=0.225,
     gbar_flux_exp=3.10,
     use_sm78_physics=False,
+    lc_strength_scale=1.0,
 ):
     if noloss:
         use_clones = False
@@ -1459,6 +1476,7 @@ def run_parallel_gbar(
                         E2_x_power,
                         E2_x_ref,
                         use_sm78_physics,
+                        lc_strength_scale,
                     ),
                 )
                 for sid in range(n_streams)
@@ -2100,6 +2118,17 @@ def main():
             "instead of parametric tunings (E2_x_power, J2_scale, lc_scale, etc.)."
         ),
     )
+    ap.add_argument(
+        "--lc-strength-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplicative factor on SM78 eq. (29d) loss-cone constraint strength. "
+            "Values > 1.0 make the loss-cone constraint stronger (smaller allowed step sizes), "
+            "increasing capture probability. Use to tune if ḡ(x) is too heavy at high x. "
+            "(default: 1.0)"
+        ),
+    )
 
     args = ap.parse_args()
 
@@ -2174,6 +2203,7 @@ def main():
         gbar_x_norm=args.gbar_x_norm,
         gbar_flux_exp=args.gbar_flux_exp,
         use_sm78_physics=args.use_sm78_physics,
+        lc_strength_scale=args.lc_strength_scale,
     )
 
     print("# x_center   gbar_MC_norm   gbar_MC_raw      gbar_paper   gbar_err_paper")
