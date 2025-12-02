@@ -554,19 +554,26 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
 
             # Eq. (29d): √n * j₂* <= max(0.25*|j - j_min|, 0.10*j_min)
             # => n <= (max(0.25*|j - j_min|, 0.10*j_min) / j₂*)^2
-            if noloss_flag or jmin <= 0.0:
+            if noloss_flag or jmin <= 0.0 or J2_star <= 0.0:
                 n_J_lc = HUGE
             else:
-                gap_scale = cone_gamma_val if lc_gap_scale is None else lc_gap_scale
-                d1 = gap_scale * abs(j - jmin)  # γ |j - j_min|
-                d2 = lc_floor_frac * jmin if lc_floor_frac > 0.0 else 0.0  # f_floor * j_min
-                d_allowed = max(d1, d2)  # max(γ |j - j_min|, f_floor * j_min)
+                if use_sm78_physics:
+                    # Literal SM78 eq. (29d) with hard-coded coefficients:
+                    # sqrt(n) * j2* <= max(0.25*|j - j_min|, 0.10*j_min)
+                    d_allowed = max(0.25 * abs(j - jmin), 0.10 * jmin)
+                else:
+                    # Keep the more general parameterized form for non-SM78 runs
+                    gap_scale = cone_gamma_val if lc_gap_scale is None else lc_gap_scale
+                    floor = lc_floor_frac if lc_floor_frac > 0.0 else 0.0
+                    d_allowed = max(gap_scale * abs(j - jmin), floor * jmin)
+
                 if d_allowed > 0.0:
                     n_J_lc = (step_size_factor_val * d_allowed / J2_star) ** 2
                 else:
                     n_J_lc = HUGE
-                if n_J_lc < 1.0:
-                    n_J_lc = 1.0
+                # CRITICAL: Do NOT enforce n_J_lc >= 1.0 here.
+                # Let it go down to n_min (set globally below) so eq. 29d can
+                # actually constrain steps near the loss cone.
                 if n_J_lc > n_max:
                     n_J_lc = n_max
         else:
@@ -712,15 +719,24 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             J2_star_curr = sigJ_curr / Jmax_curr if Jmax_curr > 0.0 else 0.0
             j1_star_curr = j1_curr / Jmax_curr if Jmax_curr > 0.0 else 0.0
 
-            # SM78 eq. (28): Use isotropic 2D random walk in dimensionless j-space ONLY when:
-            # 1. Inside the loss cone: j <= j_min
-            # 2. Low j: j <= 0.4
-            # 3. Large step: n^{1/2} j₂* >= j / 4
+            # SM78 eq. (28): Use isotropic 2D random walk in dimensionless j-space
+            # when j is small and the step is large in j-space.
             j_min_curr = j_min_of_x(x_curr, lc_scale_val, noloss_flag, use_sm78_physics)
             inside_loss_cone = (j_curr <= j_min_curr)
             low_j = (j_curr <= 0.4)
             large_step = (math.sqrt(n_step) * J2_star_curr >= 0.25 * j_curr)
-            use_2d = inside_loss_cone and low_j and large_step
+
+            if use_sm78_physics:
+                # SM78: switch to 2D random walk when j is small and the
+                # step is "large" in j-space; no explicit requirement that
+                # we already be inside the loss cone. This allows the 2D walk
+                # to be used near the loss cone, making it easier for orbits
+                # at moderate x to diffuse into the cone.
+                use_2d = low_j and large_step
+            else:
+                # For generic runs, keep the stricter condition requiring
+                # inside_loss_cone as well.
+                use_2d = inside_loss_cone and low_j and large_step
 
             if use_2d:
                 # Eq. (28): isotropic 2D random walk in dimensionless j-space
