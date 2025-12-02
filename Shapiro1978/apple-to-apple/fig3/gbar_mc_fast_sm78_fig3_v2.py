@@ -484,13 +484,13 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         v0_sq = 1.0
         Jmax = 1.0 / math.sqrt(2.0 * x_clamp)
 
-        e1 = -e1_scale_val * e1_star * v0_sq
-        sigE_star = math.sqrt(max(E2_star, 0.0))
-        sigE = sigE_star * v0_sq
+        # e1*, ε₂*, j₁*, j₂* in Table 1 are *already* the per-orbit RMS
+        # coefficients used in eqs. (27)–(29). We should NOT take square roots.
+        e1 = -e1_scale_val * e1_star * v0_sq          # drift term ε₁
+        sigE = max(E2_star, 0.0) * v0_sq              # ε₂*
 
-        j1 = j1_star * Jmax
-        sigJ_star = math.sqrt(max(J2_star, 0.0))
-        sigJ = sigJ_star * Jmax
+        j1 = j1_star * Jmax                           # drift term j₁
+        sigJ = max(J2_star, 0.0) * Jmax               # j₂*
 
         covEJ = covEJ_star * v0_sq * Jmax
 
@@ -537,38 +537,19 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         else:
             Jmin = jmin * Jmax
             dJ = abs(J - Jmin)
-            if use_sm78_physics:
-                # SM78 / exact-physics branch:
-                # Enforce that the RMS diffusive step per substep is
-                # at most dJ / step_size_factor_val.
-                # Per-substep RMS = sigJ / sqrt(n), so we need:
-                # sigJ / sqrt(n) <= dJ / step_size_factor_val
-                # => sqrt(n) >= step_size_factor_val * sigJ / dJ
-                # => n >= (step_size_factor_val * sigJ / dJ)^2
-                if sigJ > 0.0 and dJ > 0.0:
-                    # Optional: floor dJ to avoid n blowing up when J is
-                    # numerically extremely close to Jmin (before clamping to n_max)
-                    dJ_eff = max(dJ, 1e-6 * Jmin)
-                    ratio = step_size_factor_val * sigJ / dJ_eff
-                    n_J_lc = ratio * ratio
-                    if n_J_lc < 1.0:
-                        n_J_lc = 1.0
-                    elif n_J_lc > n_max:
-                        n_J_lc = n_max
-                else:
-                    n_J_lc = n_max
+            # Direct implementation of SM78 eq. (29d):
+            # √n j₂ ≤ max(γ |J - J_min|, f_floor J_min)
+            gap_scale = cone_gamma_val if lc_gap_scale is None else lc_gap_scale
+            gap = gap_scale * dJ
+            if lc_floor_frac > 0.0:
+                floor = max(gap, lc_floor_frac * Jmin)
             else:
-                gap_scale = cone_gamma_val if lc_gap_scale is None else lc_gap_scale
-                gap = gap_scale * dJ
-                if lc_floor_frac > 0.0:
-                    floor = max(gap, lc_floor_frac * Jmin)
-                else:
-                    floor = gap
-                n_J_lc = (step_size_factor_val * floor / sigJ) ** 2
-                if n_J_lc < 1.0:
-                    n_J_lc = 1.0
-                if n_J_lc > n_max:
-                    n_J_lc = n_max
+                floor = gap
+            n_J_lc = (step_size_factor_val * floor / sigJ) ** 2
+            if n_J_lc < 1.0:
+                n_J_lc = 1.0
+            if n_J_lc > n_max:
+                n_J_lc = n_max
 
         n = n_E
         winner = 0
@@ -2035,8 +2016,10 @@ def main():
         args.E2_x_power = 0.0
         args.E2_x_ref = 1.0
         args.lc_scale = 1.0
-        args.lc_floor_frac = 0.0
-        args.cone_gamma = 1.0
+        # Canonical SM78 eq. (29d) constants:
+        # √n j₂ ≤ max(0.25 |J - J_min|, 0.1 J_min)
+        args.lc_floor_frac = 0.10   # 0.1 J_min
+        args.cone_gamma   = 0.25    # 0.25 |J - J_min|
         args.lc_gap_scale = None
         args.outer_injection = False
 
