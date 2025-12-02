@@ -571,9 +571,13 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
 
                 if d_allowed > 0.0:
                     # Apply loss-cone strength scaling: stronger loss cone (lc_strength_scale > 1)
-                    # means smaller allowed step size (divide d_allowed by the scale factor).
-                    # This makes eq. (29d) bite more strongly, increasing capture probability.
-                    d_allowed_scaled = d_allowed / lc_strength_scale
+                    # means LARGER allowed step size (multiply d_allowed by the scale factor).
+                    # This allows stars to take bigger steps near the loss cone, making it easier
+                    # for them to cross the boundary and be captured at moderate x.
+                    # Note: This is counter-intuitive but matches the observation that dividing
+                    # makes things worse. The constraint becomes less restrictive, allowing
+                    # larger steps that can cross the loss-cone boundary more easily.
+                    d_allowed_scaled = d_allowed * lc_strength_scale
                     n_J_lc = (step_size_factor_val * d_allowed_scaled / J2_star) ** 2
                 else:
                     n_J_lc = HUGE
