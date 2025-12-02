@@ -511,44 +511,68 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                diag_counts=None, lc_floor_frac=0.10, lc_gap_scale=None,
                step_size_factor_val=1.0, n_max_override_val=3.0e4,
                use_sm78_physics=False):
+        """
+        Compute step size n using SM78 eq. (29) constraints in dimensionless form.
+        
+        All constraints are expressed in terms of:
+        - x (binding energy, dimensionless)
+        - j (dimensionless angular momentum, J/J_max)
+        - j_min (loss-cone boundary at this x)
+        - E2_star, J2_star (dimensionless Table-1 coefficients)
+        """
         jmin = j_min_of_x(x, lc_scale_val, noloss_flag, use_sm78_physics)
-        E = -x
         Jmax = 1.0 / math.sqrt(2.0 * x)
-        J = j * Jmax
+        
+        # Extract dimensionless coefficients from dimensional sigE, sigJ
+        # sigE = E2_star * v0_sq = E2_star (since v0_sq = 1.0)
+        # sigJ = J2_star * Jmax, so J2_star = sigJ / Jmax
+        E2_star = sigE  # Already dimensionless
+        J2_star = sigJ / Jmax if Jmax > 0.0 else 0.0  # Dimensionless
+        
+        HUGE = 1.0e60
 
-        if sigE > 0.0:
-            n_E = (step_size_factor_val * 0.15 * abs(E) / sigE) ** 2
+        # Eq. (29a): √n * ε₂* <= 0.15 * x
+        # => n <= (0.15 * x / ε₂*)^2
+        if E2_star > 0.0 and x > 0.0:
+            n_E = (step_size_factor_val * 0.15 * x / E2_star) ** 2
         else:
-            n_E = n_max
+            n_E = HUGE
 
-        if sigJ > 0.0:
-            n_J_iso = (step_size_factor_val * 0.10 * Jmax / sigJ) ** 2
-        else:
-            n_J_iso = n_max
+        # If angular diffusion is zero, no useful J-constraints
+        if J2_star > 0.0:
+            # Eq. (29b): √n * j₂* <= 0.10
+            # => n <= (0.10 / j₂*)^2
+            n_J_iso = (step_size_factor_val * 0.10 / J2_star) ** 2
 
-        if sigJ > 0.0:
-            delta_top = max(1e-6 * Jmax, 1.0075 * Jmax - J)
-            n_J_top = (step_size_factor_val * 0.40 * delta_top / sigJ) ** 2
-        else:
-            n_J_top = n_max
+            # Eq. (29c): √n * j₂* <= 0.40 * (1.0075 - j)
+            # => n <= (0.40 * (1.0075 - j) / j₂*)^2
+            margin = max(1.0075 - j, 0.0)
+            if margin > 0.0:
+                n_J_top = (step_size_factor_val * 0.40 * margin / J2_star) ** 2
+            else:
+                n_J_top = HUGE
 
-        if noloss_flag or jmin <= 0.0 or sigJ == 0.0:
-            n_J_lc = n_max
+            # Eq. (29d): √n * j₂* <= max(0.25*|j - j_min|, 0.10*j_min)
+            # => n <= (max(0.25*|j - j_min|, 0.10*j_min) / j₂*)^2
+            if noloss_flag or jmin <= 0.0:
+                n_J_lc = HUGE
+            else:
+                gap_scale = cone_gamma_val if lc_gap_scale is None else lc_gap_scale
+                d1 = gap_scale * abs(j - jmin)  # γ |j - j_min|
+                d2 = lc_floor_frac * jmin if lc_floor_frac > 0.0 else 0.0  # f_floor * j_min
+                d_allowed = max(d1, d2)  # max(γ |j - j_min|, f_floor * j_min)
+                if d_allowed > 0.0:
+                    n_J_lc = (step_size_factor_val * d_allowed / J2_star) ** 2
+                else:
+                    n_J_lc = HUGE
+                if n_J_lc < 1.0:
+                    n_J_lc = 1.0
+                if n_J_lc > n_max:
+                    n_J_lc = n_max
         else:
-            Jmin = jmin * Jmax
-            dJ = abs(J - Jmin)
-            # Direct implementation of SM78 eq. (29d):
-            # √n j₂ ≤ max(γ |J - J_min|, f_floor J_min)
-            # => n ≤ (max(γ |J - J_min|, f_floor J_min) / j₂)²
-            gap_scale = cone_gamma_val if lc_gap_scale is None else lc_gap_scale
-            dJ1 = gap_scale * dJ  # γ |J - J_min|
-            dJ2 = lc_floor_frac * Jmin if lc_floor_frac > 0.0 else 0.0  # f_floor J_min
-            dJ_allowed = max(dJ1, dJ2)  # max(γ |J - J_min|, f_floor J_min)
-            n_J_lc = (step_size_factor_val * dJ_allowed / sigJ) ** 2
-            if n_J_lc < 1.0:
-                n_J_lc = 1.0
-            if n_J_lc > n_max:
-                n_J_lc = n_max
+            n_J_iso = HUGE
+            n_J_top = HUGE
+            n_J_lc = HUGE
 
         n = n_E
         winner = 0
@@ -680,44 +704,47 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 E_step_new = -x_step_new
 
             Jmax_step_new = 1.0 / math.sqrt(2.0 * x_step_new)
-            
-            # Compute current J from current (x, j) state
             Jmax_curr = 1.0 / math.sqrt(2.0 * x_curr)
-            J_curr = j_curr * Jmax_curr
+            
+            # Extract dimensionless coefficients for eq. (28) / (27b)
+            # sigJ_curr = J2_star * Jmax_curr, so J2_star = sigJ_curr / Jmax_curr
+            # j1_curr = j1_star * Jmax_curr, so j1_star = j1_curr / Jmax_curr
+            J2_star_curr = sigJ_curr / Jmax_curr if Jmax_curr > 0.0 else 0.0
+            j1_star_curr = j1_curr / Jmax_curr if Jmax_curr > 0.0 else 0.0
 
-            # SM78 eq. (28): Use isotropic 2D random walk in J-space ONLY when:
-            # 1. Inside the loss cone: J <= J_min
-            # 2. Low J: J <= 0.4 J_max
-            # 3. Large step: n^{1/2} j_2 >= J / 4
+            # SM78 eq. (28): Use isotropic 2D random walk in dimensionless j-space ONLY when:
+            # 1. Inside the loss cone: j <= j_min
+            # 2. Low j: j <= 0.4
+            # 3. Large step: n^{1/2} j₂* >= j / 4
             j_min_curr = j_min_of_x(x_curr, lc_scale_val, noloss_flag, use_sm78_physics)
-            Jmin_curr = j_min_curr * Jmax_curr
-            inside_loss_cone = (J_curr <= Jmin_curr)
-            low_J = (J_curr <= 0.4 * Jmax_curr)
-            large_step = (math.sqrt(n_step) * sigJ_curr >= 0.25 * J_curr)
-            use_2d = inside_loss_cone and low_J and large_step
+            inside_loss_cone = (j_curr <= j_min_curr)
+            low_j = (j_curr <= 0.4)
+            large_step = (math.sqrt(n_step) * J2_star_curr >= 0.25 * j_curr)
+            use_2d = inside_loss_cone and low_j and large_step
 
             if use_2d:
-                # Eq. (28): isotropic 2D random walk in J-space
+                # Eq. (28): isotropic 2D random walk in dimensionless j-space
+                # Δj = sqrt((j + sqrt(n) y₃ j₂*)^2 + (sqrt(n) y₄ j₂*)^2) - j
                 z1 = np.random.normal()
                 z2 = np.random.normal()
-                J_step_new = math.sqrt(
-                    (J_curr + math.sqrt(n_step) * z1 * sigJ_curr) ** 2 +
-                    (math.sqrt(n_step) * z2 * sigJ_curr) ** 2
+                j_step_new = math.sqrt(
+                    (j_curr + math.sqrt(n_step) * z1 * J2_star_curr) ** 2 +
+                    (math.sqrt(n_step) * z2 * J2_star_curr) ** 2
                 )
             else:
-                # Eq. (27b): small-angle, correlated step in J
-                J_step_new = J_curr + n_step * j1_curr + math.sqrt(n_step) * sigJ_curr * y2_step
+                # Eq. (27b): small-angle, correlated step in dimensionless j-space
+                # Δj = n j₁* + sqrt(n) j₂* y₂
+                j_step_new = j_curr + n_step * j1_star_curr + math.sqrt(n_step) * J2_star_curr * y2_step
 
-            if J_step_new < 0.0:
-                J_step_new = -J_step_new
-            if J_step_new > Jmax_step_new:
-                J_step_new = 2.0 * Jmax_step_new - J_step_new
-                if J_step_new < 0.0:
-                    J_step_new = 0.0
-                if J_step_new > Jmax_step_new:
-                    J_step_new = Jmax_step_new
-
-            j_step_new = J_step_new / Jmax_step_new
+            # Enforce bounds on dimensionless j
+            if j_step_new < 0.0:
+                j_step_new = -j_step_new
+            if j_step_new > 1.0:
+                j_step_new = 2.0 - j_step_new  # Reflect at j = 1 boundary
+                if j_step_new < 0.0:
+                    j_step_new = 0.0
+                if j_step_new > 1.0:
+                    j_step_new = 1.0
             phase_curr += n_step
 
             # Update state for this sub-step
