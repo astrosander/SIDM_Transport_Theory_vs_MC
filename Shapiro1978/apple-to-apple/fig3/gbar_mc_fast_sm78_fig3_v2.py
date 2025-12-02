@@ -539,13 +539,12 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             dJ = abs(J - Jmin)
             # Direct implementation of SM78 eq. (29d):
             # √n j₂ ≤ max(γ |J - J_min|, f_floor J_min)
+            # => n ≤ (max(γ |J - J_min|, f_floor J_min) / j₂)²
             gap_scale = cone_gamma_val if lc_gap_scale is None else lc_gap_scale
-            gap = gap_scale * dJ
-            if lc_floor_frac > 0.0:
-                floor = max(gap, lc_floor_frac * Jmin)
-            else:
-                floor = gap
-            n_J_lc = (step_size_factor_val * floor / sigJ) ** 2
+            dJ1 = gap_scale * dJ  # γ |J - J_min|
+            dJ2 = lc_floor_frac * Jmin if lc_floor_frac > 0.0 else 0.0  # f_floor J_min
+            dJ_allowed = max(dJ1, dJ2)  # max(γ |J - J_min|, f_floor J_min)
+            n_J_lc = (step_size_factor_val * dJ_allowed / sigJ) ** 2
             if n_J_lc < 1.0:
                 n_J_lc = 1.0
             if n_J_lc > n_max:
@@ -631,64 +630,117 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                        n_max_override_val=n_max_override_val,
                        use_sm78_physics=use_sm78_physics)
 
-        next_int = math.floor(phase) + 1.0
-        crossed_peri = (phase + n_raw >= next_int)
-        if crossed_peri:
-            n = next_int - phase
-        else:
-            n = n_raw
-
         E = -x
         Jmax = 1.0 / math.sqrt(2.0 * x)
         J = j * Jmax
 
-        y1, y2 = correlated_normals(rho, sigE, sigJ)
-
-        deltaE = n * e1 + math.sqrt(n) * sigE * y1
-        E_new = E + deltaE
-        if E_new >= -1e-6:
-            E_new = -1e-6
-        x_new = -E_new
-
-        if x_new > x_max:
-            x_new = x_max
-            E_new = -x_new
-
-        Jmax_new = 1.0 / math.sqrt(2.0 * x_new)
-
-        use_2d = (math.sqrt(n) * sigJ > J / 4.0)
-
-        if use_2d:
-            z1 = np.random.normal()
-            z2 = np.random.normal()
-            J_new = math.sqrt(
-                (J + math.sqrt(n) * z1 * sigJ) ** 2 +
-                (math.sqrt(n) * z2 * sigJ) ** 2
-            )
-        else:
-            J_new = J + n * j1 + math.sqrt(n) * sigJ * y2
-
-        if J_new < 0.0:
-            J_new = -J_new
-        if J_new > Jmax_new:
-            J_new = 2.0 * Jmax_new - J_new
-            if J_new < 0.0:
-                J_new = 0.0
-            if J_new > Jmax_new:
-                J_new = Jmax_new
-
-        j_new = J_new / Jmax_new
-        phase_new = phase + n
-
+        # Handle multiple integer orbit crossings: check capture at each pericenter
+        phase_curr = phase
+        n_remaining = n_raw
+        x_curr = x
+        j_curr = j
         captured = False
         ghost_captured = False
-        if (not noloss_flag) and crossed_peri:
-            j_min_new = j_min_of_x(x_new, lc_scale_val, noloss_flag, use_sm78_physics)
-            if j_new < j_min_new:
-                if not disable_capture:
-                    captured = True
-                else:
-                    ghost_captured = True
+        crossed_peri = False
+
+        while n_remaining > 0.0:
+            next_int = math.floor(phase_curr) + 1.0
+            n_to_next_int = next_int - phase_curr
+            
+            if n_remaining <= n_to_next_int:
+                # This step doesn't cross an integer boundary
+                n_step = n_remaining
+                n_remaining = 0.0
+                will_cross = False
+            else:
+                # This step crosses at least one integer boundary
+                n_step = n_to_next_int
+                n_remaining -= n_step
+                will_cross = True
+
+            # Compute step for this sub-interval
+            e1_curr, sigE_curr, j1_curr, sigJ_curr, rho_curr = bilinear_coeffs(
+                x_curr, j_curr, pstar_val, e1_scale_val,
+                zero_coeffs_flag, zero_drift_flag, zero_diffusion_flag,
+                E2_scale_local, J2_scale_local, covEJ_scale_local,
+                E2_x_power_local, E2_x_ref_local, use_sm78_physics
+            )
+
+            y1_step, y2_step = correlated_normals(rho_curr, sigE_curr, sigJ_curr)
+
+            E_curr = -x_curr
+            deltaE_step = n_step * e1_curr + math.sqrt(n_step) * sigE_curr * y1_step
+            E_step_new = E_curr + deltaE_step
+            if E_step_new >= -1e-6:
+                E_step_new = -1e-6
+            x_step_new = -E_step_new
+
+            if x_step_new > x_max:
+                x_step_new = x_max
+                E_step_new = -x_step_new
+
+            Jmax_step_new = 1.0 / math.sqrt(2.0 * x_step_new)
+            
+            # Compute current J from current (x, j) state
+            Jmax_curr = 1.0 / math.sqrt(2.0 * x_curr)
+            J_curr = j_curr * Jmax_curr
+
+            # SM78 eq. (28): Use isotropic 2D random walk in J-space ONLY when:
+            # 1. Inside the loss cone: J <= J_min
+            # 2. Low J: J <= 0.4 J_max
+            # 3. Large step: n^{1/2} j_2 >= J / 4
+            j_min_curr = j_min_of_x(x_curr, lc_scale_val, noloss_flag, use_sm78_physics)
+            Jmin_curr = j_min_curr * Jmax_curr
+            inside_loss_cone = (J_curr <= Jmin_curr)
+            low_J = (J_curr <= 0.4 * Jmax_curr)
+            large_step = (math.sqrt(n_step) * sigJ_curr >= 0.25 * J_curr)
+            use_2d = inside_loss_cone and low_J and large_step
+
+            if use_2d:
+                # Eq. (28): isotropic 2D random walk in J-space
+                z1 = np.random.normal()
+                z2 = np.random.normal()
+                J_step_new = math.sqrt(
+                    (J_curr + math.sqrt(n_step) * z1 * sigJ_curr) ** 2 +
+                    (math.sqrt(n_step) * z2 * sigJ_curr) ** 2
+                )
+            else:
+                # Eq. (27b): small-angle, correlated step in J
+                J_step_new = J_curr + n_step * j1_curr + math.sqrt(n_step) * sigJ_curr * y2_step
+
+            if J_step_new < 0.0:
+                J_step_new = -J_step_new
+            if J_step_new > Jmax_step_new:
+                J_step_new = 2.0 * Jmax_step_new - J_step_new
+                if J_step_new < 0.0:
+                    J_step_new = 0.0
+                if J_step_new > Jmax_step_new:
+                    J_step_new = Jmax_step_new
+
+            j_step_new = J_step_new / Jmax_step_new
+            phase_curr += n_step
+
+            # Update state for this sub-step
+            x_curr = x_step_new
+            j_curr = j_step_new
+            if will_cross:
+                crossed_peri = True
+
+            # Check capture at integer pericenter crossings
+            if will_cross and (not noloss_flag):
+                j_min_new = j_min_of_x(x_step_new, lc_scale_val, noloss_flag, use_sm78_physics)
+                if j_step_new < j_min_new:
+                    if not disable_capture:
+                        captured = True
+                        break
+                    else:
+                        ghost_captured = True
+
+        # Final state
+        x_new = x_curr
+        j_new = j_curr
+        phase_new = phase_curr
+        n = phase_new - phase
         
         if ghost_cap_hist is not None and ghost_captured:
             best = 0
