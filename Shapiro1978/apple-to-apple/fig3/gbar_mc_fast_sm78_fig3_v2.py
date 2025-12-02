@@ -1580,6 +1580,22 @@ def run_parallel_gbar(
                     f"normalized at x={X_BINS[norm_idx_occ]:.3g}",
                     file=sys.stderr,
                 )
+                # Also fit a simple power law N(E) ∝ x^p in 1≲x≲100
+                mask = (
+                    (X_BINS >= 1.0)
+                    & (X_BINS <= 100.0)
+                    & np.isfinite(N_x)
+                    & (N_x > 0.0)
+                )
+                if mask.sum() >= 2:
+                    logx = np.log10(X_BINS[mask])
+                    logN = np.log10(N_x[mask])
+                    p_fit, _ = np.polyfit(logx, logN, 1)
+                    print(
+                        f"[diag] best-fit N(E) ∝ x^{p_fit:.3f} in 1≲x≲100 "
+                        "(occupancy slope, before applying gexp).",
+                        file=sys.stderr,
+                    )
         else:
             gbar_norm, gbar_raw = make_gbar_from_occupancy(
                 x_centers=X_BINS,
@@ -1633,6 +1649,22 @@ def run_parallel_gbar(
                     f"This is N(E), not g(E).",
                     file=sys.stderr,
                 )
+                # Also fit a simple power law N(E) ∝ x^p in 1≲x≲100
+                mask = (
+                    (X_BINS >= 1.0)
+                    & (X_BINS <= 100.0)
+                    & np.isfinite(N_x)
+                    & (N_x > 0.0)
+                )
+                if mask.sum() >= 2:
+                    logx = np.log10(X_BINS[mask])
+                    logN = np.log10(N_x[mask])
+                    p_fit, _ = np.polyfit(logx, logN, 1)
+                    print(
+                        f"[diag] best-fit N(E) ∝ x^{p_fit:.3f} in 1≲x≲100 "
+                        "(occupancy slope, before applying gexp).",
+                        file=sys.stderr,
+                    )
             return gbar_norm, gbar_raw
         else:
             if gbar_from_flux:
