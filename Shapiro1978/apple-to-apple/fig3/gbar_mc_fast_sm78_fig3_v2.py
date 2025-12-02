@@ -70,24 +70,6 @@ DX = X_EDGES[1:] - X_EDGES[:-1]
 
 
 def make_gbar_from_occupancy(x_centers, N_x, gexp, x_norm):
-    """
-    Map occupancy N(E) → ḡ(E) using paper's N(E) → g(E) ∝ x^{gexp}.
-
-    This is the primary method for computing ḡ(x) and matches SM78's definition:
-        ḡ(E) ∝ N(E) * x^{gexp}
-    where N(E) is the time-averaged occupancy per energy bin from snapshots,
-    and gexp = 2.5 for SM78 canonical case.
-
-    For SM78 fiducial model, this gives ḡ(x) ∝ x^{-0.48} in 1≲x≲100.
-
-    Args:
-        x_centers: Energy bin centers
-        N_x: Time-averaged occupancy per bin (from snapshots)
-        gexp: Exponent for N(E) → g(E) mapping (default: 2.5 for SM78)
-        x_norm: x value at which to normalize ḡ to 1
-
-    Returns (gbar_norm, gbar_raw).
-    """
     x_centers = np.asarray(x_centers, dtype=float)
     N_x = np.asarray(N_x, dtype=float)
 
@@ -105,30 +87,6 @@ def make_gbar_from_occupancy(x_centers, N_x, gexp, x_norm):
 
 
 def make_gbar_from_flux(x_centers, N_cap, N_occ, total_measure, flux_exp, x_norm):
-    """
-    Compute ḡ(E) from capture flux Γ_cap = N_cap / N_occ per t0.
-
-    From the steady-state flux relation (SM78 style):
-        Γ_cap(x) ∝ ḡ(x) / x^flux_exp
-    so to recover ḡ(x) we divide out the x^flux_exp factor:
-        ḡ(x) ∝ Γ_cap(x) / x^flux_exp
-
-    In our implementation Γ_cap(x) already grows ~ x^flux_exp, so we must DIVIDE
-    by x^flux_exp to get a roughly flat ḡ(x) consistent with occupancy-based ḡ.
-
-    For SM78 fiducial model (gexp=2.5, E2-x-power=0.62), flux_exp ≈ 3.10
-    makes flux-based ḡ match occupancy-based ḡ (both give slope ≈ -0.48).
-
-    Args:
-        x_centers: Energy bin centers
-        N_cap: Total capture counts per bin (raw counts)
-        N_occ: Total occupancy counts per bin (raw counts, not normalized)
-        total_measure: Total time/snapshots for normalization (to compute N_occ per t0)
-        flux_exp: Exponent for the flux relation (default: 3.10 for SM78 fiducial)
-        x_norm: x value at which to normalize ḡ to 1
-
-    Returns (gbar_norm, gbar_raw).
-    """
     x_centers = np.asarray(x_centers, dtype=float)
     N_cap = np.asarray(N_cap, dtype=float)
     N_occ = np.asarray(N_occ, dtype=float)
@@ -357,21 +315,6 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
 
     @njit(**fastmath)
     def diff_coeffs_sm78_exact_star(x, j):
-        """
-        Exact SM78 orbit-averaged diffusion coefficients in the SAME
-        normalized units as the original Table 1 ("starred" units).
-
-        That is: this should return the analogs of
-            NEG_E1, E2, J2, J1, ZETA2
-        evaluated at (x, j) for P* = PSTAR_CANON.
-
-        Returns:
-            (e1_star, E2_star, j1_star, J2_star, covEJ_star)
-        all for pstar = PSTAR_CANON, i.e. BEFORE any pstar scaling.
-
-        IMPORTANT: Do NOT include pstar in these formulas; pstar
-        scaling is handled later in bilinear_coeffs().
-        """
         if x < X_GRID[-1]:
             x = X_GRID[-1]
         if x > X_GRID[0]:
@@ -486,13 +429,11 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         v0_sq = 1.0
         Jmax = 1.0 / math.sqrt(2.0 * x_clamp)
 
-        # e1*, ε₂*, j₁*, j₂* in Table 1 are *already* the per-orbit RMS
-        # coefficients used in eqs. (27)–(29). We should NOT take square roots.
-        e1 = -e1_scale_val * e1_star * v0_sq          # drift term ε₁
-        sigE = max(E2_star, 0.0) * v0_sq              # ε₂*
+        e1 = -e1_scale_val * e1_star * v0_sq
+        sigE = max(E2_star, 0.0) * v0_sq
 
-        j1 = j1_star * Jmax                           # drift term j₁
-        sigJ = max(J2_star, 0.0) * Jmax               # j₂*
+        j1 = j1_star * Jmax
+        sigJ = max(J2_star, 0.0) * Jmax
 
         covEJ = covEJ_star * v0_sq * Jmax
 
@@ -513,77 +454,43 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                diag_counts=None, lc_floor_frac=0.10, lc_gap_scale=None,
                step_size_factor_val=1.0, n_max_override_val=3.0e4,
                use_sm78_physics=False, lc_strength_scale=1.0):
-        """
-        Compute step size n using SM78 eq. (29) constraints in dimensionless form.
-        
-        All constraints are expressed in terms of:
-        - x (binding energy, dimensionless)
-        - j (dimensionless angular momentum, J/J_max)
-        - j_min (loss-cone boundary at this x)
-        - E2_star, J2_star (dimensionless Table-1 coefficients)
-        """
+        if use_sm78_physics and n_min > 1e-5:
+            n_min = 1e-5
         jmin = j_min_of_x(x, lc_scale_val, noloss_flag, use_sm78_physics)
         Jmax = 1.0 / math.sqrt(2.0 * x)
         
-        # Extract dimensionless coefficients from dimensional sigE, sigJ
-        # sigE = E2_star * v0_sq = E2_star (since v0_sq = 1.0)
-        # sigJ = J2_star * Jmax, so J2_star = sigJ / Jmax
-        E2_star = sigE  # Already dimensionless
-        J2_star = sigJ / Jmax if Jmax > 0.0 else 0.0  # Dimensionless
+        E2_star = sigE
+        J2_star = sigJ / Jmax if Jmax > 0.0 else 0.0
         
         HUGE = 1.0e60
-
-        # Eq. (29a): √n * ε₂* <= 0.15 * x
-        # => n <= (0.15 * x / ε₂*)^2
         if E2_star > 0.0 and x > 0.0:
             n_E = (step_size_factor_val * 0.15 * x / E2_star) ** 2
         else:
             n_E = HUGE
 
-        # If angular diffusion is zero, no useful J-constraints
         if J2_star > 0.0:
-            # Eq. (29b): √n * j₂* <= 0.10
-            # => n <= (0.10 / j₂*)^2
             n_J_iso = (step_size_factor_val * 0.10 / J2_star) ** 2
-
-            # Eq. (29c): √n * j₂* <= 0.40 * (1.0075 - j)
-            # => n <= (0.40 * (1.0075 - j) / j₂*)^2
             margin = max(1.0075 - j, 0.0)
             if margin > 0.0:
                 n_J_top = (step_size_factor_val * 0.40 * margin / J2_star) ** 2
             else:
                 n_J_top = HUGE
 
-            # Eq. (29d): √n * j₂* <= max(0.25*|j - j_min|, 0.10*j_min)
-            # => n <= (max(0.25*|j - j_min|, 0.10*j_min) / j₂*)^2
             if noloss_flag or jmin <= 0.0 or J2_star <= 0.0:
                 n_J_lc = HUGE
             else:
                 if use_sm78_physics:
-                    # Literal SM78 eq. (29d) with hard-coded coefficients:
-                    # sqrt(n) * j2* <= max(0.25*|j - j_min|, 0.10*j_min)
                     d_allowed = max(0.25 * abs(j - jmin), 0.10 * jmin)
                 else:
-                    # Keep the more general parameterized form for non-SM78 runs
                     gap_scale = cone_gamma_val if lc_gap_scale is None else lc_gap_scale
                     floor = lc_floor_frac if lc_floor_frac > 0.0 else 0.0
                     d_allowed = max(gap_scale * abs(j - jmin), floor * jmin)
 
                 if d_allowed > 0.0:
-                    # Apply loss-cone strength scaling: stronger loss cone (lc_strength_scale > 1)
-                    # means LARGER allowed step size (multiply d_allowed by the scale factor).
-                    # This allows stars to take bigger steps near the loss cone, making it easier
-                    # for them to cross the boundary and be captured at moderate x.
-                    # Note: This is counter-intuitive but matches the observation that dividing
-                    # makes things worse. The constraint becomes less restrictive, allowing
-                    # larger steps that can cross the loss-cone boundary more easily.
-                    d_allowed_scaled = d_allowed * lc_strength_scale
+                    d_allowed_scaled = d_allowed / lc_strength_scale
                     n_J_lc = (step_size_factor_val * d_allowed_scaled / J2_star) ** 2
                 else:
                     n_J_lc = HUGE
-                # CRITICAL: Do NOT enforce n_J_lc >= 1.0 here.
-                # Let it go down to n_min (set globally below) so eq. 29d can
-                # actually constrain steps near the loss cone.
                 if n_J_lc > n_max:
                     n_J_lc = n_max
         else:
@@ -675,8 +582,6 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         E = -x
         Jmax = 1.0 / math.sqrt(2.0 * x)
         J = j * Jmax
-
-        # Handle multiple integer orbit crossings: check capture at each pericenter
         phase_curr = phase
         n_remaining = n_raw
         x_curr = x
@@ -690,17 +595,13 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             n_to_next_int = next_int - phase_curr
             
             if n_remaining <= n_to_next_int:
-                # This step doesn't cross an integer boundary
                 n_step = n_remaining
                 n_remaining = 0.0
                 will_cross = False
             else:
-                # This step crosses at least one integer boundary
                 n_step = n_to_next_int
                 n_remaining -= n_step
                 will_cross = True
-
-            # Compute step for this sub-interval
             e1_curr, sigE_curr, j1_curr, sigJ_curr, rho_curr = bilinear_coeffs(
                 x_curr, j_curr, pstar_val, e1_scale_val,
                 zero_coeffs_flag, zero_drift_flag, zero_diffusion_flag,
@@ -724,34 +625,22 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             Jmax_step_new = 1.0 / math.sqrt(2.0 * x_step_new)
             Jmax_curr = 1.0 / math.sqrt(2.0 * x_curr)
             
-            # Extract dimensionless coefficients for eq. (28) / (27b)
-            # sigJ_curr = J2_star * Jmax_curr, so J2_star = sigJ_curr / Jmax_curr
-            # j1_curr = j1_star * Jmax_curr, so j1_star = j1_curr / Jmax_curr
             J2_star_curr = sigJ_curr / Jmax_curr if Jmax_curr > 0.0 else 0.0
             j1_star_curr = j1_curr / Jmax_curr if Jmax_curr > 0.0 else 0.0
 
-            # SM78 eq. (28): Use isotropic 2D random walk in dimensionless j-space
-            # when j is small and the step is large in j-space.
             j_min_curr = j_min_of_x(x_curr, lc_scale_val, noloss_flag, use_sm78_physics)
             inside_loss_cone = (j_curr <= j_min_curr)
-            low_j = (j_curr <= 0.4)
-            large_step = (math.sqrt(n_step) * J2_star_curr >= 0.25 * j_curr)
+            
+            d_lc = max(0.25 * abs(j_curr - j_min_curr), 0.10 * j_min_curr)
+            large_step_lc = (math.sqrt(n_step) * J2_star_curr >= d_lc)
 
             if use_sm78_physics:
-                # SM78: switch to 2D random walk when j is small and the
-                # step is "large" in j-space; no explicit requirement that
-                # we already be inside the loss cone. This allows the 2D walk
-                # to be used near the loss cone, making it easier for orbits
-                # at moderate x to diffuse into the cone.
-                use_2d = low_j and large_step
+                use_2d = inside_loss_cone and large_step_lc
             else:
-                # For generic runs, keep the stricter condition requiring
-                # inside_loss_cone as well.
-                use_2d = inside_loss_cone and low_j and large_step
+                low_j = (j_curr <= 0.4)
+                use_2d = inside_loss_cone and low_j and large_step_lc
 
             if use_2d:
-                # Eq. (28): isotropic 2D random walk in dimensionless j-space
-                # Δj = sqrt((j + sqrt(n) y₃ j₂*)^2 + (sqrt(n) y₄ j₂*)^2) - j
                 z1 = np.random.normal()
                 z2 = np.random.normal()
                 j_step_new = math.sqrt(
@@ -759,28 +648,22 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                     (math.sqrt(n_step) * z2 * J2_star_curr) ** 2
                 )
             else:
-                # Eq. (27b): small-angle, correlated step in dimensionless j-space
-                # Δj = n j₁* + sqrt(n) j₂* y₂
                 j_step_new = j_curr + n_step * j1_star_curr + math.sqrt(n_step) * J2_star_curr * y2_step
 
-            # Enforce bounds on dimensionless j
             if j_step_new < 0.0:
                 j_step_new = -j_step_new
             if j_step_new > 1.0:
-                j_step_new = 2.0 - j_step_new  # Reflect at j = 1 boundary
+                j_step_new = 2.0 - j_step_new
                 if j_step_new < 0.0:
                     j_step_new = 0.0
                 if j_step_new > 1.0:
                     j_step_new = 1.0
             phase_curr += n_step
 
-            # Update state for this sub-step
             x_curr = x_step_new
             j_curr = j_step_new
             if will_cross:
                 crossed_peri = True
-
-            # Check capture at integer pericenter crossings
             if will_cross and (not noloss_flag):
                 j_min_new = j_min_of_x(x_step_new, lc_scale_val, noloss_flag, use_sm78_physics)
                 if j_step_new < j_min_new:
@@ -790,7 +673,6 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                     else:
                         ghost_captured = True
 
-        # Final state
         x_new = x_curr
         j_new = j_curr
         phase_new = phase_curr
@@ -1033,7 +915,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         crossings = 0
         caps = 0
         max_ccount = ccount
-        cap_E_sum = 0.0  # sum of binding energy x at captures, weighted by stream/clone weight
+        cap_E_sum = 0.0
 
         while t0_used < n_relax:
             x_prev = x
@@ -1082,7 +964,6 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                     caps += 1
                     if cap_hist is not None:
                         cap_hist[bin_index(x_prev)] += 1
-                    # binding energy removed by this capture (weight * x at start of step)
                     cap_E_sum += w * x_prev
                 
                 if use_sm78_physics:
@@ -1175,7 +1056,6 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                             caps += 1
                             if cap_hist is not None:
                                 cap_hist[bin_index(x_c)] += 1
-                            # binding energy removed by this clone capture
                             cap_E_sum += cw[i] * x_c
                         
                         if use_sm78_physics:
@@ -1260,7 +1140,6 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             ghost_cap_hist = np.zeros(x_bins.size, dtype=np.int64)
         
         if use_snapshots:
-            # measure_b = snapshots, t0_b = t0_used
             return (
                 g_acc,
                 snapshots,
@@ -1276,7 +1155,6 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 ghost_cap_hist,
             )
         else:
-            # measure_b = total_t0, t0_b = total_t0
             return (
                 g_acc,
                 total_t0,
@@ -1422,10 +1300,10 @@ def run_parallel_gbar(
 
     g_total = np.zeros_like(X_BINS, dtype=np.float64)
     total_measure = 0.0
-    total_t0_measured = 0.0   # actual time in units of t0 (for capture/energy rates)
+    total_t0_measured = 0.0
     peri_total = 0
     caps_total = 0
-    capE_total = 0.0          # total binding energy removed by captures (sum w*x)
+    capE_total = 0.0
     max_ccount = 0
     total_done = 0
     weight_sums = []
@@ -1503,8 +1381,8 @@ def run_parallel_gbar(
                 ) = f.result()
 
                 g_total += g_b
-                total_measure += measure_b       # snapshots or total t0, as before
-                total_t0_measured += t0_b        # always total time in units of t0
+                total_measure += measure_b
+                total_t0_measured += t0_b
                 peri_total += peri_b
                 caps_total += caps_b
                 capE_total += capE_b
@@ -1582,11 +1460,10 @@ def run_parallel_gbar(
                 f"std={wsum_arr.std():.6f}",
                 file=sys.stderr,
             )
-        # --- Global capture & energy-outflow diagnostics (for comparison to SM78 eqs. 31 & 33) ---
         if total_t0_measured > 0.0 and caps_total > 0:
-            F_mc = caps_total / total_t0_measured          # capture rate per t0
-            E_cap_mean = capE_total / caps_total           # mean binding energy (in x units) per capture
-            Edot_mc = capE_total / total_t0_measured       # energy outflow per t0 (sum x / Δt0)
+            F_mc = caps_total / total_t0_measured
+            E_cap_mean = capE_total / caps_total
+            Edot_mc = capE_total / total_t0_measured
 
             print(
                 f"[diag] capture/heating diagnostics:",
@@ -1678,7 +1555,6 @@ def run_parallel_gbar(
                     f"normalized at x={X_BINS[norm_idx_occ]:.3g}",
                     file=sys.stderr,
                 )
-                # Also fit a simple power law N(E) ∝ x^p in 1≲x≲100
                 mask = (
                     (X_BINS >= 1.0)
                     & (X_BINS <= 100.0)
@@ -1747,7 +1623,6 @@ def run_parallel_gbar(
                     f"This is N(E), not g(E).",
                     file=sys.stderr,
                 )
-                # Also fit a simple power law N(E) ∝ x^p in 1≲x≲100
                 mask = (
                     (X_BINS >= 1.0)
                     & (X_BINS <= 100.0)
@@ -2144,10 +2019,8 @@ def main():
         args.E2_x_power = 0.0
         args.E2_x_ref = 1.0
         args.lc_scale = 1.0
-        # Canonical SM78 eq. (29d) constants:
-        # √n j₂ ≤ max(0.25 |J - J_min|, 0.1 J_min)
-        args.lc_floor_frac = 0.10   # 0.1 J_min
-        args.cone_gamma   = 0.25    # 0.25 |J - J_min|
+        args.lc_floor_frac = 0.10
+        args.cone_gamma   = 0.25
         args.lc_gap_scale = None
         args.outer_injection = False
 
@@ -2210,7 +2083,7 @@ def main():
         lc_strength_scale=args.lc_strength_scale,
     )
 
-    print("# x_center   gbar_MC_norm   gbar_MC_raw      gbar_paper   gbar_err_paper")
+    print("x_center   gbar_MC_norm   gbar_MC_raw      gbar_paper   gbar_err_paper")
     residuals = []
     for xb, g_norm, g_raw, gp, gp_err in zip(
         X_BINS, gbar_norm, gbar_raw, GBAR_PAPER, GBAR_ERR_PAPER
@@ -2226,8 +2099,8 @@ def main():
         residuals_arr = np.array(residuals)
         chi2 = np.sum(residuals_arr**2)
         chi2_per_dof = chi2 / len(residuals_arr)
-        print(f"# chi^2/dof = {chi2_per_dof:.3f} (target: < 2.0 for good agreement)")
-        print(f"# max |residual| = {np.abs(residuals_arr).max():.3f} sigma")
+        print(f"chi^2/dof = {chi2_per_dof:.3f} (target: < 2.0 for good agreement)")
+        print(f"max |residual| = {np.abs(residuals_arr).max():.3f} sigma")
 
 
 if __name__ == "__main__":
