@@ -24,19 +24,19 @@ import matplotlib.pyplot as plt
 
 
 
-# import matplotlib as mpl
+import matplotlib as mpl
 
 
-# mpl.rcParams.update({
-#     "text.usetex": False,          # use MathText (portable)
-#     "font.family": "STIXGeneral",  # match math fonts
-#     "font.size": 14,
-#     "mathtext.fontset": "stix",
-#     "axes.unicode_minus": False,   # proper minus sign
-#     "axes.labelsize": 18,           # axis label text
-#     "xtick.labelsize": 16,          # x-tick labels
-#     "ytick.labelsize": 16,          # y-tick labels
-# })
+mpl.rcParams.update({
+    "text.usetex": False,          # use MathText (portable)
+    "font.family": "STIXGeneral",  # match math fonts
+    "font.size": 14,
+    "mathtext.fontset": "stix",
+    "axes.unicode_minus": False,   # proper minus sign
+    "axes.labelsize": 18,           # axis label text
+    "xtick.labelsize": 16,          # x-tick labels
+    "ytick.labelsize": 16,          # y-tick labels
+})
 
 LOGDIR = Path("logs")
 OUTDIR = Path("figs")
@@ -302,7 +302,7 @@ def plot_bw_noloss():
     OUTDIR.mkdir(parents=True, exist_ok=True)
 
     plt.figure()
-    plt.plot(x, n_raw,marker="o", linestyle="-", color="black", label="MC raw occupancy $N(E)$")
+    plt.plot(x, n_raw,marker="o", linestyle="-", color="black", label="MC occupancy $N(E)$")
 
     # Reference x^-2 line normalized at first x>=1 point
     mask = (x >= 1.0) & (n_raw > 0) &(x <= 50.0) 
@@ -316,8 +316,8 @@ def plot_bw_noloss():
     plt.xscale("log")
     plt.yscale("log")
     plt.xlabel("$x$")
-    plt.ylabel("$N(E)$ (raw)")
-    plt.title("No-loss-cone occupancy check")
+    plt.ylabel("$N(E)$")
+    plt.title("No-loss-cone")
     plt.legend()
     plt.tight_layout()
     plt.savefig(OUTDIR / "fig6_noloss_occupancy.png", dpi=300)
