@@ -334,10 +334,12 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
 
     @njit(**fastmath)
     def diff_coeffs_sm78_exact_star(x, j):
-        if x < X_GRID[-1]:
-            x = X_GRID[-1]
-        if x > X_GRID[0]:
+        # Clamp x to the interpolation grid bounds (X_GRID is ascending: [0.336, ..., 3180])
+        if x < X_GRID[0]:
             x = X_GRID[0]
+        if x > X_GRID[-1]:
+            x = X_GRID[-1]
+        # Clamp j to valid range [0, 1]
         if j < 0.0:
             j = 0.0
         if j > 1.0:
@@ -489,7 +491,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
 
         if J2_star > 0.0:
             n_J_iso = (step_size_factor_val * 0.10 / J2_star) ** 2
-            margin = max(1.0075 - j, 0.0)
+            margin = max(1.0075 - j, 0.0) 
             if margin > 0.0:
                 n_J_top = (step_size_factor_val * 0.40 * margin / J2_star) ** 2
             else:
@@ -663,9 +665,10 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 # So we can compare in terms of the dimensionless j:
                 #   sqrt(n) * J2_star_curr  ≳  0.25 * j_curr
                 large_step_2d = (math.sqrt(n_step) * J2_star_curr >= 0.25 * j_curr)
-                # Eq. (28) is used only for stars that are already inside the loss cone
-                # AND satisfy the large-step condition.
-                use_2d = inside_loss_cone and large_step_2d
+                low_j = (j_curr <= 0.4)  # SM78: eq. (28) applies when J ≲ 0.4 J_max
+                # Eq. (28) is used only for stars that are already inside the loss cone,
+                # have low angular momentum, AND satisfy the large-step condition.
+                use_2d = inside_loss_cone and low_j and large_step_2d
             else:
                 # --- Generic / non-SM78 mode: keep your previous "loss-cone-width" logic ---
                 d_lc = max(0.25 * abs(j_curr - j_min_curr), 0.10 * j_min_curr)
@@ -1751,298 +1754,215 @@ def main():
         "--streams",
         type=int,
         default=400,
-        help="number of non-clone time-carrying streams (default: 400)",
     )
     ap.add_argument(
         "--windows",
         type=float,
         default=6.0,
-        help="t0 windows per stream (measurement duration, default: 6)",
     )
     ap.add_argument(
         "--procs",
         type=int,
         default=48,
-        help="number of worker processes (default: 48)",
     )
     ap.add_argument(
         "--floors_min_exp",
         type=int,
         default=8,
-        help="min exponent k for floors 10^{-k} (default: 8 => 1e-8)",
     )
     ap.add_argument(
         "--floor-step",
         type=int,
         default=1,
-        help="stride for floor exponents (e.g. 2 => decades 0,2,4,...)",
     )
     ap.add_argument(
         "--clones",
         type=int,
         default=9,
-        help="clones per split (default: 9, matching SM78 canonical model)",
     )
     ap.add_argument(
         "--nojit",
         action="store_true",
-        help="disable numba JIT (slow fallback)",
     )
     ap.add_argument(
         "--no-progress",
         action="store_true",
-        help="disable progress display",
     )
     ap.add_argument(
         "--seed",
         type=int,
         default=SEED,
-        help="base RNG seed (default: %(default)s)",
     )
     ap.add_argument(
         "--pstar",
         type=float,
         default=PSTAR,
-        help="P* parameter (default: %(default)s)",
     )
     ap.add_argument(
         "--warmup",
         type=float,
         default=2.0,
-        help="equilibration time in t0 before tallying (default: 2)",
     )
     ap.add_argument(
         "--replicates",
         type=int,
         default=1,
-        help="repeat the whole measurement K times (accumulating raw tallies)",
     )
     ap.add_argument(
         "--gexp",
         type=float,
         default=2.5,
-        help=(
-            "Exponent in g(x) ∝ N(E) x^gexp conversion. "
-            "For an apples-to-apples comparison with Shapiro & Marchant (1978), "
-            "this should be 2.5 as implied by eqs. (9), (11) and (13). "
-            "The parameter is kept for diagnostic testing only (default: 2.5)."
-        ),
     )
     ap.add_argument(
         "--use-tunable-gexp",
         action="store_true",
-        help=(
-            "DEPRECATED: This flag is now a no-op. The code always uses the --gexp "
-            "parameter. For Fig. 3 reproduction, use --gexp 2.5 (the default)."
-        ),
     )
     ap.add_argument(
         "--gbar-no-clones",
         action="store_true",
-        help=(
-            "Accumulate ḡ(x) from parent stream only "
-            "(ignore clones in the histogram)."
-        ),
     )
     ap.add_argument(
         "--snapshots",
         action="store_true",
-        help=(
-            "Use per-t0 snapshots for ḡ accumulation "
-            "(closer to SM78 Fig. 3 procedure) instead "
-            "of continuous time-weighting."
-        ),
     )
     ap.add_argument(
         "--snaps-per-t0",
         type=int,
         default=40,
-        help="Snapshots per t0 when --snapshots is set (default: 40).",
     )
     ap.add_argument(
         "--noloss",
         action="store_true",
-        help="Disable loss-cone capture (for BW g0 diagnostics).",
     )
     ap.add_argument(
         "--e1-scale",
         type=float,
         default=E1_SCALE_DEFAULT,
-        help="Scale factor for energy drift e1 (default: %.3f)" % E1_SCALE_DEFAULT,
     )
     ap.add_argument(
         "--lc_scale",
         type=float,
         default=LC_SCALE_DEFAULT,
-        help="Scale factor for loss-cone boundary j_min (default: %.3f; <1 shrinks the cone)" % LC_SCALE_DEFAULT,
     )
     ap.add_argument(
         "--cone-gamma",
         type=float,
         default=0.25,
-        help="γ factor in eq. 29d for loss-cone step limiting (default: 0.25, matching SM78).",
     )
     ap.add_argument(
         "--diag-29-counts",
         action="store_true",
-        help="Enable diagnostic counters for eq. 29 constraint winners (29a/29b/29c/29d).",
     )
     ap.add_argument(
         "--disable-capture",
         action="store_true",
-        help="Disable capture events while keeping loss-cone geometry (for testing 29d effect alone).",
     )
     ap.add_argument(
         "--lc-floor-frac",
         type=float,
         default=0.10,
-        help="Floor fraction for eq. 29d loss-cone limiter (default: 0.10). Set to 0.0 to disable floor.",
     )
     ap.add_argument(
         "--lc-gap-scale",
         type=float,
         default=None,
-        help="Override cone_gamma for eq. 29d gap calculation (default: use --cone-gamma value).",
     )
     ap.add_argument(
         "--cap-inj-diag",
         action="store_true",
-        help="Enable capture/injection diagnostics: histogram captures and injections by x-bin.",
     )
     ap.add_argument(
         "--outer-injection",
         action="store_true",
-        help="Use outer-boundary injection (x >= --outer-inj-x-min from reservoir). "
-             "By default, x-bound injection is used (x_b = 0.2, canonical SM78).",
     )
     ap.add_argument(
         "--use-x-bound-injection",
         action="store_true",
-        help="DEPRECATED: Use --outer-injection to enable outer-boundary injection. "
-             "By default, x-bound injection (x_b = 0.2) is used for canonical SM78.",
     )
     ap.add_argument(
         "--outer-inj-x-min",
         type=float,
         default=10.0,
-        help="Minimum x for outer-boundary injection (default: 10.0). "
-             "Stars are injected from the reservoir distribution with x >= this value.",
     )
     ap.add_argument(
         "--debug-occupancy-norm",
         action="store_true",
-        help=(
-            "DEBUG: Use occupancy-based normalization (capture-independent) "
-            "instead of gexp-based conversion. Useful for testing cloning neutrality."
-        ),
     )
     ap.add_argument(
         "--zero-coeffs",
         action="store_true",
-        help="DIAGNOSTIC: Zero out all drift and diffusion coefficients (Step 1 test).",
     )
     ap.add_argument(
         "--zero-drift",
         action="store_true",
-        help="DIAGNOSTIC: Zero out drift terms (e1, j1) to test diffusion only (Step 2a).",
     )
     ap.add_argument(
         "--zero-diffusion",
         action="store_true",
-        help="DIAGNOSTIC: Zero out diffusion terms (E2, J2, covEJ) to test drift only (Step 2b).",
     )
     ap.add_argument(
         "--step-size-factor",
         type=float,
         default=1.0,
-        help="DIAGNOSTIC: Scale factor for eq. 29 step-size constants (default: 1.0). Use <1.0 for smaller steps (Step 3).",
     )
     ap.add_argument(
         "--n-max-override",
         type=float,
         default=None,
-        help="DIAGNOSTIC: Override maximum step size n_max (default: 3.0e4). Use smaller values to force smaller steps (Step 3).",
     )
     ap.add_argument(
         "--E2-scale",
         type=float,
         default=1.0,
-        help="DIAGNOSTIC: Scale factor for energy diffusion E2* (default: 1.0). Use to test if missing factor in diffusion.",
     )
     ap.add_argument(
         "--J2-scale",
         type=float,
         default=1.0,
-        help="DIAGNOSTIC: Scale factor for angular momentum diffusion J2* (default: 1.0). Use to test if missing factor in diffusion.",
     )
     ap.add_argument(
         "--covEJ-scale",
         type=float,
         default=1.0,
-        help="DIAGNOSTIC: Scale factor for E-J covariance ζ*² (default: 1.0). Use to test if missing factor in correlation.",
     )
     ap.add_argument(
         "--E2-x-power",
         type=float,
         default=0.0,
-        help="DIAGNOSTIC: Energy-dependent power-law scaling for E2: E2_eff = E2 * (x/x_ref)^power (default: 0.0). Use to test what exponent would fix the slope.",
     )
     ap.add_argument(
         "--E2-x-ref",
         type=float,
         default=1.0,
-        help="DIAGNOSTIC: Reference energy for --E2-x-power scaling (default: 1.0).",
     )
     ap.add_argument(
         "--gbar-from-flux",
         action="store_true",
-        help="Compute ḡ(x) from capture flux diagnostics instead of snapshot occupancy (experimental).",
     )
     ap.add_argument(
         "--gbar-x-norm",
         type=float,
         default=0.225,
-        help="x at which ḡ is normalized to 1 (default: 0.225, matching paper).",
     )
     flux_exp_group = ap.add_mutually_exclusive_group()
     flux_exp_group.add_argument(
         "--gbar-flux-exp",
         type=float,
         default=3.10,
-        help=(
-            "Exponent p in ḡ ∝ Γ_cap(x) / x^p when using --gbar-from-flux "
-            "(p ≈ gexp + E2_x_power; default: 3.10 for SM78 fiducial). "
-            "This value makes flux-based ḡ match occupancy-based ḡ."
-        ),
     )
     flux_exp_group.add_argument(
         "--gbar-flux-power",
         type=float,
         dest="gbar_flux_exp",
-        help=(
-            "Alias for --gbar-flux-exp. Exponent p in ḡ ∝ Γ_cap(x) / x^p "
-            "when using --gbar-from-flux (default: 3.10)."
-        ),
     )
     ap.add_argument(
         "--use-sm78-physics",
         action="store_true",
-        help=(
-            "Use exact SM78 diffusion coefficients, loss cone, and outer boundary "
-            "instead of parametric tunings (E2_x_power, J2_scale, lc_scale, etc.)."
-        ),
     )
     ap.add_argument(
         "--lc-strength-scale",
         type=float,
         default=1.0,
-        help=(
-            "Multiplicative factor on SM78 eq. (29d) loss-cone constraint strength. "
-            "Values > 1.0 make eq. (29d) more restrictive (smaller allowed angular-momentum "
-            "steps near the loss cone). This changes the capture rate; the effect is best "
-            "calibrated empirically. Use to tune if ḡ(x) is too heavy at high x. "
-            "(default: 1.0)"
-        ),
     )
 
     args = ap.parse_args()
