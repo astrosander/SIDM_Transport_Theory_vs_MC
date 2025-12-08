@@ -19,6 +19,8 @@ PSTAR   = 0.005
 X_BOUND = 0.2
 SEED    = 20251028
 
+U_EXP = 1.25  # 5/4, SM78: u ∝ |E|^{-5/4}
+
 E1_SCALE_DEFAULT = 1.2
 
 LC_SCALE_DEFAULT = 1.0
@@ -555,17 +557,25 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         return y1, y2
 
     @njit(**fastmath)
-    def floor_index_for_j2(j2, floors):
+    def u_of_x(x):
+        # x = |E| in your units
+        # SM78: u ∝ |E|^{-5/4}
+        if x <= 0.0:
+            return 1.0e30
+        return x ** (-U_EXP)
+
+    @njit(**fastmath)
+    def floor_index_for_u(u, floors):
         k = -1
         for i in range(floors.size):
-            if j2 < floors[i]:
+            if u < floors[i]:
                 k = i
         return k
 
     @njit(**fastmath)
-    def target_floor_with_hysteresis(j2, floors, current_idx, split_hyst=0.8):
+    def target_floor_with_hysteresis(u, floors, current_idx, split_hyst=0.8):
         k = current_idx
-        while (k + 1) < floors.size and j2 < split_hyst * floors[k + 1]:
+        while (k + 1) < floors.size and u < split_hyst * floors[k + 1]:
             k += 1
         return k
 
@@ -598,121 +608,84 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                        step_size_factor_val=step_size_factor_val,
                        n_max_override_val=n_max_override_val,
                        use_sm78_physics=use_sm78_physics,
-                       lc_strength_scale=lc_strength_scale_val)
+                       lc_strength_scale=lc_strength_scale)
 
-        E = -x
-        Jmax = 1.0 / math.sqrt(2.0 * x)
-        J = j * Jmax
-        phase_curr = phase
-        n_remaining = n_raw
-        x_curr = x
-        j_curr = j
+        # SM78 step adjustment: truncate to next integer orbit count if possible.
+        next_int = math.floor(phase) + 1.0
+        n_to_next_int = next_int - phase
+
+        if use_sm78_physics and n_raw >= n_to_next_int:
+            n = n_to_next_int
+            crossed_peri = True
+        else:
+            n = n_raw
+            crossed_peri = False
+
+        e1_curr, sigE_curr, j1_curr, sigJ_curr, rho_curr = bilinear_coeffs(
+            x, j, pstar_val, e1_scale_val,
+            zero_coeffs_flag, zero_drift_flag, zero_diffusion_flag,
+            E2_scale_local, J2_scale_local, covEJ_scale_local,
+            E2_x_power_local, E2_x_ref_local, use_sm78_physics
+        )
+
+        y1_step, y2_step = correlated_normals(rho_curr, sigE_curr, sigJ_curr)
+
+        E_curr = -x
+        deltaE = n * e1_curr + math.sqrt(n) * sigE_curr * y1_step
+        E_new = E_curr + deltaE
+        if E_new >= -1e-6:
+            E_new = -1e-6
+        x_new = -E_new
+        if x_new > x_max:
+            x_new = x_max
+            E_new = -x_new
+
+        Jmax_curr = 1.0 / math.sqrt(2.0 * x)
+        J2_star_curr = sigJ_curr / Jmax_curr if Jmax_curr > 0.0 else 0.0
+        j1_star_curr = j1_curr / Jmax_curr if Jmax_curr > 0.0 else 0.0
+
+        j_min_curr = j_min_of_x(x, lc_scale_val, noloss_flag, use_sm78_physics)
+        inside_loss_cone = (j <= j_min_curr)
+
+        if use_sm78_physics:
+            # --- Literal SM78 criterion for using the 2D random walk (eq. 28) ---
+            large_step_2d = (math.sqrt(n) * J2_star_curr >= 0.25 * j)
+            low_j = (j <= 0.4)  # SM78: eq. (28) applies when J ≲ 0.4 J_max
+            use_2d = inside_loss_cone and low_j and large_step_2d
+        else:
+            # --- Generic / non-SM78 mode: keep your previous "loss-cone-width" logic ---
+            d_lc = max(0.25 * abs(j - j_min_curr), 0.10 * j_min_curr)
+            large_step_lc = (math.sqrt(n) * J2_star_curr >= d_lc)
+            low_j = (j <= 0.4)
+            use_2d = inside_loss_cone and low_j and large_step_lc
+
+        if use_2d:
+            z1 = np.random.normal()
+            z2 = np.random.normal()
+            j_new = math.sqrt(
+                (j + math.sqrt(n) * z1 * J2_star_curr) ** 2 +
+                (math.sqrt(n) * z2 * J2_star_curr) ** 2
+            )
+        else:
+            j_new = j + n * j1_star_curr + math.sqrt(n) * J2_star_curr * y2_step
+
+        if j_new < 0.0:
+            j_new = -j_new
+        if j_new > 1.0:
+            j_new = 2.0 - j_new
+            j_new = min(max(j_new, 0.0), 1.0)
+
+        phase_new = phase + n
+
         captured = False
         ghost_captured = False
-        crossed_peri = False
-
-        while n_remaining > 0.0:
-            next_int = math.floor(phase_curr) + 1.0
-            n_to_next_int = next_int - phase_curr
-            
-            if n_remaining <= n_to_next_int:
-                n_step = n_remaining
-                n_remaining = 0.0
-                will_cross = False
-            else:
-                n_step = n_to_next_int
-                n_remaining -= n_step
-                will_cross = True
-            e1_curr, sigE_curr, j1_curr, sigJ_curr, rho_curr = bilinear_coeffs(
-                x_curr, j_curr, pstar_val, e1_scale_val,
-                zero_coeffs_flag, zero_drift_flag, zero_diffusion_flag,
-                E2_scale_local, J2_scale_local, covEJ_scale_local,
-                E2_x_power_local, E2_x_ref_local, use_sm78_physics
-            )
-
-            y1_step, y2_step = correlated_normals(rho_curr, sigE_curr, sigJ_curr)
-
-            E_curr = -x_curr
-            deltaE_step = n_step * e1_curr + math.sqrt(n_step) * sigE_curr * y1_step
-            E_step_new = E_curr + deltaE_step
-            if E_step_new >= -1e-6:
-                E_step_new = -1e-6
-            x_step_new = -E_step_new
-
-            if x_step_new > x_max:
-                x_step_new = x_max
-                E_step_new = -x_step_new
-
-            Jmax_step_new = 1.0 / math.sqrt(2.0 * x_step_new)
-            Jmax_curr = 1.0 / math.sqrt(2.0 * x_curr)
-            
-            J2_star_curr = sigJ_curr / Jmax_curr if Jmax_curr > 0.0 else 0.0
-            j1_star_curr = j1_curr / Jmax_curr if Jmax_curr > 0.0 else 0.0
-
-            # Current dimensionless angular momentum (0 ≤ j ≤ 1)
-            j_min_curr = j_min_of_x(x_curr, lc_scale_val, noloss_flag, use_sm78_physics)
-            inside_loss_cone = (j_curr <= j_min_curr)
-
-            if use_sm78_physics:
-                # --- Literal SM78 criterion for using the 2D random walk (eq. 28) ---
-                # Text just below eq. (28): when the angular step is "large",
-                # namely sqrt(n) * j2* ≳ J/4, the star's angular momentum is
-                # essentially randomized in an isotropic 2D random walk.
-                #
-                # In our dimensionless variables:
-                #   J = j * Jmax,   j2* is the dimensionless per-orbit coefficient,
-                # and we have already factored Jmax into J2_star_curr.
-                # So we can compare in terms of the dimensionless j:
-                #   sqrt(n) * J2_star_curr  ≳  0.25 * j_curr
-                large_step_2d = (math.sqrt(n_step) * J2_star_curr >= 0.25 * j_curr)
-                low_j = (j_curr <= 0.4)  # SM78: eq. (28) applies when J ≲ 0.4 J_max
-                # Eq. (28) is used only for stars that are already inside the loss cone,
-                # have low angular momentum, AND satisfy the large-step condition.
-                use_2d = inside_loss_cone and low_j and large_step_2d
-            else:
-                # --- Generic / non-SM78 mode: keep your previous "loss-cone-width" logic ---
-                d_lc = max(0.25 * abs(j_curr - j_min_curr), 0.10 * j_min_curr)
-                large_step_lc = (math.sqrt(n_step) * J2_star_curr >= d_lc)
-                low_j = (j_curr <= 0.4)
-                use_2d = inside_loss_cone and low_j and large_step_lc
-
-            if use_2d:
-                z1 = np.random.normal()
-                z2 = np.random.normal()
-                j_step_new = math.sqrt(
-                    (j_curr + math.sqrt(n_step) * z1 * J2_star_curr) ** 2 +
-                    (math.sqrt(n_step) * z2 * J2_star_curr) ** 2
-                )
-            else:
-                j_step_new = j_curr + n_step * j1_star_curr + math.sqrt(n_step) * J2_star_curr * y2_step
-
-            if j_step_new < 0.0:
-                j_step_new = -j_step_new
-            if j_step_new > 1.0:
-                j_step_new = 2.0 - j_step_new
-                if j_step_new < 0.0:
-                    j_step_new = 0.0
-                if j_step_new > 1.0:
-                    j_step_new = 1.0
-            phase_curr += n_step
-
-            x_curr = x_step_new
-            j_curr = j_step_new
-            if will_cross:
-                crossed_peri = True
-            if will_cross and (not noloss_flag):
-                j_min_new = j_min_of_x(x_step_new, lc_scale_val, noloss_flag, use_sm78_physics)
-                if j_step_new < j_min_new:
-                    if not disable_capture:
-                        captured = True
-                        break
-                    else:
-                        ghost_captured = True
-
-        x_new = x_curr
-        j_new = j_curr
-        phase_new = phase_curr
-        n = phase_new - phase
+        if crossed_peri and (not noloss_flag):
+            j_min_new = j_min_of_x(x_new, lc_scale_val, noloss_flag, use_sm78_physics)
+            if j_new < j_min_new:
+                if not disable_capture:
+                    captured = True
+                else:
+                    ghost_captured = True
         
         if ghost_cap_hist is not None and ghost_captured:
             best = 0
@@ -782,7 +755,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         j = math.sqrt(np.random.random())
         phase = 0.0
         w = 1.0
-        parent_floor_idx = floor_index_for_j2(j * j, floors)
+        parent_floor_idx = floor_index_for_u(u_of_x(x), floors)
 
         MAX_CLONES = 65536 if use_clones else 0
         cx = np.zeros(MAX_CLONES, dtype=np.float64)
@@ -839,11 +812,11 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                         else:
                             x = X_BOUND
                     j = math.sqrt(np.random.random())
-                parent_floor_idx = floor_index_for_j2(j * j, floors)
+                parent_floor_idx = floor_index_for_u(u_of_x(x), floors)
             elif use_clones:
-                j2_now = j * j
+                u_now = u_of_x(x)
                 target_idx = target_floor_with_hysteresis(
-                    j2_now, floors, parent_floor_idx, SPLIT_HYST
+                    u_now, floors, parent_floor_idx, SPLIT_HYST
                 )
                 while parent_floor_idx < target_idx:
                     parent_floor_idx += 1
@@ -890,36 +863,23 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                     cph[i] = ph_c2
 
                     if cap_c or (x_c2 < X_BOUND):
-                        if use_sm78_physics:
-                            cx[i], cj[i] = inject_star_sm78()
-                        else:
-                            if noloss_flag:
-                                cx[i] = sample_x_from_g0_jit()
-                            else:
-                                if outer_injection:
-                                    x_inj = sample_x_from_g0_jit()
-                                    while x_inj < outer_inj_x_min:
-                                        x_inj = sample_x_from_g0_jit()
-                                    cx[i] = x_inj
-                                else:
-                                    cx[i] = X_BOUND
-                            cj[i] = math.sqrt(np.random.random())
-                        cph[i] = ph_c2
-                        cfloor_idx[i] = floor_index_for_j2(cj[i] * cj[i], floors)
-                        cactive[i] = 1
+                        # SM78: clones are NOT replaced if consumed or lost;
+                        # they are simply removed after being counted.
+                        cw[i] = 0.0
+                        cactive[i] = 0
                         i += 1
                         continue
 
-                    if cfloor_idx[i] >= 0 and j_c2 * j_c2 >= floors[cfloor_idx[i]]:
+                    if cfloor_idx[i] >= 0 and u_of_x(x_c2) >= floors[cfloor_idx[i]]:
                         w += cw[i]
                         cw[i] = 0.0
                         cactive[i] = 0
                         i += 1
                         continue
 
-                    j2_c = j_c2 * j_c2
+                    u_c = u_of_x(x_c2)
                     target_idx_c = target_floor_with_hysteresis(
-                        j2_c, floors, cfloor_idx[i], SPLIT_HYST
+                        u_c, floors, cfloor_idx[i], SPLIT_HYST
                     )
                     while cfloor_idx[i] < target_idx_c:
                         cfloor_idx[i] += 1
@@ -1031,11 +991,11 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                             else:
                                 x = X_BOUND
                     j = math.sqrt(np.random.random())
-                parent_floor_idx = floor_index_for_j2(j * j, floors)
+                parent_floor_idx = floor_index_for_u(u_of_x(x), floors)
             elif use_clones:
-                j2_now = j * j
+                u_now = u_of_x(x)
                 target_idx = target_floor_with_hysteresis(
-                    j2_now, floors, parent_floor_idx, SPLIT_HYST
+                    u_now, floors, parent_floor_idx, SPLIT_HYST
                 )
                 while parent_floor_idx < target_idx:
                     parent_floor_idx += 1
@@ -1088,60 +1048,30 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                         crossings += 1
 
                     if cap_c or (x_c2 < X_BOUND):
+                        # SM78: clones are NOT replaced if consumed or lost;
+                        # they are simply removed after being counted.
                         if cap_c:
                             caps += 1
                             if cap_hist is not None:
                                 cap_hist[bin_index(x_c)] += 1
                             cap_E_sum += cw[i] * x_c
-                        
-                        if use_sm78_physics:
-                            cx[i], cj[i] = inject_star_sm78()
-                            if inj_hist is not None:
-                                inj_hist[bin_index(cx[i])] += 1
-                        else:
-                            if inj_hist is not None:
-                                if outer_injection and not noloss_flag:
-                                    x_inj = sample_x_from_g0_jit()
-                                    while x_inj < outer_inj_x_min:
-                                        x_inj = sample_x_from_g0_jit()
-                                    cx[i] = x_inj
-                                    inj_hist[bin_index(x_inj)] += 1
-                                elif noloss_flag:
-                                    cx[i] = sample_x_from_g0_jit()
-                                    inj_hist[bin_index(cx[i])] += 1
-                                else:
-                                    cx[i] = X_BOUND
-                                    inj_hist[bin_index(cx[i])] += 1
-                            else:
-                                if noloss_flag:
-                                    cx[i] = sample_x_from_g0_jit()
-                                else:
-                                    if outer_injection:
-                                        x_inj = sample_x_from_g0_jit()
-                                        while x_inj < outer_inj_x_min:
-                                            x_inj = sample_x_from_g0_jit()
-                                        cx[i] = x_inj
-                                    else:
-                                        cx[i] = X_BOUND
-                            cj[i] = math.sqrt(np.random.random())
-                        cph[i] = ph_c2
-                        cfloor_idx[i] = floor_index_for_j2(cj[i] * cj[i], floors)
-                        cactive[i] = 1
+                        cw[i] = 0.0
+                        cactive[i] = 0
                         if ccount > max_ccount:
                             max_ccount = ccount
                         i += 1
                         continue
 
-                    if cfloor_idx[i] >= 0 and j_c2 * j_c2 >= floors[cfloor_idx[i]]:
+                    if cfloor_idx[i] >= 0 and u_of_x(x_c2) >= floors[cfloor_idx[i]]:
                         w += cw[i]
                         cw[i] = 0.0
                         cactive[i] = 0
                         i += 1
                         continue
 
-                    j2_c = j_c2 * j_c2
+                    u_c = u_of_x(x_c2)
                     target_idx_c = target_floor_with_hysteresis(
-                        j2_c, floors, cfloor_idx[i], SPLIT_HYST
+                        u_c, floors, cfloor_idx[i], SPLIT_HYST
                     )
                     while cfloor_idx[i] < target_idx_c:
                         cfloor_idx[i] += 1
