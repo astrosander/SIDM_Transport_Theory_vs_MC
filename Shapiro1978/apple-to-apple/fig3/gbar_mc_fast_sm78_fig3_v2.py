@@ -19,7 +19,7 @@ PSTAR   = 0.005
 X_BOUND = 0.2
 SEED    = 20251028
 
-E1_SCALE_DEFAULT = 1.0
+E1_SCALE_DEFAULT = 1.2
 
 LC_SCALE_DEFAULT = 1.0
 
@@ -86,7 +86,7 @@ def make_gbar_from_occupancy(x_centers, N_x, gexp, x_norm):
     return g_norm, g_raw
 
 
-def make_gbar_from_flux(x_centers, N_cap, N_occ, total_measure, flux_exp, x_norm):
+def make_gbar_from_flux(x_centers, N_cap, N_occ, total_measure, flux_exp, x_norm, show_progress=False):
     x_centers = np.asarray(x_centers, dtype=float)
     N_cap = np.asarray(N_cap, dtype=float)
     N_occ = np.asarray(N_occ, dtype=float)
@@ -100,14 +100,33 @@ def make_gbar_from_flux(x_centers, N_cap, N_occ, total_measure, flux_exp, x_norm
         g_raw[mask] = gamma_cap[mask] / np.power(x_centers[mask], flux_exp)
 
     norm_idx = np.argmin(np.abs(x_centers - x_norm))
-    if g_raw[norm_idx] == 0.0:
-        raise RuntimeError(
-            f"Normalization bin at x={x_norm} has zero g_raw (flux mode); "
-            "need more captures / different x_norm."
-        )
+    
+    # If the requested normalization bin has no captures, find the closest bin with captures
+    if g_raw[norm_idx] == 0.0 or not np.isfinite(g_raw[norm_idx]):
+        # Find all bins with valid (non-zero, finite) g_raw
+        valid_mask = (g_raw > 0.0) & np.isfinite(g_raw)
+        if not np.any(valid_mask):
+            raise RuntimeError(
+                f"No bins with valid g_raw (flux mode); need more captures. "
+                f"Total captures: {N_cap.sum()}, requested x_norm: {x_norm}"
+            )
+        
+        # Find the closest valid bin to the requested normalization point
+        valid_indices = np.where(valid_mask)[0]
+        distances = np.abs(x_centers[valid_indices] - x_norm)
+        closest_valid_idx = valid_indices[np.argmin(distances)]
+        
+        if show_progress:
+            import sys
+            print(
+                f"[diag] flux mode: requested x_norm={x_norm:.3g} has no captures; "
+                f"using x={x_centers[closest_valid_idx]:.3g} (bin {closest_valid_idx}) instead.",
+                file=sys.stderr,
+            )
+        norm_idx = closest_valid_idx
 
     g_norm = g_raw / g_raw[norm_idx]
-    return g_norm, g_raw
+    return g_norm, g_raw, x_centers[norm_idx]
 
 GBAR_X_PAPER = np.array([
     0.2250, 0.3030, 0.4950, 1.0400, 1.2600, 1.6200, 2.3500, 5.0000,
@@ -628,15 +647,29 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             J2_star_curr = sigJ_curr / Jmax_curr if Jmax_curr > 0.0 else 0.0
             j1_star_curr = j1_curr / Jmax_curr if Jmax_curr > 0.0 else 0.0
 
+            # Current dimensionless angular momentum (0 ≤ j ≤ 1)
             j_min_curr = j_min_of_x(x_curr, lc_scale_val, noloss_flag, use_sm78_physics)
             inside_loss_cone = (j_curr <= j_min_curr)
-            
-            d_lc = max(0.25 * abs(j_curr - j_min_curr), 0.10 * j_min_curr)
-            large_step_lc = (math.sqrt(n_step) * J2_star_curr >= d_lc)
 
             if use_sm78_physics:
-                use_2d = inside_loss_cone and large_step_lc
+                # --- Literal SM78 criterion for using the 2D random walk (eq. 28) ---
+                # Text just below eq. (28): when the angular step is "large",
+                # namely sqrt(n) * j2* ≳ J/4, the star's angular momentum is
+                # essentially randomized in an isotropic 2D random walk.
+                #
+                # In our dimensionless variables:
+                #   J = j * Jmax,   j2* is the dimensionless per-orbit coefficient,
+                # and we have already factored Jmax into J2_star_curr.
+                # So we can compare in terms of the dimensionless j:
+                #   sqrt(n) * J2_star_curr  ≳  0.25 * j_curr
+                large_step_2d = (math.sqrt(n_step) * J2_star_curr >= 0.25 * j_curr)
+                # Eq. (28) is used only for stars that are already inside the loss cone
+                # AND satisfy the large-step condition.
+                use_2d = inside_loss_cone and large_step_2d
             else:
+                # --- Generic / non-SM78 mode: keep your previous "loss-cone-width" logic ---
+                d_lc = max(0.25 * abs(j_curr - j_min_curr), 0.10 * j_min_curr)
+                large_step_lc = (math.sqrt(n_step) * J2_star_curr >= d_lc)
                 low_j = (j_curr <= 0.4)
                 use_2d = inside_loss_cone and low_j and large_step_lc
 
@@ -1531,18 +1564,19 @@ def run_parallel_gbar(
                 )
             p_flux = gbar_flux_exp
             N_occ = g_total.copy()
-            gbar_norm, gbar_raw = make_gbar_from_flux(
+            gbar_norm, gbar_raw, x_norm_used = make_gbar_from_flux(
                 x_centers=X_BINS,
                 N_cap=cap_hist_total,
                 N_occ=N_occ,
                 total_measure=total_measure,
                 flux_exp=p_flux,
                 x_norm=gbar_x_norm,
+                show_progress=show_progress,
             )
             if show_progress:
                 print(
                     f"[diag] ḡ mode: using capture flux Γ_cap(x) / x^{p_flux:.2f}, "
-                    f"normalized at x={gbar_x_norm:.3g}",
+                    f"normalized at x={x_norm_used:.3g}",
                     file=sys.stderr,
                 )
         elif debug_occupancy_norm:
@@ -1647,18 +1681,19 @@ def run_parallel_gbar(
                     )
                 N_occ = g_total.copy()
                 p_flux = gbar_flux_exp
-                gbar_norm, gbar_raw = make_gbar_from_flux(
+                gbar_norm, gbar_raw, x_norm_used = make_gbar_from_flux(
                     x_centers=X_BINS,
                     N_cap=cap_hist_total,
                     N_occ=N_occ,
                     total_measure=total_measure,
                     flux_exp=p_flux,
                     x_norm=gbar_x_norm,
+                    show_progress=show_progress,
                 )
                 if show_progress:
                     print(
                         f"[diag] ḡ mode: using capture flux Γ_cap(x) / x^{p_flux:.2f}, "
-                        f"normalized at x={gbar_x_norm:.3g}",
+                        f"normalized at x={x_norm_used:.3g}",
                         file=sys.stderr,
                     )
             else:
@@ -2003,8 +2038,9 @@ def main():
         default=1.0,
         help=(
             "Multiplicative factor on SM78 eq. (29d) loss-cone constraint strength. "
-            "Values > 1.0 make the loss-cone constraint stronger (smaller allowed step sizes), "
-            "increasing capture probability. Use to tune if ḡ(x) is too heavy at high x. "
+            "Values > 1.0 make eq. (29d) more restrictive (smaller allowed angular-momentum "
+            "steps near the loss cone). This changes the capture rate; the effect is best "
+            "calibrated empirically. Use to tune if ḡ(x) is too heavy at high x. "
             "(default: 1.0)"
         ),
     )
@@ -2012,7 +2048,7 @@ def main():
     args = ap.parse_args()
 
     if args.use_sm78_physics:
-        args.e1_scale = 1.0
+        #   
         args.E2_scale = 1.0
         args.J2_scale = 1.0
         args.covEJ_scale = 1.0
@@ -2053,7 +2089,7 @@ def main():
         use_snapshots=args.snapshots,
         snaps_per_t0=args.snaps_per_t0,
         noloss=args.noloss,
-        use_clones=(not args.noloss and not args.gbar_no_clones),
+        use_clones=(not args.noloss),
         lc_scale=args.lc_scale,
         e1_scale=args.e1_scale,
         x_max=None,
