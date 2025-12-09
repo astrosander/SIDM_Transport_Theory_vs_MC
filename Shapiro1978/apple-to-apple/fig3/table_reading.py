@@ -1,15 +1,14 @@
-# Re-run with corrected BW II arrays and full pipeline.
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 
 mpl.rcParams.update({
-    "text.usetex": False,          # use MathText (portable)
-    "font.family": "STIXGeneral",  # match math fonts
+    "text.usetex": False,
+    "font.family": "STIXGeneral",
     "font.size": 12,
     "mathtext.fontset": "stix",
-    "axes.unicode_minus": False,   # proper minus sign
+    "axes.unicode_minus": False,
 })
 
 def sci(cell):
@@ -24,7 +23,6 @@ def sci(cell):
         return float(base.strip()) * (10.0 ** float(expo))
     return float(s)
 
-# ---- Table 2 rows ----
 rows = [
     ("2.25 (-1)", 1.00, 0.04, None, None),
     ("3.03 (-1)", 1.07, 0.06, None, None),
@@ -57,7 +55,6 @@ gbar     = np.array([r[1] for r in rows], dtype=float)
 gbar_err = np.array([r[2] for r in rows], dtype=float)
 Fstar    = np.array([sci(r[3]) if r[3] is not None else np.nan for r in rows], dtype=float)
 Fstar_err= np.array([sci(r[4]) if r[4] is not None else np.nan for r in rows], dtype=float)
-# New data to replace F_E^*\cdot X
 new_data_x = np.array([
     0.225, 0.303, 0.495, 1.04, 1.26, 1.62, 2.35, 5.0, 7.2, 8.94,
     12.1, 19.7, 41.6, 50.3, 64.6, 93.6, 198, 287, 356, 480,
@@ -69,10 +66,9 @@ new_data_y = np.array([
     3.610911e-03, 7.038733e-04, 4.041021e-02, 1.230824e-01, 2.114299e-01,
     1.914627e-01, 2.353178e-01, 1.387421e-01, 1.218783e-01, 6.558564e-03,
     2.027822e-01, 1.329827e-02, 2.959764e-03, 2.431357e-03, 1.675451e-04,
-    9.579539e-05, 1.555108e-04, 0.000000e+00, 0.000000e+00, 0.000000e+00
+    9.579539e-05, 1.555108e-04,     0.000000e+00, 0.000000e+00, 0.000000e+00
 ], dtype=float)
 
-# ---- Data from four runs ----
 run1 = np.array([
     [0.225,0.000000e+00],[0.303,1.000590e-03],[0.495,2.714267e-03],[1.04,5.184111e-03],
     [1.26,4.384712e-03],[1.62,2.186703e-02],[2.35,2.875843e-02],[5,8.892460e-02],
@@ -106,17 +102,14 @@ run4 = np.array([
     [784,2.494038e-03],[1.65e3,1.012183e-03],[2e3,0.000000e+00],[2.57e3,0.000000e+00],[3.73e3,0.000000e+00]
 ])
 
-# ---- Combine four runs and compute mean ± std ----
 runs = [run1, run2, run3, run4]
-x_mc = run1[:, 0]  # X values (should match new_data_x)
+x_mc = run1[:, 0]
 y_all = np.array([r[:, 1] for r in runs])
-y_all[y_all <= 0] = np.nan  # Treat zeros as NaN for statistics
+y_all[y_all <= 0] = np.nan
 
-# Compute mean ± std
 y_mean = np.nanmean(y_all, axis=0)
 y_std = np.nanstd(y_all, axis=0)
 
-# ---- Additional gbar data ----
 gbar_new_data = """1.102485487467425307e-01,0.000000000000000000e+00,0.000000000000000000e+00
 1.340042721099458101e-01,0.000000000000000000e+00,0.000000000000000000e+00
 1.628787421498550381e-01,0.000000000000000000e+00,0.000000000000000000e+00
@@ -177,7 +170,6 @@ gbar_new_data = """1.102485487467425307e-01,0.000000000000000000e+00,0.000000000
 7.462448653723023199e+03,0.000000000000000000e+00,0.000000000000000000e+00
 9.070414181116790132e+03,0.000000000000000000e+00,0.000000000000000000e+00"""
 
-# Parse the data
 lines = gbar_new_data.strip().split('\n')
 x_new_old = []
 gbar_new_old = []
@@ -192,7 +184,6 @@ x_new_old = np.array(x_new_old, dtype=float)
 gbar_new_old = np.array(gbar_new_old, dtype=float)
 gbar_err_new_old = np.array(gbar_err_new_old, dtype=float)
 
-# Use occupancy-based gbar data from long run
 x_new = np.array([
     2.25e-01, 3.03e-01, 4.95e-01, 1.04e+00, 1.26e+00, 1.62e+00, 2.35e+00, 5.00e+00,
     7.20e+00, 8.94e+00, 1.21e+01, 1.97e+01, 4.16e+01, 5.03e+01, 6.46e+01, 9.36e+01,
@@ -206,13 +197,25 @@ gbar_new = np.array([
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 ], dtype=float)
 
-# Estimate errors as a fraction of the value (5% for non-zero, zero for zero values)
 gbar_err_new = np.where(gbar_new > 0, 0.05 * gbar_new, 0.0)
+
+x_single = np.array([
+    0.225, 0.303, 0.495, 1.04, 1.26, 1.62, 2.35, 5.0, 7.2, 8.94,
+    12.1, 19.7, 41.6, 50.3, 64.6, 93.6, 198, 287, 356, 480,
+    784, 1650, 2000, 2570, 3730
+], dtype=float)
+
+gbar_single = np.array([
+    1.000000e+00, 2.536115e+00, 9.557223e+00, 3.648839e+01, 4.881908e+01,
+    6.655834e+01, 9.395544e+01, 1.999275e+02, 2.558708e+02, 2.931486e+02,
+    3.651242e+02, 5.391865e+02, 1.209974e+03, 1.343570e+03, 1.720973e+03,
+    2.469160e+03, 7.029859e+03, 9.570994e+03, 0.000000e+00, 0.000000e+00,
+    0.000000e+00, 0.000000e+00, 0.000000e+00, 0.000000e+00, 0.000000e+00
+], dtype=float)
 
 FE_x     = Fstar * x_vals
 FE_x_err = Fstar_err * x_vals
 
-# ---- BW II Table 1 -> g0(X) ----
 ln1p = np.array([
     0.00, 0.37, 0.74, 1.11, 1.47, 1.84, 2.21, 2.58, 2.95, 3.32,
     3.68, 4.05, 4.42, 4.79, 5.16, 5.53, 5.89, 6.26, 6.63, 7.00,
@@ -252,7 +255,6 @@ if tail.any():
     g_start = g0_line[tail][0]
     g0_line[tail] = np.maximum(g_start * (1 - (X_line[tail] - X_last)/(1e4 - X_last)), 1e-16)
 
-# ---- Save CSVs ----
 pd.DataFrame({"x": x_vals, "gbar": gbar, "gbar_err": gbar_err}).to_csv("/mnt/data/figure3_gbar.csv", index=False)
 pd.DataFrame({"x": x_vals, "Fstar": Fstar, "Fstar_err": Fstar_err, "FE_x": FE_x, "FE_x_err": FE_x_err}).to_csv("/mnt/data/figure3_FEx.csv", index=False)
 pd.DataFrame({"x": new_data_x, "y": new_data_y}).to_csv("/mnt/data/figure3_new_data.csv", index=False)
@@ -261,34 +263,30 @@ pd.DataFrame({"x": x_mc, "y_mean": y_mean, "y_std": y_std}).to_csv("/mnt/data/fi
 pd.DataFrame({"x": x_new, "gbar": gbar_new, "gbar_err": gbar_err_new}).to_csv("/mnt/data/figure3_gbar_new.csv", index=False)
 pd.DataFrame({"x": x_new, "gbar_occ_long": gbar_new, "gbar_err_occ_long": gbar_err_new}).to_csv("/mnt/data/figure3_gbar_occ_long.csv", index=False)
 
-# ---- Plot ----
 plt.figure(figsize=(6,5), dpi=140)
 plt.xscale("log")
 plt.yscale("log")
 plt.xlim(1e-1, 1e4)
 plt.ylim(1e-3, 1e2)
 
-# Theory line: sophisticated dark blue-gray
 plt.plot(X_line, g0_line, linewidth=2, color="#2C3E50", label=r"$g_0$ (BW II)", alpha=0.9)
 
 mask_g = ~np.isnan(gbar)
-# Paper gbar: professional blue
 plt.errorbar(x_vals[mask_g], gbar[mask_g], yerr=gbar_err[mask_g],
              fmt="o", markersize=4, capsize=2, color="#3498DB", 
              label=r"$\bar{g}$ (SM78)", elinewidth=1.2, alpha=0.85)
 for i in range(len(x_vals[mask_g])):
     print(f"X_val={x_vals[mask_g][i]:.4f}\tgbar[mask_g]={gbar[mask_g][i]:.4f}\tgbar_err[mask_g]={gbar_err[mask_g][i]:.4f}")
 
-# print(gbar=gbar)
-# print(gbar_err)
-
-
-# Plot additional gbar data (occupancy-based from long run)
-# Simulation gbar: vibrant coral/salmon (complementary to blue)
-mask_g_new = (gbar_new > 0)  # Only plot non-zero values
+mask_g_new = (gbar_new > 0)
 plt.errorbar(x_new[mask_g_new], gbar_new[mask_g_new], yerr=gbar_err_new[mask_g_new],
              fmt="D", markersize=4, capsize=2, alpha=0.85, color="#E74C3C",
              label=r"$\bar{g}$ (simulation)", elinewidth=1.2)
+
+mask_g_single = (gbar_single > 0)
+plt.plot(x_single[mask_g_single], gbar_single[mask_g_single],
+         marker="*", markersize=6, linestyle="None", alpha=0.85, color="#F39C12",
+         label=r"$\bar{g}$ (simulation, 1 replicate)", markeredgewidth=0.5)
 
 mask_f = ~np.isnan(FE_x)
 rel_err = np.zeros_like(FE_x)
@@ -296,26 +294,17 @@ rel_err[mask_f] = (FE_x_err[mask_f] / np.maximum(FE_x[mask_f], 1e-99))
 large = mask_f & (rel_err >= 0.6)
 small = mask_f & ~large
 
-# Paper flux: teal/cyan
 plt.errorbar(x_vals[small], FE_x[small], yerr=FE_x_err[small],
              fmt="s", markersize=4, capsize=2, color="#16A085", 
              label=r"$F_E^*\cdot X$ (MS78)", elinewidth=1.2, alpha=0.85)
-# plt.errorbar(x_vals[large], FE_x[large], yerr=FE_x_err[large],
-#              fmt="s", mfc="none", markersize=5, capsize=2, label="large-error points")
 
-# Plot MC data with mean ± std error bars
-# Simulation flux: vibrant magenta (complementary to teal)
-mask_mc = ~np.isnan(y_mean) & (y_mean > 0)  # Only plot non-zero, non-NaN values
+mask_mc = ~np.isnan(y_mean) & (y_mean > 0)
 plt.errorbar(x_mc[mask_mc], y_mean[mask_mc], yerr=y_std[mask_mc],
              fmt="^", markersize=5, capsize=3, capthick=1.5,
              label=r"$F_E^*\cdot X$ (simulation)", alpha=0.85, color="#9B59B6", elinewidth=1.5)
 
-# plt.annotate(r"$x_{\rm crit}=10$", xy=(10, 1e-1), xytext=(12, 2e-1),
-#              arrowprops=dict(arrowstyle="->", lw=1))
-
 plt.xlabel(r"$X \equiv (-E/v_0^2)$")
 plt.ylabel(r"$\bar g(E),\  F_E^*\cdot X$, MC")
-# plt.title("Reproduction of Fig. 3 (canonical case: $x_{\\rm crit}=10,\\ x_D=10^4$)")
 plt.legend(loc="lower left", fontsize=9)
 plt.tight_layout()
 plt.savefig("figure3_repro.png")
