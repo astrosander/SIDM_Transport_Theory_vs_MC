@@ -2,84 +2,32 @@
 """
 Monte Carlo reproduction of Shapiro & Marchant (1978) Fig. 3
 
-We implement a simplified version of their 2D (E, J) Monte Carlo scheme
-with the loss-cone boundary condition and then compute the isotropized
-distribution function ḡ(x) for the “canonical” case
+This version adds multi-CPU parallelism via multiprocessing:
 
-    x_crit = 10
-    x_D    = 1e4
+- We keep the core run_simulation() unchanged (single-process MC).
+- We add run_simulation_task() as a small wrapper so it can be used
+  with multiprocessing.Pool.map.
+- main() runs multiple independent replicas of the simulation
+  in parallel and averages the resulting ḡ(x).
 
-We also compute the Bahcall–Wolf (BW) 1D “no-loss-cone” solution g0(x)
-from the tabulated values (LN1P, G0_TAB).
+If you want to add numba JIT on top of this, the easiest wins are:
+- JIT the purely numerical helpers (g0_bw, interpolate_orbital_coeffs,
+  j_min_of_x, orbital_period_star) with @numba.njit.
+- You still keep multiprocessing for multi-core, but each process
+  runs a faster JIT-compiled kernel.
 
-The main goal is to numerically produce a ḡ(x) that is qualitatively
-(and roughly quantitatively) similar to the one plotted in Fig. 3
-of Shapiro & Marchant (1978).
-
-Notes / approximations vs. the paper:
-
-- We work in dimensionless units with v0 = 1 and M = 1.
-- We set P* = 0.005 and x_D = 1e4 as in their “canonical” case.
-- We use their tabulated dimensionless orbital perturbations
-      NEG_E1, E2, J1, J2, ZETA2
-  which correspond to the *dimensionless* coefficients
-  (ε1*, ε2*, j1*, j2*, ζ*²) at discrete (x, j) points.
-- For x we interpolate linearly in ln x between the list
-  X_BINS (which is exactly the x values of the table rows).
-- For j we interpolate linearly in j between the 5 tabulated values
-  j_grid = [1.0, 0.401, 0.161, 0.065, 0.026].
-- We follow test-star motion in (x, j) using an approximate
-  version of their step-adjustment algorithm. The exact
-  algorithm in the paper is quite complex; here we capture
-  the main constraints:
-    * steps small in x and j
-    * smaller near the loss cone
-    * smaller near j ~ 1 where cross-correlation is important
-- Loss-cone boundary: stars are removed if j < j_min(x) and
-  they are at “pericenter” (we keep a cycle counter in units
-  of orbital periods and only allow capture at integer cycles).
-- Outer energy boundary at x_b ~ 0.2 (following the paper);
-  we “reinject” bound stars that wander out to x < x_b with
-  new isotropic (x, j) near x ~ 0.2.
-- We ignore the creation–annihilation cloning scheme of the paper
-  and instead just use a reasonably large number of stars
-  and long integration time.
-
-This is *not* an exact reproduction of their code but is a
-faithful implementation of the method as described in the text,
-sufficient to:
-  * illustrate the algorithm,
-  * produce a reasonable ḡ(x) curve,
-  * show that in the no-loss-cone case ḡ ≈ g0.
-
-The script:
-
-- Defines all constants and tables you gave.
-- Implements:
-    * interpolation of BW g0(x)
-    * interpolation of orbital perturbations at (x, j)
-    * loss-cone boundary j_min(x)
-    * time-step adaptation
-    * Monte Carlo update rule (Δx, Δj)
-    * measurement of ḡ(x) on X_BINS
-- Runs two simulations:
-    1) “no-loss-cone” check
-    2) full loss-cone with x_crit ~ 10
-- Produces a single matplotlib plot:
-    * ḡ(x) (no loss cone)
-    * ḡ(x) (with loss cone)
-    * g0(x) (“BW” 1D solution)
-    * GBAR_PAPER with error bars (the original Fig. 3 data)
-
-You can tune:
-    N_STARS, N_STEPS, MEASURE_START, MEASURE_EVERY
-to trade off between CPU time and Monte Carlo noise.
+Everything below is self-contained: no argparse, one file.
 """
 
 import numpy as np
 import math
 import random
 import matplotlib.pyplot as plt
+from multiprocessing import Pool, cpu_count
+
+# If you want to use numba later, uncomment these lines:
+from numba import njit
+# and then decorate some hot functions (see comments near them).
 
 # -------------------------------------------------------------
 # Constants / tables from the prompt
@@ -90,6 +38,10 @@ X_BINS = np.array([
     12.1, 19.7, 41.6, 50.3, 64.6, 93.6, 198., 287., 356., 480.,
     784., 1650., 2000., 2570., 3730.
 ], dtype=np.float64)
+
+# Precompute log bins once (used for snapshot binning)
+LOGX_BINS = np.log(X_BINS)
+
 
 GBAR_X_PAPER = np.array([
     0.2250, 0.3030, 0.4950, 1.0400, 1.2600, 1.6200, 2.3500, 5.0000,
@@ -165,14 +117,14 @@ ZETA2 = np.array([
     [6.03e-4, 2.38e-4, 9.53e-5, 3.82e-5, 1.53e-5],
 ], dtype=np.float64)
 
-# x grid and j grid for those tables (from Table 1 description)
+# x grid and j grid for those tables (from Table 1)
 X_TABLE = np.array([3.36e-1, 3.31, 3.27e1, 3.23e2, 3.18e3], dtype=np.float64)
 J_GRID  = np.array([1.0, 0.401, 0.161, 0.065, 0.026], dtype=np.float64)
 
 # Canonical parameters
 P_STAR = 0.005   # P* (dimensionless period at x=1)
 X_D    = 1.0e4   # x_D = M/(2 r_D v0^2)
-X_CRIT_TARGET = 10.0  # mainly “for consistency”
+X_CRIT_TARGET = 10.0  # not directly used, but we're in that regime
 
 # Outer cusp boundary (as in § IIIe)
 X_B = 0.20
@@ -181,6 +133,8 @@ X_B = 0.20
 # Helper functions
 # -------------------------------------------------------------
 
+# If you want numba, you can do:
+@njit(cache=True)
 def g0_bw(x):
     """
     Bahcall–Wolf 1D BW solution g0(x) via linear interpolation in ln(1+x).
@@ -199,6 +153,7 @@ def g0_bw(x):
     return (1.0 - t)*G0_TAB[i] + t*G0_TAB[i+1]
 
 
+@njit(cache=True)
 def interpolate_orbital_coeffs(x, j):
     """
     Interpolate the dimensionless orbital perturbations at (x, j):
@@ -228,7 +183,6 @@ def interpolate_orbital_coeffs(x, j):
               (log_x_tab[ix+1] - log_x_tab[ix]))
 
     # Indices in j (linear)
-    # J_GRID is descending [1.0, 0.401, 0.161, 0.065, 0.026]
     jg = J_GRID
     if j_cl >= jg[0]:
         ij = 0
@@ -260,6 +214,7 @@ def interpolate_orbital_coeffs(x, j):
     return eps1_star, eps2_star, j1_star, j2_star, zeta2_star
 
 
+@njit(cache=True)
 def j_min_of_x(x):
     """
     Loss-cone boundary j_min(x) = sqrt(2 x / x_D - x^2 / x_D^2).
@@ -268,22 +223,22 @@ def j_min_of_x(x):
     if x <= 0.0:
         return 0.0
     if x >= X_D:
-        return 1.0  # doesn't matter; we won't go this far
+        return 1.0
     val = 2.0*x/X_D - (x**2)/(X_D**2)
     if val <= 0.0:
         return 0.0
     return math.sqrt(val)
 
 
+@njit(cache=True)
 def orbital_period_star(x):
     """
     Dimensionless orbital period P*(x) = P(x) / τ0.
     From Eq. (26) scaling: P* at x=1 is given; roughly P(x) ∝ x^(-3/2),
     so P*(x) ≈ P_STAR * x^(-3/2).
-    This is exactly the factor in front of ∂g/∂τ in Eq. (26).
     """
     if x <= 0.0:
-        x = 1.0  # not used in unbound regime here
+        x = 1.0
     return P_STAR * x**(-1.5)
 
 
@@ -295,34 +250,25 @@ def choose_time_step(x, j, eps2_star, j2_star):
         sqrt(n) * eps2* << x
         sqrt(n) * j2*   << 1
         sqrt(n) * j2*   << j_min constraints near the loss cone, etc.
-    We will pick n as the minimum over a few constraints.
+    We pick n as the minimum over a few constraints.
 
     Returns:
         n  (dimensionless number of orbital periods),
         dt = n * P*(x)
     """
-    # If x is very small, avoid crazy periods
     x_eff = max(x, 1e-3)
-    # Base constraints (Eq. 29-ish, but simplified)
-    # Avoid division by zero
     eps2 = abs(eps2_star)
     j2   = abs(j2_star)
 
     constraints = []
 
-    # (29a) n^(1/2) eps2 <= 0.15 |E| → E ~ v0^2 x, with v0^2=1
     if eps2 > 0:
         constraints.append((0.15 * x_eff / eps2)**2)
 
-    # (29b) n^(1/2) j2 <= 0.1 J_max (dimensionless j2* already normalized)
     if j2 > 0:
         constraints.append((0.1 / j2)**2)
-
-    # (29c) n^(1/2) j2 <= 0.4 (1.0075 − j)
-    if j2 > 0:
         constraints.append((0.4 * (1.0075 - j) / j2)**2)
 
-    # Loss-cone constraint (approx; Eq. 29d)
     jmin = j_min_of_x(x_eff)
     if j2 > 0 and jmin > 0:
         d1 = 0.25 * abs(j - jmin)
@@ -335,8 +281,6 @@ def choose_time_step(x, j, eps2_star, j2_star):
         n = 1e-3
     else:
         n = min(constraints)
-        # Cap to avoid absurdly large n; the paper uses huge n,
-        # but we just need a moderate to small fraction of a period
         n = max(min(n, 1.0), 1e-5)
 
     dt = n * orbital_period_star(x_eff)
@@ -350,19 +294,14 @@ def correlated_normals(zeta2_star, eps2_star, j2_star):
         Var[y1] = Var[y2] = 1
         Cov[y1, y2] = zeta2* / (eps2* j2*)
 
-    This implements the Appendix B algorithm in spirit, but
-    uses a simpler Gaussian correlation if the required
-    correlation coefficient is in [-1, 1].
+    Uses a standard Gaussian correlation construction.
     """
     if eps2_star == 0.0 or j2_star == 0.0:
-        # No correlation needed
         return random.gauss(0, 1), random.gauss(0, 1)
 
     rho = zeta2_star / (eps2_star * j2_star)
-    # Numerically clamp
     rho = max(min(rho, 0.999), -0.999)
 
-    # Standard method: y1 ~ N(0,1); y2 = rho y1 + sqrt(1-rho^2) z
     y1 = random.gauss(0, 1)
     z  = random.gauss(0, 1)
     y2 = rho * y1 + math.sqrt(1.0 - rho*rho) * z
@@ -373,19 +312,14 @@ def initialize_star(bound=True, x_outer=X_B):
     """
     Initialize a star in the cusp boundary, x slightly above x_outer.
     We choose x from a narrow band [x_outer, 1.5 x_outer] with probability
-    proportional to g0(x) x^{-9/4} (since N(E) ~ x^{-9/4} g(x)).
-
-    j is chosen isotropically: j^2 uniform on [0,1] => j = sqrt(u).
+    proportional to g0(x).
     """
-    # Basic sampling: just pick uniformly in ln x and weight by g0(x)
     ln_x_min = math.log(x_outer)
     ln_x_max = math.log(1.5 * x_outer)
     ln_x = ln_x_min + random.random() * (ln_x_max - ln_x_min)
     x = math.exp(ln_x)
     g = g0_bw(x)
-    # Rejection sampling: accept with probability g / g_max
-    # approximate g_max from table near that region
-    g_max = 3.0  # safe upper bound for that x range
+    g_max = 3.0  # safe upper bound
     if random.random() > min(1.0, g / g_max):
         x = x_outer
 
@@ -403,7 +337,7 @@ def reinject_star(star):
 
 
 # -------------------------------------------------------------
-# Monte Carlo simulation
+# Monte Carlo simulation (single-process)
 # -------------------------------------------------------------
 
 def run_simulation(
@@ -417,61 +351,40 @@ def run_simulation(
     """
     Run a Monte Carlo simulation of n_stars test stars for n_steps.
     If loss_cone=False, we artificially set j_min(x) ≡ 0 to remove
-    loss-cone capture and mimic the “no-loss-cone” test.
+    loss-cone capture (no-loss-cone test).
 
     We measure ḡ(x) on the X_BINS grid after measure_start steps,
-    every measure_every steps, by averaging g(x) of all stars in
-    each x-bin.
+    every measure_every steps, by averaging over a set of snapshots.
 
     Returns:
-        gbar_mean  (same length as X_BINS)
-        gbar_std   (same length as X_BINS)
+        gbar_mean  (len(X_BINS))
+        gbar_std   (len(X_BINS))
     """
     random.seed(rng_seed)
 
-    # Each star: (x, j, cycle), where "cycle" is the accumulated
-    # number of orbital periods since creation (sum of n).
     stars = [initialize_star() for _ in range(n_stars)]
 
-    # Accumulators for gbar
-    # We'll collect multiple “snapshots” and compute mean, std at the end.
     snapshots = []
 
-    # Precompute bin ranges in log x for better statistics
     logX_bins = np.log(X_BINS)
-    # We'll just use simple nearest-bin in log space for ḡ(x).
 
     def record_snapshot():
         xs = np.array([s[0] for s in stars])
-        js = np.array([s[1] for s in stars])
-        # We want gbar(x_bin) ~ < g(x) > over that range.
-        # We approximate g(x) ~ BW g0(x) times correction from
-        # relative occupancy vs BW. To keep things simple, we
-        # just measure the star counts in each decade of x and
-        # define gbar ∝ counts / x^{-9/4}, then renormalize so
-        # that at small x we match g0(x).
+        logxs = np.log(xs)
         gbar = np.zeros(len(X_BINS))
         counts = np.zeros(len(X_BINS))
 
-        logxs = np.log(xs)
-        for xi in range(len(xs)):
-            lx = logxs[xi]
-            # nearest bin in log space
+        for lx in logxs:
             idx = np.argmin(np.abs(logX_bins - lx))
             counts[idx] += 1.0
 
-        # Turn counts into ḡ by dividing out the BW X^{-9/4} weighting
-        # and then scaling such that at the smallest x we have ḡ ≈ g0.
         for i, x_bin in enumerate(X_BINS):
             if counts[i] <= 0:
                 gbar[i] = 0.0
             else:
-                # Use g0(x) as base shape; we will renormalize across bins
-                gbar[i] = counts[i]  # temporary
+                gbar[i] = counts[i]
 
-        # Renormalize by requiring that at the lowest x bins
-        # we match g0 (roughly isotropic, no depletion).
-        # Use first three points as calibration.
+        # Normalize by matching small-x bins to g0(x)
         idxs = [0, 1, 2]
         s_num = 0.0
         s_den = 0.0
@@ -479,86 +392,58 @@ def run_simulation(
             if gbar[i] > 0:
                 s_num += g0_bw(X_BINS[i])
                 s_den += gbar[i]
-        if s_den > 0:
-            scale = s_num / s_den
-        else:
-            scale = 1.0
-
+        scale = s_num / s_den if s_den > 0 else 1.0
         for i in range(len(gbar)):
-            gbar[i] = gbar[i] * scale
+            gbar[i] *= scale
 
         snapshots.append(gbar)
 
-    # Main loop
     next_measure = measure_start
 
     for step in range(n_steps):
-        # Evolve each star one step
         new_stars = []
         for (x, j, cycle) in stars:
-            # Orbital coefficients (dimensionless)
             eps1_star, eps2_star, j1_star, j2_star, zeta2_star = \
                 interpolate_orbital_coeffs(max(x, X_TABLE[0]), max(j, J_GRID[-1]))
 
-            # Choose time step
             n, dt = choose_time_step(x, j, eps2_star, j2_star)
-
-            # Orbital “age” update
             cycle_new = cycle + n
 
-            # Draw correlated random deviates for E and J
             y1, y2 = correlated_normals(zeta2_star, eps2_star, j2_star)
 
-            # Update x and j (dimensionless)
-            # x change ~ ΔE / v0^2, and eps1_star, eps2_star are per orbit,
-            # so Δx = n*eps1* + sqrt(n)*eps2* y1.
             dx = n * eps1_star + math.sqrt(n) * eps2_star * y1
             x_new = x + dx
 
-            # Similarly for j
             dj = n * j1_star + math.sqrt(n) * j2_star * y2
             j_new = j + dj
 
-            # Reflect or clip j at 0 and 1 due to geometry / boundary (ii)
             if j_new < 0.0:
                 j_new = -j_new
             if j_new > 1.0:
-                # Instead of discarding, reflect near J_max,
-                # but if it overshoots badly, just clip.
                 j_new = 2.0 - j_new
                 if j_new < 0.0:
                     j_new = 0.0
                 if j_new > 1.0:
                     j_new = 1.0
 
-            # Now apply boundary conditions:
-            # Outer cusp: if x < X_B, star escapes to the core
-            # (for bound stars); we reinject it.
+            # outer boundary
             if x_new < X_B:
                 new_stars.append(reinject_star((x, j, cycle_new)))
                 continue
 
-            # Inner “disruption” energy: x <= x_D is allowed;
-            # if x is extremely large, also reinject to avoid blow-up.
+            # extreme inner bound
             if x_new > 2.0 * X_D:
                 new_stars.append(reinject_star((x, j, cycle_new)))
                 continue
 
-            # Loss cone: check only if we are at pericenter,
-            # i.e. cycle_new has passed an integer number of orbits.
-            # The paper uses an integer count of orbits; we approximate
-            # by checking if floor(cycle_new) > floor(cycle).
             captured = False
             if loss_cone:
                 if math.floor(cycle_new + 1e-9) > math.floor(cycle + 1e-9):
-                    # At pericenter for the first time after this step
                     jmin = j_min_of_x(x_new)
                     if j_new < jmin:
-                        # Captured by BH
                         captured = True
 
             if captured:
-                # Reinjection from the core
                 new_stars.append(reinject_star((x, j, cycle_new)))
             else:
                 new_stars.append((x_new, j_new, cycle_new))
@@ -569,11 +454,10 @@ def run_simulation(
             record_snapshot()
             next_measure += measure_every
 
-    # Aggregate snapshots
     if not snapshots:
-        raise RuntimeError("No snapshots recorded; increase n_steps or decrease measure_start.")
+        raise RuntimeError("No snapshots recorded; adjust n_steps/measure_start.")
 
-    snapshots = np.array(snapshots)  # shape (n_snapshots, n_bins)
+    snapshots = np.array(snapshots)
     gbar_mean = snapshots.mean(axis=0)
     gbar_std  = snapshots.std(axis=0)
 
@@ -581,35 +465,293 @@ def run_simulation(
 
 
 # -------------------------------------------------------------
-# Main driver: run both simulations and plot
+# Parallel wrapper for multi-CPU use
+# -------------------------------------------------------------
+
+def _warmup_numba():
+    """
+    Warm up numba-compiled functions by calling them with dummy inputs.
+    This ensures they're compiled in each worker process before actual use.
+    """
+    # Warm up g0_bw
+    g0_bw(0.5)
+    g0_bw(10.0)
+    g0_bw(100.0)
+    
+    # Warm up interpolate_orbital_coeffs
+    interpolate_orbital_coeffs(1.0, 0.5)
+    interpolate_orbital_coeffs(10.0, 0.3)
+    interpolate_orbital_coeffs(100.0, 0.1)
+    
+    # Warm up j_min_of_x
+    j_min_of_x(1.0)
+    j_min_of_x(100.0)
+    j_min_of_x(1000.0)
+    
+    # Warm up orbital_period_star
+    orbital_period_star(1.0)
+    orbital_period_star(10.0)
+
+
+def _closest_log_bin_indices(logxs: np.ndarray) -> np.ndarray:
+    """
+    For each log(x), return the index of the closest LOGX_BINS entry.
+    Uses searchsorted + neighbor check (fast, vectorized).
+    """
+    idx = np.searchsorted(LOGX_BINS, logxs, side="left")
+    idx = np.clip(idx, 0, len(LOGX_BINS) - 1)
+    has_left = idx > 0
+    left = idx - 1
+    choose_left = has_left & (np.abs(logxs - LOGX_BINS[left]) < np.abs(logxs - LOGX_BINS[idx]))
+    idx[choose_left] = left[choose_left]
+    return idx
+
+
+def update_stars_batch_full(args):
+    """
+    Update a batch of stars for the entire simulation, returning snapshots.
+    This minimizes communication by doing all work in one go.
+    
+    args = (stars_batch, loss_cone, n_steps, measure_start, measure_every, batch_idx, base_seed)
+    Returns: (final_stars, snapshot_counts_list)
+        snapshot_counts_list: list of (step_num, counts_array) tuples for measurement steps,
+        where counts_array has shape (len(X_BINS),)
+    """
+    stars_batch, loss_cone, n_steps, measure_start, measure_every, batch_idx, base_seed = args
+    
+    # Set initial seed for this batch
+    random.seed(base_seed + batch_idx)
+    
+    stars = stars_batch[:]  # Copy the list
+    snapshot_counts_list = []
+    
+    for step in range(n_steps):
+        new_stars = []
+        
+        for (x, j, cycle) in stars:
+            eps1_star, eps2_star, j1_star, j2_star, zeta2_star = \
+                interpolate_orbital_coeffs(max(x, X_TABLE[0]), max(j, J_GRID[-1]))
+
+            n, dt = choose_time_step(x, j, eps2_star, j2_star)
+            cycle_new = cycle + n
+
+            y1, y2 = correlated_normals(zeta2_star, eps2_star, j2_star)
+
+            dx = n * eps1_star + math.sqrt(n) * eps2_star * y1
+            x_new = x + dx
+
+            dj = n * j1_star + math.sqrt(n) * j2_star * y2
+            j_new = j + dj
+
+            if j_new < 0.0:
+                j_new = -j_new
+            if j_new > 1.0:
+                j_new = 2.0 - j_new
+                if j_new < 0.0:
+                    j_new = 0.0
+                if j_new > 1.0:
+                    j_new = 1.0
+
+            # outer boundary
+            if x_new < X_B:
+                new_stars.append(reinject_star((x, j, cycle_new)))
+                continue
+
+            # extreme inner bound
+            if x_new > 2.0 * X_D:
+                new_stars.append(reinject_star((x, j, cycle_new)))
+                continue
+
+            captured = False
+            if loss_cone:
+                if math.floor(cycle_new + 1e-9) > math.floor(cycle + 1e-9):
+                    jmin = j_min_of_x(x_new)
+                    if j_new < jmin:
+                        captured = True
+
+            if captured:
+                new_stars.append(reinject_star((x, j, cycle_new)))
+            else:
+                new_stars.append((x_new, j_new, cycle_new))
+        
+        stars = new_stars
+        
+        # Record snapshot bin counts at measurement steps (tiny payload back to parent process)
+        if step >= measure_start and (step - measure_start) % measure_every == 0:
+            xs = np.array([s[0] for s in stars], dtype=np.float64)
+            logxs = np.log(xs)
+            indices = _closest_log_bin_indices(logxs)
+            counts = np.bincount(indices, minlength=len(X_BINS)).astype(np.float64)
+            snapshot_counts_list.append((step, counts))
+    
+    return stars, snapshot_counts_list
+
+
+def run_simulation_parallel(
+        n_stars=500,
+        n_steps=200000,
+        loss_cone=True,
+        measure_start=5000,
+        measure_every=100,
+        rng_seed=42,
+        n_procs=4,
+        pool=None
+    ):
+    """
+    Run a parallel Monte Carlo simulation where all processes work together
+    on a single simulation by splitting stars across processes.
+    
+    Returns:
+        gbar_mean  (len(X_BINS))
+        gbar_std   (len(X_BINS))
+    """
+    random.seed(rng_seed)
+    
+    # Initialize all stars in main process
+    all_stars = [initialize_star() for _ in range(n_stars)]
+    
+    # Split stars across processes
+    stars_per_proc = n_stars // n_procs
+    star_batches = []
+    for i in range(n_procs):
+        start_idx = i * stars_per_proc
+        if i == n_procs - 1:
+            # Last process gets remaining stars
+            end_idx = n_stars
+        else:
+            end_idx = (i + 1) * stars_per_proc
+        star_batches.append(all_stars[start_idx:end_idx])
+    
+    snapshots = []
+    
+    created_pool = False
+    if pool is None:
+        # Warm up numba in main process
+        _warmup_numba()
+        pool = Pool(processes=n_procs, initializer=_warmup_numba)
+        created_pool = True
+
+    try:
+        # Prepare arguments for each batch - each processes full simulation
+        batch_args = [
+            (star_batches[i], loss_cone, n_steps, measure_start, measure_every, i, rng_seed)
+            for i in range(n_procs)
+        ]
+
+        # Run full simulation for each batch in parallel
+        results = pool.map(update_stars_batch_full, batch_args)
+
+        # Extract final stars and snapshot bin-counts
+        final_batches = []
+        all_counts_by_step = {}
+
+        for i, (final_stars, snapshot_counts_list) in enumerate(results):
+            final_batches.append(final_stars)
+            for step_num, counts in snapshot_counts_list:
+                if step_num not in all_counts_by_step:
+                    all_counts_by_step[step_num] = []
+                all_counts_by_step[step_num].append(counts)
+
+        star_batches = final_batches
+
+        # Combine snapshots from all batches at each measurement step (sum counts)
+        for step_num in sorted(all_counts_by_step.keys()):
+            total_counts = np.sum(np.stack(all_counts_by_step[step_num], axis=0), axis=0)
+            gbar = total_counts.astype(np.float64, copy=True)
+
+            # Normalize by matching small-x bins to g0(x)
+            idxs = [0, 1, 2]
+            s_num = 0.0
+            s_den = 0.0
+            for i in idxs:
+                if gbar[i] > 0:
+                    s_num += g0_bw(X_BINS[i])
+                    s_den += gbar[i]
+            scale = s_num / s_den if s_den > 0 else 1.0
+            gbar *= scale
+
+            snapshots.append(gbar)
+    finally:
+        if created_pool:
+            pool.close()
+            pool.join()
+    
+    if not snapshots:
+        raise RuntimeError("No snapshots recorded; adjust n_steps/measure_start.")
+    
+    snapshots = np.array(snapshots)
+    gbar_mean = snapshots.mean(axis=0)
+    gbar_std  = snapshots.std(axis=0)
+    
+    return gbar_mean, gbar_std
+
+
+def run_simulation_task(args):
+    """
+    Small wrapper so we can call run_simulation via Pool.map.
+    (Kept for backward compatibility, but not used in new parallel mode)
+
+    args = (loss_cone, seed, n_stars, n_steps, measure_start, measure_every)
+    """
+    (loss_cone, seed, n_stars, n_steps, measure_start, measure_every) = args
+    gbar_mean, gbar_std = run_simulation(
+        n_stars=n_stars,
+        n_steps=n_steps,
+        loss_cone=loss_cone,
+        measure_start=measure_start,
+        measure_every=measure_every,
+        rng_seed=seed,
+    )
+    return gbar_mean  # we only use the mean across replicas
+
+
+# -------------------------------------------------------------
+# Main driver: run multiple replicas in parallel and plot
 # -------------------------------------------------------------
 
 def main():
-    # Parameters – tune as needed
+    # Base MC parameters – you can tune for quality vs. speed
     N_STARS = 800
-    N_STEPS = 3000#00
-    MEASURE_START = 200#00
-    MEASURE_EVERY = 5#00
+    N_STEPS = 300000
+    MEASURE_START = 20000
+    MEASURE_EVERY = 500
 
-    print("Running no-loss-cone check...")
-    gbar_nolc, gbar_nolc_err = run_simulation(
-        n_stars=N_STARS,
-        n_steps=N_STEPS,
-        loss_cone=False,
-        measure_start=MEASURE_START,
-        measure_every=MEASURE_EVERY,
-        rng_seed=123
-    )
+    # Parallelism parameters
+    # On Windows, using too many worker processes for too few stars is slower (spawn + pickling overhead).
+    # Heuristic: aim for ~200 stars per process, capped to 8.
+    TARGET_STARS_PER_PROC = 200
+    N_PROCS = min(cpu_count(), 8, max(1, N_STARS // TARGET_STARS_PER_PROC))
 
-    print("Running full loss-cone simulation...")
-    gbar_lc, gbar_lc_err = run_simulation(
-        n_stars=N_STARS,
-        n_steps=N_STEPS,
-        loss_cone=True,
-        measure_start=MEASURE_START,
-        measure_every=MEASURE_EVERY,
-        rng_seed=456
-    )
+    # Warm up numba functions in main process (helps with compilation)
+    print("Warming up numba JIT functions...")
+    _warmup_numba()
+    print("Done warming up.")
+
+    # Reuse a single Pool for both runs to avoid paying Windows spawn overhead twice.
+    with Pool(processes=N_PROCS, initializer=_warmup_numba) as pool:
+        print(f"Running no-loss-cone simulation with {N_STARS} stars, {N_PROCS} CPUs working together...")
+        gbar_nolc_mean, gbar_nolc_std = run_simulation_parallel(
+            n_stars=N_STARS,
+            n_steps=N_STEPS,
+            loss_cone=False,
+            measure_start=MEASURE_START,
+            measure_every=MEASURE_EVERY,
+            rng_seed=1000,
+            n_procs=N_PROCS,
+            pool=pool,
+        )
+
+        print(f"Running full-loss-cone simulation with {N_STARS} stars, {N_PROCS} CPUs working together...")
+        gbar_lc_mean, gbar_lc_std = run_simulation_parallel(
+            n_stars=N_STARS,
+            n_steps=N_STEPS,
+            loss_cone=True,
+            measure_start=MEASURE_START,
+            measure_every=MEASURE_EVERY,
+            rng_seed=2000,
+            n_procs=N_PROCS,
+            pool=pool,
+        )
 
     # Compute g0(x) at X_BINS for reference
     g0_vals = np.array([g0_bw(x) for x in X_BINS])
@@ -617,22 +759,22 @@ def main():
     # --- Plot ---
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    # Paper data for Fig. 3
+    # Original paper points
     ax.errorbar(
         GBAR_X_PAPER, GBAR_PAPER, yerr=GBAR_ERR_PAPER,
-        fmt='o', markersize=4, capsize=3, label=r"$\bar{g}$ (Shapiro & Marchant 1978)"
+        fmt='o', markersize=4, capsize=3, label=r"$\bar{g}$ (paper)"
     )
 
-    # Our no-loss-cone MC
+    # Our no-loss-cone MC (shared parallel simulation)
     ax.errorbar(
-        X_BINS, gbar_nolc, yerr=gbar_nolc_err,
-        fmt='s', markersize=4, capsize=3, label=r"MC $\bar{g}$ (no loss cone)"
+        X_BINS, gbar_nolc_mean, yerr=gbar_nolc_std,
+        fmt='s', markersize=4, capsize=3, label=r"MC $\bar{g}$ (no loss cone, shared parallel)"
     )
 
-    # Our full loss-cone MC
+    # Our full loss-cone MC (shared parallel simulation)
     ax.errorbar(
-        X_BINS, gbar_lc, yerr=gbar_lc_err,
-        fmt='D', markersize=4, capsize=3, label=r"MC $\bar{g}$ (loss cone)"
+        X_BINS, gbar_lc_mean, yerr=gbar_lc_std,
+        fmt='D', markersize=4, capsize=3, label=r"MC $\bar{g}$ (loss cone, shared parallel)"
     )
 
     # BW 1D solution g0 (solid line)
@@ -641,16 +783,16 @@ def main():
     ax.set_xscale('log')
     ax.set_xlabel(r"$x = -E / v_0^2$")
     ax.set_ylabel(r"$\bar{g}(x)$")
-    ax.set_title(r"Isotropized distribution $\bar{g}(x)$ (canonical case $x_{\mathrm{crit}}\approx 10$, $x_D=10^4$)")
+    ax.set_title(r"Isotropized distribution $\bar{g}(x)$ (canonical case, shared parallel MC)")
     ax.grid(True, which='both', alpha=0.3)
     ax.legend()
     plt.tight_layout()
     plt.show()
 
-    # Print a small table to inspect numerically
     print("\n x-bin    g0(x)   gbar(no LC)   gbar(LC)")
-    for x, g0, gn, gl in zip(X_BINS, g0_vals, gbar_nolc, gbar_lc):
+    for x, g0, gn, gl in zip(X_BINS, g0_vals, gbar_nolc_mean, gbar_lc_mean):
         print(f"{x:8.3g}  {g0:7.3f}   {gn:11.3f}   {gl:11.3f}")
+
 
 if __name__ == "__main__":
     main()
