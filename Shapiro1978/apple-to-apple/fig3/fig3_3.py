@@ -411,7 +411,8 @@ def run_simulation(
 
             y1, y2 = correlated_normals(zeta2_star, eps2_star, j2_star)
 
-            dx = n * eps1_star + math.sqrt(n) * eps2_star * y1
+            # Δx = -ΔE/v₀² = -(n·ε₁* + √n·ε₂*·y₁)
+            dx = -(n * eps1_star + math.sqrt(n) * eps2_star * y1)
             x_new = x + dx
 
             dj = n * j1_star + math.sqrt(n) * j2_star * y2
@@ -537,7 +538,8 @@ def update_stars_batch_full(args):
 
             y1, y2 = correlated_normals(zeta2_star, eps2_star, j2_star)
 
-            dx = n * eps1_star + math.sqrt(n) * eps2_star * y1
+            # Δx = -ΔE/v₀² = -(n·ε₁* + √n·ε₂*·y₁)
+            dx = -(n * eps1_star + math.sqrt(n) * eps2_star * y1)
             x_new = x + dx
 
             dj = n * j1_star + math.sqrt(n) * j2_star * y2
@@ -712,9 +714,9 @@ def run_simulation_task(args):
 def main():
     # Base MC parameters – you can tune for quality vs. speed
     N_STARS = 800
-    N_STEPS = 300000
-    MEASURE_START = 20000
-    MEASURE_EVERY = 500
+    N_STEPS = 30000*4#0
+    MEASURE_START = 2000*4#0
+    MEASURE_EVERY = 50*4#0
 
     # Parallelism parameters
     # On Windows, using too many worker processes for too few stars is slower (spawn + pickling overhead).
