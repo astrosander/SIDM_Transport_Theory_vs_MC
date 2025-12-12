@@ -574,15 +574,12 @@ def run_simulation(
             if captured:
                 new_stars.append(reinject_star((x, j, cycle_new, u_tag, weight)))
             else:
-                x_final, j_final, u_tag_final, weight_final = apply_cloning(x_new, j_new, u_tag, weight)
-                
-                if (not math.isfinite(x_final) or
-                    not math.isfinite(j_final) or
-                    not math.isfinite(weight_final) or
-                    x_final <= 0.0):
+                if (not math.isfinite(x_new) or
+                    not math.isfinite(j_new) or
+                    x_new <= 0.0):
                     new_stars.append(initialize_star())
                 else:
-                    new_stars.append((x_final, j_final, cycle_new, u_tag_final, weight_final))
+                    new_stars.append((x_new, j_new, cycle_new, u_tag, weight))
 
         stars = new_stars
 
@@ -691,15 +688,12 @@ def process_stars_block(args):
             if captured:
                 new_stars.append(reinject_star((x, j, cycle_new, u_tag, weight)))
             else:
-                x_final, j_final, u_tag_final, weight_final = apply_cloning(x_new, j_new, u_tag, weight)
-                
-                if (not math.isfinite(x_final) or
-                    not math.isfinite(j_final) or
-                    not math.isfinite(weight_final) or
-                    x_final <= 0.0):
+                if (not math.isfinite(x_new) or
+                    not math.isfinite(j_new) or
+                    x_new <= 0.0):
                     new_stars.append(initialize_star())
                 else:
-                    new_stars.append((x_final, j_final, cycle_new, u_tag_final, weight_final))
+                    new_stars.append((x_new, j_new, cycle_new, u_tag, weight))
         
         stars = new_stars
     
@@ -850,6 +844,40 @@ def run_simulation_numba(
     return gbar_mean, gbar_std
 
 
+def check_coefficient_g0_consistency():
+    print("=" * 70)
+    print("Checking coefficient-g0 consistency")
+    print("=" * 70)
+    print("Testing if: eps1 ≈ -eps2^2 * d(ln g0)/dx")
+    print()
+    
+    j_test = 0.5
+    x_test_values = [0.3, 1.0, 3.0, 10.0, 30.0]
+    
+    print(f"{'x':>8}  {'eps1':>12}  {'eps2^2':>12}  {'dln(g0)/dx':>12}  {'RHS':>12}  {'Match':>8}")
+    print("-" * 70)
+    
+    for x in x_test_values:
+        eps1_star, eps2_star, j1_star, j2_star, zeta2_star = \
+            interpolate_orbital_coeffs(x, j_test)
+        
+        g0_val = g0_bw(x)
+        dx_small = 0.01 * x
+        g0_plus = g0_bw(x + dx_small)
+        g0_minus = g0_bw(x - dx_small)
+        
+        dln_g0_dx = (math.log(g0_plus) - math.log(g0_minus)) / (2.0 * dx_small)
+        
+        rhs = -(eps2_star * eps2_star) * dln_g0_dx
+        
+        match = "OK" if abs(eps1_star - rhs) < 0.1 * max(abs(eps1_star), abs(rhs)) else "MISMATCH"
+        
+        print(f"{x:8.3f}  {eps1_star:12.6f}  {eps2_star*eps2_star:12.6f}  {dln_g0_dx:12.6f}  {rhs:12.6f}  {match:>8}")
+    
+    print("=" * 70)
+    print()
+
+
 def compare_python_vs_numba():
     N_STARS = 1000
     N_STEPS = 20000
@@ -984,7 +1012,12 @@ def main():
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "compare":
-        compare_python_vs_numba()
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "compare":
+            compare_python_vs_numba()
+        elif sys.argv[1] == "check":
+            check_coefficient_g0_consistency()
+        else:
+            main()
     else:
         main()
