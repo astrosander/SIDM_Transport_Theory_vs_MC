@@ -6,7 +6,7 @@ import random
 import matplotlib.pyplot as plt
 from multiprocessing import Pool, cpu_count
 
-from numba import njit
+from numba import njit, prange
 
 X_BINS = np.array([
     0.225, 0.303, 0.495, 1.04, 1.26, 1.62, 2.35, 5.00, 7.20, 8.94,
@@ -203,6 +203,211 @@ def orbital_period_star(x):
     return P_STAR * x**(-1.5)
 
 
+@njit(cache=True)
+def choose_time_step_numba(x, j, eps2_star, j2_star):
+    x_eff = x if x > 1e-3 else 1e-3
+    eps2 = abs(eps2_star)
+    j2   = abs(j2_star)
+
+    have = False
+    n = 1e-3
+
+    if eps2 > 0.0:
+        val = (0.15 * x_eff / eps2)**2
+        n = val
+        have = True
+
+    if j2 > 0.0:
+        val = (0.1 / j2)**2
+        if (not have) or (val < n):
+            n = val
+            have = True
+
+        val = (0.4 * (1.0075 - j) / j2)**2
+        if (not have) or (val < n):
+            n = val
+            have = True
+
+        jmin = j_min_of_x(x_eff)
+        if jmin > 0.0:
+            d1 = 0.25 * abs(j - jmin)
+            d2 = 0.10 * jmin
+            maxd = d1 if d1 > d2 else d2
+            if maxd > 0.0:
+                val = (maxd / j2)**2
+                if (not have) or (val < n):
+                    n = val
+                    have = True
+
+    if not have:
+        n = 1e-3
+
+    if n > 1.0:
+        n = 1.0
+    if n < 1e-5:
+        n = 1e-5
+
+    dt = n * orbital_period_star(x_eff)
+    return n, dt
+
+
+@njit(cache=True)
+def correlated_normals_numba(zeta2_star, eps2_star, j2_star):
+    if eps2_star == 0.0 or j2_star == 0.0:
+        return np.random.normal(), np.random.normal()
+
+    rho = zeta2_star / (eps2_star * j2_star)
+    if rho > 0.999:
+        rho = 0.999
+    elif rho < -0.999:
+        rho = -0.999
+
+    y1 = np.random.normal()
+    z  = np.random.normal()
+    y2 = rho * y1 + math.sqrt(1.0 - rho*rho) * z
+    return y1, y2
+
+
+@njit(cache=True)
+def inject_new_star(x_outer):
+    ln_x_min = math.log(x_outer)
+    ln_x_max = math.log(1.5 * x_outer)
+    ln_x = ln_x_min + np.random.random() * (ln_x_max - ln_x_min)
+    x = math.exp(ln_x)
+
+    g = g0_bw(x)
+    g_max = 3.0
+    if np.random.random() > min(1.0, g / g_max):
+        x = x_outer
+
+    j = math.sqrt(np.random.random())
+
+    u_tag = x_to_u(x)
+    weight = 1.0
+    cycle = 0.0
+
+    return x, j, cycle, u_tag, weight
+
+
+@njit(cache=True)
+def initialize_all_stars_numba(n_stars, x_outer):
+    x      = np.empty(n_stars, dtype=np.float64)
+    j      = np.empty(n_stars, dtype=np.float64)
+    cycle  = np.zeros(n_stars, dtype=np.float64)
+    u_tag  = np.empty(n_stars, dtype=np.float64)
+    weight = np.empty(n_stars, dtype=np.float64)
+
+    for i in range(n_stars):
+        xi, ji, cyc, ut, w = inject_new_star(x_outer)
+        x[i] = xi
+        j[i] = ji
+        cycle[i] = cyc
+        u_tag[i] = ut
+        weight[i] = w
+
+    return x, j, cycle, u_tag, weight
+
+
+@njit(cache=True)
+def compute_counts_numba(x, weight, logx_bins):
+    nbins = logx_bins.size
+    counts = np.zeros(nbins, dtype=np.float64)
+
+    for i in range(x.size):
+        xi = x[i]
+        if xi <= 0.0:
+            continue
+        logx = math.log(xi)
+
+        best = 1.0e99
+        idx  = 0
+        for k in range(nbins):
+            d = abs(logx - logx_bins[k])
+            if d < best:
+                best = d
+                idx = k
+
+        counts[idx] += weight[i]
+
+    return counts
+
+
+@njit(cache=True, parallel=True)
+def evolve_block_numba(x, j, cycle, u_tag, weight,
+                       loss_cone, steps_per_block):
+    n = x.size
+
+    for step in range(steps_per_block):
+        for i in prange(n):
+            xi = x[i]
+            ji = j[i]
+            cyc = cycle[i]
+            ut = u_tag[i]
+            w  = weight[i]
+
+            xx = xi
+            if xx < X_TABLE[0]:
+                xx = X_TABLE[0]
+            elif xx > X_TABLE[-1]:
+                xx = X_TABLE[-1]
+
+            jj = ji
+            if jj < J_GRID[-1]:
+                jj = J_GRID[-1]
+            elif jj > J_GRID[0]:
+                jj = J_GRID[0]
+
+            eps1_star, eps2_star, j1_star, j2_star, zeta2_star = \
+                interpolate_orbital_coeffs(xx, jj)
+
+            nstep, dt = choose_time_step_numba(xi, ji, eps2_star, j2_star)
+            cyc_new = cyc + nstep
+
+            y1, y2 = correlated_normals_numba(zeta2_star, eps2_star, j2_star)
+
+            dx = -(nstep * eps1_star + math.sqrt(nstep) * eps2_star * y1)
+            x_new = xi + dx
+
+            dj = nstep * j1_star + math.sqrt(nstep) * j2_star * y2
+            j_new = ji + dj
+
+            if j_new < 0.0:
+                j_new = -j_new
+            if j_new > 1.0:
+                j_new = 2.0 - j_new
+                if j_new < 0.0:
+                    j_new = 0.0
+                if j_new > 1.0:
+                    j_new = 1.0
+
+            if x_new < X_B or x_new > 2.0 * X_D:
+                x_new, j_new, cyc_new, ut, w = inject_new_star(X_B)
+            else:
+                if loss_cone:
+                    if math.floor(cyc_new + 1e-9) > math.floor(cyc + 1e-9):
+                        jmin = j_min_of_x(x_new)
+                        if j_new < jmin:
+                            x_new, j_new, cyc_new, ut, w = inject_new_star(X_B)
+
+                u_val = x_to_u(x_new)
+
+                if u_val > ut:
+                    x_new, j_new, cyc_new, ut, w = inject_new_star(X_B)
+                else:
+                    for m in range(U_BOUNDS.size):
+                        u_boundary = U_BOUNDS[m]
+                        if u_val < u_boundary and u_boundary < ut:
+                            w *= K_CLONES
+                            ut = u_boundary
+                            break
+
+            x[i]      = x_new
+            j[i]      = j_new
+            cycle[i]  = cyc_new
+            u_tag[i]  = ut
+            weight[i] = w
+
+
 def choose_time_step(x, j, eps2_star, j2_star):
     x_eff = max(x, 1e-3)
     eps2 = abs(eps2_star)
@@ -391,6 +596,18 @@ def _warmup_numba():
     
     orbital_period_star(1.0)
     orbital_period_star(10.0)
+    
+    choose_time_step_numba(1.0, 0.5, 0.1, 0.1)
+    correlated_normals_numba(0.1, 0.1, 0.1)
+    inject_new_star(X_B)
+    x_to_u(1.0)
+    
+    x_test = np.array([0.2, 1.0, 10.0], dtype=np.float64)
+    weight_test = np.array([1.0, 1.0, 1.0], dtype=np.float64)
+    compute_counts_numba(x_test, weight_test, LOGX_BINS)
+    
+    x_init, j_init, c_init, u_init, w_init = initialize_all_stars_numba(10, X_B)
+    evolve_block_numba(x_init, j_init, c_init, u_init, w_init, False, 1)
 
 
 def _closest_log_bin_indices(logxs: np.ndarray) -> np.ndarray:
@@ -564,40 +781,70 @@ def run_simulation_task(args):
     return gbar_mean
 
 
-def main():
-    N_STARS = 5000
-    N_STEPS = 3000#0
-    N_BLOCKS = 6
+def run_simulation_numba(
+        n_stars=5000,
+        n_steps=200000,
+        loss_cone=True,
+        n_blocks=40,
+    ):
+    x, j, cycle, u_tag, weight = initialize_all_stars_numba(n_stars, X_B)
 
-    TARGET_STARS_PER_PROC = 200
-    N_PROCS = 32#min(cpu_count(), 8, max(1, N_STARS // TARGET_STARS_PER_PROC))
+    steps_per_block = n_steps // n_blocks
+    if steps_per_block < 1:
+        raise ValueError("n_steps must be >= n_blocks")
+
+    gbar_blocks = []
+
+    for block in range(n_blocks):
+        evolve_block_numba(x, j, cycle, u_tag, weight,
+                           loss_cone, steps_per_block)
+
+        counts = compute_counts_numba(x, weight, LOGX_BINS)
+
+        mask = X_BINS <= 0.5
+        num = 0.0
+        den = 0.0
+        for k in range(len(X_BINS)):
+            if mask[k] and counts[k] > 0.0:
+                num += g0_bw(X_BINS[k])
+                den += counts[k]
+
+        factor = num / den if den > 0.0 else 1.0
+        counts *= factor
+
+        gbar_blocks.append(counts.copy())
+
+    gbar_blocks = np.array(gbar_blocks[1:], dtype=np.float64)
+    gbar_mean = gbar_blocks.mean(axis=0)
+    gbar_std  = gbar_blocks.std(axis=0)
+
+    return gbar_mean, gbar_std
+
+
+def main():
+    N_STARS  = 5000
+    N_STEPS  = 200000
+    N_BLOCKS = 40
 
     print("Warming up numba JIT functions...")
     _warmup_numba()
     print("Done warming up.")
 
-    with Pool(processes=N_PROCS, initializer=_warmup_numba) as pool:
-        print(f"Running no-loss-cone simulation with {N_STARS} stars, {N_PROCS} CPUs, {N_BLOCKS} blocks...")
-        gbar_nolc_mean, gbar_nolc_std = run_simulation_parallel(
-            n_stars=N_STARS,
-            n_steps=N_STEPS,
-            loss_cone=False,
-            rng_seed=1000,
-            n_procs=N_PROCS,
-            pool=pool,
-            n_blocks=N_BLOCKS,
-        )
+    print(f"Running no-loss-cone simulation with {N_STARS} stars, numba-parallel, {N_BLOCKS} blocks...")
+    gbar_nolc_mean, gbar_nolc_std = run_simulation_numba(
+        n_stars=N_STARS,
+        n_steps=N_STEPS,
+        loss_cone=False,
+        n_blocks=N_BLOCKS,
+    )
 
-        print(f"Running full-loss-cone simulation with {N_STARS} stars, {N_PROCS} CPUs, {N_BLOCKS} blocks...")
-        gbar_lc_mean, gbar_lc_std = run_simulation_parallel(
-            n_stars=N_STARS,
-            n_steps=N_STEPS,
-            loss_cone=True,
-            rng_seed=2000,
-            n_procs=N_PROCS,
-            pool=pool,
-            n_blocks=N_BLOCKS,
-        )
+    print(f"Running full-loss-cone simulation with {N_STARS} stars, numba-parallel, {N_BLOCKS} blocks...")
+    gbar_lc_mean, gbar_lc_std = run_simulation_numba(
+        n_stars=N_STARS,
+        n_steps=N_STEPS,
+        loss_cone=True,
+        n_blocks=N_BLOCKS,
+    )
 
     g0_vals = np.array([g0_bw(x) for x in X_BINS])
 
@@ -610,12 +857,14 @@ def main():
 
     ax.errorbar(
         X_BINS, gbar_nolc_mean, yerr=gbar_nolc_std,
-        fmt='s', markersize=4, capsize=3, label=r"MC $\bar{g}$ (no loss cone, shared parallel)"
+        fmt='s', markersize=4, capsize=3,
+        label=r"MC $\bar{g}$ (no loss cone, numba-parallel)"
     )
 
     ax.errorbar(
         X_BINS, gbar_lc_mean, yerr=gbar_lc_std,
-        fmt='D', markersize=4, capsize=3, label=r"MC $\bar{g}$ (loss cone, shared parallel)"
+        fmt='D', markersize=4, capsize=3,
+        label=r"MC $\bar{g}$ (loss cone, numba-parallel)"
     )
 
     ax.plot(X_BINS, g0_vals, '-', lw=2, label=r"$g_0$ (BW 1D)")
@@ -623,7 +872,7 @@ def main():
     ax.set_xscale('log')
     ax.set_xlabel(r"$x = -E / v_0^2$")
     ax.set_ylabel(r"$\bar{g}(x)$")
-    ax.set_title(r"Isotropized distribution $\bar{g}(x)$ (canonical case, shared parallel MC)")
+    ax.set_title(r"Isotropized distribution $\bar{g}(x)$ (canonical case, numba-parallel MC)")
     ax.grid(True, which='both', alpha=0.3)
     ax.legend()
     plt.tight_layout()
