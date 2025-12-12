@@ -500,7 +500,7 @@ def run_simulation(
             idx = np.argmin(np.abs(logX_bins - logx))
             counts[idx] += weight
 
-        mask = X_BINS <= 0.5
+        mask = X_BINS <= 2.0
         num = 0.0
         den = 0.0
         for k in range(len(X_BINS)):
@@ -738,7 +738,7 @@ def run_simulation_parallel(
 
             star_batches = updated_batches
 
-            mask = X_BINS <= 0.5
+            mask = X_BINS <= 2.0
             num = 0.0
             den = 0.0
             for k in range(len(X_BINS)):
@@ -801,7 +801,7 @@ def run_simulation_numba(
 
         counts = compute_counts_numba(x, weight, LOGX_BINS)
 
-        mask = X_BINS <= 0.5
+        mask = X_BINS <= 2.0
         num = 0.0
         den = 0.0
         for k in range(len(X_BINS)):
@@ -823,8 +823,8 @@ def run_simulation_numba(
 
 def main():
     N_STARS  = 5000
-    N_STEPS  = 200000
-    N_BLOCKS = 40
+    N_STEPS  = 1000000
+    N_BLOCKS = 100
 
     print("Warming up numba JIT functions...")
     _warmup_numba()
