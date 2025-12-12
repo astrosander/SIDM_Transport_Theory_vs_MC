@@ -98,6 +98,13 @@ X_CRIT_TARGET = 10.0
 
 X_B = 0.20
 
+U_BOUNDS = np.array([1.0, 0.1, 0.01, 0.001], dtype=np.float64)
+K_CLONES = 10.0
+
+@njit(cache=True)
+def x_to_u(x):
+    return x ** (-1.25)
+
 @njit(cache=True)
 def g0_bw(x):
     if x < 0.0:
@@ -161,6 +168,21 @@ def interpolate_orbital_coeffs(x, j):
 
     return eps1_star, eps2_star, j1_star, j2_star, zeta2_star
 
+
+def apply_cloning(x, j, u_tag, weight):
+    u = x_to_u(x)
+    
+    if u > u_tag:
+        return X_B, math.sqrt(random.random()), x_to_u(X_B), weight
+    
+    for k in range(len(U_BOUNDS)):
+        u_boundary = U_BOUNDS[k]
+        if u < u_boundary < u_tag:
+            weight_new = weight * K_CLONES
+            u_tag_new = u_boundary
+            return x, j, u_tag_new, weight_new
+    
+    return x, j, u_tag, weight
 
 @njit(cache=True)
 def j_min_of_x(x):
@@ -238,11 +260,15 @@ def initialize_star(bound=True, x_outer=X_B):
 
     u = random.random()
     j = math.sqrt(u)
+    
+    u_tag = x_to_u(x)
+    weight = 1.0
 
-    return x, j, 0.0
+    return x, j, 0.0, u_tag, weight
 
 
 def reinject_star(star):
+    x, j, cycle, u_tag, weight = star
     return initialize_star(bound=True, x_outer=X_B)
 
 
@@ -263,39 +289,32 @@ def run_simulation(
     logX_bins = np.log(X_BINS)
 
     def record_snapshot():
-        xs = np.array([s[0] for s in stars])
-        logxs = np.log(xs)
-        gbar = np.zeros(len(X_BINS))
         counts = np.zeros(len(X_BINS))
+        for (x, j, cycle, u_tag, weight) in stars:
+            logx = math.log(x)
+            idx = np.argmin(np.abs(logX_bins - logx))
+            counts[idx] += weight
 
-        for lx in logxs:
-            idx = np.argmin(np.abs(logX_bins - lx))
-            counts[idx] += 1.0
+        idx_norm = 0
+        best_d = 1e99
+        for k in range(len(X_BINS)):
+            d = abs(X_BINS[k] - 0.2)
+            if d < best_d:
+                best_d = d
+                idx_norm = k
 
-        for i, x_bin in enumerate(X_BINS):
-            if counts[i] <= 0:
-                gbar[i] = 0.0
-            else:
-                gbar[i] = counts[i]
+        if counts[idx_norm] > 0.0:
+            g0_norm = g0_bw(X_BINS[idx_norm])
+            factor = g0_norm / counts[idx_norm]
+            counts *= factor
 
-        idxs = [0, 1, 2]
-        s_num = 0.0
-        s_den = 0.0
-        for i in idxs:
-            if gbar[i] > 0:
-                s_num += g0_bw(X_BINS[i])
-                s_den += gbar[i]
-        scale = s_num / s_den if s_den > 0 else 1.0
-        for i in range(len(gbar)):
-            gbar[i] *= scale
-
-        snapshots.append(gbar)
+        snapshots.append(counts)
 
     next_measure = measure_start
 
     for step in range(n_steps):
         new_stars = []
-        for (x, j, cycle) in stars:
+        for (x, j, cycle, u_tag, weight) in stars:
             eps1_star, eps2_star, j1_star, j2_star, zeta2_star = \
                 interpolate_orbital_coeffs(max(x, X_TABLE[0]), max(j, J_GRID[-1]))
 
@@ -320,11 +339,11 @@ def run_simulation(
                     j_new = 1.0
 
             if x_new < X_B:
-                new_stars.append(reinject_star((x, j, cycle_new)))
+                new_stars.append(reinject_star((x, j, cycle_new, u_tag, weight)))
                 continue
 
             if x_new > 2.0 * X_D:
-                new_stars.append(reinject_star((x, j, cycle_new)))
+                new_stars.append(reinject_star((x, j, cycle_new, u_tag, weight)))
                 continue
 
             captured = False
@@ -335,9 +354,10 @@ def run_simulation(
                         captured = True
 
             if captured:
-                new_stars.append(reinject_star((x, j, cycle_new)))
+                new_stars.append(reinject_star((x, j, cycle_new, u_tag, weight)))
             else:
-                new_stars.append((x_new, j_new, cycle_new))
+                x_final, j_final, u_tag_final, weight_final = apply_cloning(x_new, j_new, u_tag, weight)
+                new_stars.append((x_final, j_final, cycle_new, u_tag_final, weight_final))
 
         stars = new_stars
 
@@ -382,18 +402,17 @@ def _closest_log_bin_indices(logxs: np.ndarray) -> np.ndarray:
     return idx
 
 
-def update_stars_batch_full(args):
-    stars_batch, loss_cone, n_steps, measure_start, measure_every, batch_idx, base_seed = args
+def process_stars_block(args):
+    stars_batch, loss_cone, steps_per_block, batch_idx, base_seed = args
     
     random.seed(base_seed + batch_idx)
     
     stars = stars_batch[:]
-    snapshot_counts_list = []
     
-    for step in range(n_steps):
+    for step in range(steps_per_block):
         new_stars = []
         
-        for (x, j, cycle) in stars:
+        for (x, j, cycle, u_tag, weight) in stars:
             eps1_star, eps2_star, j1_star, j2_star, zeta2_star = \
                 interpolate_orbital_coeffs(max(x, X_TABLE[0]), max(j, J_GRID[-1]))
 
@@ -418,11 +437,11 @@ def update_stars_batch_full(args):
                     j_new = 1.0
 
             if x_new < X_B:
-                new_stars.append(reinject_star((x, j, cycle_new)))
+                new_stars.append(reinject_star((x, j, cycle_new, u_tag, weight)))
                 continue
 
             if x_new > 2.0 * X_D:
-                new_stars.append(reinject_star((x, j, cycle_new)))
+                new_stars.append(reinject_star((x, j, cycle_new, u_tag, weight)))
                 continue
 
             captured = False
@@ -433,20 +452,20 @@ def update_stars_batch_full(args):
                         captured = True
 
             if captured:
-                new_stars.append(reinject_star((x, j, cycle_new)))
+                new_stars.append(reinject_star((x, j, cycle_new, u_tag, weight)))
             else:
-                new_stars.append((x_new, j_new, cycle_new))
+                x_final, j_final, u_tag_final, weight_final = apply_cloning(x_new, j_new, u_tag, weight)
+                new_stars.append((x_final, j_final, cycle_new, u_tag_final, weight_final))
         
         stars = new_stars
-        
-        if step >= measure_start and (step - measure_start) % measure_every == 0:
-            xs = np.array([s[0] for s in stars], dtype=np.float64)
-            logxs = np.log(xs)
-            indices = _closest_log_bin_indices(logxs)
-            counts = np.bincount(indices, minlength=len(X_BINS)).astype(np.float64)
-            snapshot_counts_list.append((step, counts))
     
-    return stars, snapshot_counts_list
+    counts = np.zeros(len(X_BINS))
+    for (x, j, cycle, u_tag, weight) in stars:
+        logx = math.log(x)
+        idx = np.argmin(np.abs(LOGX_BINS - logx))
+        counts[idx] += weight
+    
+    return stars, counts
 
 
 def run_simulation_parallel(
@@ -457,7 +476,8 @@ def run_simulation_parallel(
         measure_every=100,
         rng_seed=42,
         n_procs=4,
-        pool=None
+        pool=None,
+        n_blocks=6
     ):
     random.seed(rng_seed)
     
@@ -473,7 +493,8 @@ def run_simulation_parallel(
             end_idx = (i + 1) * stars_per_proc
         star_batches.append(all_stars[start_idx:end_idx])
     
-    snapshots = []
+    steps_per_block = n_steps // n_blocks
+    gbar_blocks = []
     
     created_pool = False
     if pool is None:
@@ -482,51 +503,48 @@ def run_simulation_parallel(
         created_pool = True
 
     try:
-        batch_args = [
-            (star_batches[i], loss_cone, n_steps, measure_start, measure_every, i, rng_seed)
-            for i in range(n_procs)
-        ]
+        for block in range(n_blocks):
+            batch_args = [
+                (star_batches[i], loss_cone, steps_per_block, i, rng_seed + block * 1000)
+                for i in range(n_procs)
+            ]
 
-        results = pool.map(update_stars_batch_full, batch_args)
+            results = pool.map(process_stars_block, batch_args)
 
-        final_batches = []
-        all_counts_by_step = {}
+            updated_batches = []
+            total_counts = np.zeros(len(X_BINS))
+            
+            for i, (final_stars, counts) in enumerate(results):
+                updated_batches.append(final_stars)
+                total_counts += counts
 
-        for i, (final_stars, snapshot_counts_list) in enumerate(results):
-            final_batches.append(final_stars)
-            for step_num, counts in snapshot_counts_list:
-                if step_num not in all_counts_by_step:
-                    all_counts_by_step[step_num] = []
-                all_counts_by_step[step_num].append(counts)
+            star_batches = updated_batches
 
-        star_batches = final_batches
+            idx_norm = 0
+            best_d = 1e99
+            for k in range(len(X_BINS)):
+                d = abs(X_BINS[k] - 0.2)
+                if d < best_d:
+                    best_d = d
+                    idx_norm = k
 
-        for step_num in sorted(all_counts_by_step.keys()):
-            total_counts = np.sum(np.stack(all_counts_by_step[step_num], axis=0), axis=0)
-            gbar = total_counts.astype(np.float64, copy=True)
+            if total_counts[idx_norm] > 0.0:
+                g0_norm = g0_bw(X_BINS[idx_norm])
+                factor = g0_norm / total_counts[idx_norm]
+                total_counts *= factor
 
-            idxs = [0, 1, 2]
-            s_num = 0.0
-            s_den = 0.0
-            for i in idxs:
-                if gbar[i] > 0:
-                    s_num += g0_bw(X_BINS[i])
-                    s_den += gbar[i]
-            scale = s_num / s_den if s_den > 0 else 1.0
-            gbar *= scale
-
-            snapshots.append(gbar)
+            gbar_blocks.append(total_counts.copy())
     finally:
         if created_pool:
             pool.close()
             pool.join()
     
-    if not snapshots:
-        raise RuntimeError("No snapshots recorded; adjust n_steps/measure_start.")
+    if len(gbar_blocks) < 2:
+        raise RuntimeError("Need at least 2 blocks for averaging.")
     
-    snapshots = np.array(snapshots)
-    gbar_mean = snapshots.mean(axis=0)
-    gbar_std  = snapshots.std(axis=0)
+    gbar_blocks = np.array(gbar_blocks[1:])
+    gbar_mean = gbar_blocks.mean(axis=0)
+    gbar_std  = gbar_blocks.std(axis=0)
     
     return gbar_mean, gbar_std
 
@@ -545,41 +563,38 @@ def run_simulation_task(args):
 
 
 def main():
-    N_STARS = 800
+    N_STARS = 5000
     N_STEPS = 30000
-    MEASURE_START = 2000
-    MEASURE_EVERY = 50
+    N_BLOCKS = 6
 
     TARGET_STARS_PER_PROC = 200
-    N_PROCS = 8#min(cpu_count(), 8, max(1, N_STARS // TARGET_STARS_PER_PROC))
+    N_PROCS = min(cpu_count(), 8, max(1, N_STARS // TARGET_STARS_PER_PROC))
 
     print("Warming up numba JIT functions...")
     _warmup_numba()
     print("Done warming up.")
 
     with Pool(processes=N_PROCS, initializer=_warmup_numba) as pool:
-        print(f"Running no-loss-cone simulation with {N_STARS} stars, {N_PROCS} CPUs working together...")
+        print(f"Running no-loss-cone simulation with {N_STARS} stars, {N_PROCS} CPUs, {N_BLOCKS} blocks...")
         gbar_nolc_mean, gbar_nolc_std = run_simulation_parallel(
             n_stars=N_STARS,
             n_steps=N_STEPS,
             loss_cone=False,
-            measure_start=MEASURE_START,
-            measure_every=MEASURE_EVERY,
             rng_seed=1000,
             n_procs=N_PROCS,
             pool=pool,
+            n_blocks=N_BLOCKS,
         )
 
-        print(f"Running full-loss-cone simulation with {N_STARS} stars, {N_PROCS} CPUs working together...")
+        print(f"Running full-loss-cone simulation with {N_STARS} stars, {N_PROCS} CPUs, {N_BLOCKS} blocks...")
         gbar_lc_mean, gbar_lc_std = run_simulation_parallel(
             n_stars=N_STARS,
             n_steps=N_STEPS,
             loss_cone=True,
-            measure_start=MEASURE_START,
-            measure_every=MEASURE_EVERY,
             rng_seed=2000,
             n_procs=N_PROCS,
             pool=pool,
+            n_blocks=N_BLOCKS,
         )
 
     g0_vals = np.array([g0_bw(x) for x in X_BINS])
