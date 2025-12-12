@@ -51,7 +51,7 @@ G0_TAB = np.array([
 
 NEG_E1 = np.array([
     [1.41e-1, 1.40e-1, 1.33e-1, 1.29e-1, 1.29e-1],
-    [1.47e-3, -4.67e-3, -6.33e-3, -5.52e-3, -4.78e-3],
+    [-1.47e-3, -4.67e-3, -6.33e-3, -5.52e-3, -4.78e-3],
     [1.96e-3, 1.59e-3, 2.83e-3, 3.38e-3, 3.49e-3],
     [3.64e-3, 4.64e-3, 4.93e-3, 4.97e-3, 4.98e-3],
     [8.39e-4, 8.53e-4, 8.56e-4, 8.56e-4, 8.56e-4],
@@ -273,7 +273,7 @@ def correlated_normals_numba(zeta2_star, eps2_star, j2_star):
         j2_star == 0.0):
         return y1, z
 
-    rho = -zeta2_star / (eps2_star * j2_star)
+    rho = zeta2_star / (eps2_star * j2_star)
 
     if not math.isfinite(rho):
         return y1, z
@@ -289,18 +289,9 @@ def correlated_normals_numba(zeta2_star, eps2_star, j2_star):
 
 @njit(cache=True)
 def inject_new_star(x_outer):
-    ln_x_min = math.log(x_outer)
-    ln_x_max = math.log(1.5 * x_outer)
-    ln_x = ln_x_min + np.random.random() * (ln_x_max - ln_x_min)
-    x = math.exp(ln_x)
-
-    g = g0_bw(x)
-    g_max = 3.0
-    if np.random.random() > min(1.0, g / g_max):
-        x = x_outer
-
+    x = x_outer
     j = math.sqrt(np.random.random())
-
+    
     u_tag = 0.0
     weight = 1.0
     cycle = 0.0
@@ -480,7 +471,7 @@ def correlated_normals(zeta2_star, eps2_star, j2_star):
         j2_star == 0.0):
         return y1, z
 
-    rho = -zeta2_star / (eps2_star * j2_star)
+    rho = zeta2_star / (eps2_star * j2_star)
 
     if not math.isfinite(rho):
         return y1, z
@@ -492,19 +483,10 @@ def correlated_normals(zeta2_star, eps2_star, j2_star):
 
 
 def initialize_star(bound=True, x_outer=X_B):
-    ln_x_min = math.log(x_outer)
-    ln_x_max = math.log(1.5 * x_outer)
-    ln_x = ln_x_min + random.random() * (ln_x_max - ln_x_min)
-    x = math.exp(ln_x)
-    g = g0_bw(x)
-    g_max = 3.0
-    if random.random() > min(1.0, g / g_max):
-        x = x_outer
-
-    u = random.random()
-    j = math.sqrt(u)
+    x = x_outer
+    j = math.sqrt(random.random())
     
-    u_tag = x_to_u(x)
+    u_tag = 0.0
     weight = 1.0
 
     return x, j, 0.0, u_tag, weight
@@ -878,6 +860,76 @@ def run_simulation_numba(
     return gbar_mean, gbar_std
 
 
+def compare_python_vs_numba():
+    N_STARS = 1000
+    N_STEPS = 20000
+    N_BLOCKS = 20
+    RNG_SEED = 1234
+    
+    print("=" * 70)
+    print("Comparing pure-Python vs Numba implementations")
+    print("=" * 70)
+    print(f"Parameters: {N_STARS} stars, {N_STEPS} steps, {N_BLOCKS} blocks")
+    print(f"Random seed: {RNG_SEED}")
+    print()
+    
+    print("Warming up numba JIT functions...")
+    _warmup_numba()
+    print("Done warming up.")
+    print()
+    
+    np.random.seed(RNG_SEED)
+    random.seed(RNG_SEED)
+    print("Running pure-Python simulation...")
+    gbar_python_mean, gbar_python_std = run_simulation(
+        n_stars=N_STARS,
+        n_steps=N_STEPS,
+        loss_cone=False,
+        measure_start=2000,
+        measure_every=100,
+        rng_seed=RNG_SEED,
+    )
+    print("Done.")
+    print()
+    
+    np.random.seed(RNG_SEED)
+    random.seed(RNG_SEED)
+    print("Running Numba simulation...")
+    gbar_numba_mean, gbar_numba_std = run_simulation_numba(
+        n_stars=N_STARS,
+        n_steps=N_STEPS,
+        loss_cone=False,
+        n_blocks=N_BLOCKS,
+    )
+    print("Done.")
+    print()
+    
+    g0_vals = np.array([g0_bw(x) for x in X_BINS])
+    
+    print("=" * 70)
+    print("Comparison Results:")
+    print("=" * 70)
+    print(f"{'x-bin':>8}  {'g0(x)':>8}  {'Python':>12}  {'Numba':>12}  {'Diff':>12}  {'Rel Diff':>10}")
+    print("-" * 70)
+    
+    for i, (x, g0) in enumerate(zip(X_BINS, g0_vals)):
+        py_val = gbar_python_mean[i]
+        nb_val = gbar_numba_mean[i]
+        diff = abs(py_val - nb_val)
+        rel_diff = diff / max(abs(py_val), abs(nb_val), 1e-10) * 100
+        
+        print(f"{x:8.3g}  {g0:8.3f}  {py_val:12.3f}  {nb_val:12.3f}  {diff:12.3f}  {rel_diff:10.1f}%")
+    
+    print()
+    print("=" * 70)
+    max_diff = np.max(np.abs(gbar_python_mean - gbar_numba_mean))
+    mean_diff = np.mean(np.abs(gbar_python_mean - gbar_numba_mean))
+    print(f"Max absolute difference: {max_diff:.6f}")
+    print(f"Mean absolute difference: {mean_diff:.6f}")
+    print("=" * 70)
+    print()
+
+
 def main():
     N_STARS  = 5000
     N_STEPS  = 200000
@@ -941,4 +993,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "compare":
+        compare_python_vs_numba()
+    else:
+        main()
