@@ -51,7 +51,7 @@ G0_TAB = np.array([
 
 NEG_E1 = np.array([
     [1.41e-1, 1.40e-1, 1.33e-1, 1.29e-1, 1.29e-1],
-    [-1.47e-3, -4.67e-3, -6.33e-3, -5.52e-3, -4.78e-3],
+    [1.47e-3, -4.67e-3, -6.33e-3, -5.52e-3, -4.78e-3],
     [1.96e-3, 1.59e-3, 2.83e-3, 3.38e-3, 3.49e-3],
     [3.64e-3, 4.64e-3, 4.93e-3, 4.97e-3, 4.98e-3],
     [8.39e-4, 8.53e-4, 8.56e-4, 8.56e-4, 8.56e-4],
@@ -273,7 +273,7 @@ def correlated_normals_numba(zeta2_star, eps2_star, j2_star):
         j2_star == 0.0):
         return y1, z
 
-    rho = zeta2_star / (eps2_star * j2_star)
+    rho = -zeta2_star / (eps2_star * j2_star)
 
     if not math.isfinite(rho):
         return y1, z
@@ -480,7 +480,7 @@ def correlated_normals(zeta2_star, eps2_star, j2_star):
         j2_star == 0.0):
         return y1, z
 
-    rho = zeta2_star / (eps2_star * j2_star)
+    rho = -zeta2_star / (eps2_star * j2_star)
 
     if not math.isfinite(rho):
         return y1, z
