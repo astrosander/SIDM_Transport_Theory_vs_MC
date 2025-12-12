@@ -171,6 +171,9 @@ def interpolate_orbital_coeffs(x, j):
 
 
 def apply_cloning(x, j, u_tag, weight):
+    if K_CLONES <= 1.0:
+        return x, j, u_tag, weight
+    
     u = x_to_u(x)
     
     if u > u_tag:
@@ -378,21 +381,8 @@ def evolve_block_numba(x, j, cycle, u_tag, weight,
             dx = -(nstep * eps1_star + math.sqrt(nstep) * eps2_star * y1)
             x_new = xi + dx
 
-            use_2d_walk = False
-            sqrt_n_j2 = 0.0
-            if j2_star > 0.0:
-                sqrt_n_j2 = math.sqrt(nstep) * j2_star
-                if sqrt_n_j2 >= 0.25 * ji:
-                    use_2d_walk = True
-
-            if use_2d_walk:
-                y3 = np.random.normal()
-                y4 = np.random.normal()
-                j_sq = (ji + sqrt_n_j2 * y3) ** 2 + nstep * j2_star * j2_star * y4 * y4
-                j_new = math.sqrt(j_sq) if j_sq > 0.0 else 0.0
-            else:
-                dj = nstep * j1_star + math.sqrt(nstep) * j2_star * y2
-                j_new = ji + dj
+            dj = nstep * j1_star + math.sqrt(nstep) * j2_star * y2
+            j_new = ji + dj
 
             if j_new < 0.0:
                 j_new = -j_new
