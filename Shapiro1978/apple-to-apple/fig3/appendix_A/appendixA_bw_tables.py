@@ -411,7 +411,7 @@ class AppendixA:
 
         sqrt2pi = np.sqrt(2.0 * np.pi)
 
-        eps1_star = 3.0 * sqrt2pi * self.P_star * (A_eps1 + B_eps1 + C_eps1)
+        eps1_star = -3.0 * sqrt2pi * self.P_star * (A_eps1 + B_eps1 + C_eps1)
         eps2_star2 = 4.0 * sqrt2pi * self.P_star * (A_eps2 + B_eps2 + C_eps2)
         j1_star = sqrt2pi * (x / j) * self.P_star * (A_j1 + B_j1 + C_j1)
         j2_star2 = sqrt2pi * x * self.P_star * (A_j2 + B_j2 + C_j2)
