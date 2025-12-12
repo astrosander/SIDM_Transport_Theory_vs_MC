@@ -51,7 +51,7 @@ G0_TAB = np.array([
 
 NEG_E1 = np.array([
     [1.41e-1, 1.40e-1, 1.33e-1, 1.29e-1, 1.29e-1],
-    [1.47e-3, -4.67e-3, -6.33e-3, -5.52e-3, -4.78e-3],
+    [-1.47e-3, -4.67e-3, -6.33e-3, -5.52e-3, -4.78e-3],
     [1.96e-3, 1.59e-3, 2.83e-3, 3.38e-3, 3.49e-3],
     [3.64e-3, 4.64e-3, 4.93e-3, 4.97e-3, 4.98e-3],
     [8.39e-4, 8.53e-4, 8.56e-4, 8.56e-4, 8.56e-4],
@@ -384,7 +384,7 @@ def evolve_block_numba(x, j, cycle, u_tag, weight,
 
             y1, y2 = correlated_normals_numba(zeta2_star, eps2_star, j2_star)
 
-            dx = nstep * eps1_star + math.sqrt(nstep) * eps2_star * y1
+            dx = -(nstep * eps1_star + math.sqrt(nstep) * eps2_star * y1)
             x_new = xi + dx
 
             use_2d_walk = False
@@ -569,7 +569,7 @@ def run_simulation(
 
             y1, y2 = correlated_normals(zeta2_star, eps2_star, j2_star)
 
-            dx = n * eps1_star + math.sqrt(n) * eps2_star * y1
+            dx = -(n * eps1_star + math.sqrt(n) * eps2_star * y1)
             x_new = x + dx
 
             dj = n * j1_star + math.sqrt(n) * j2_star * y2
@@ -686,7 +686,7 @@ def process_stars_block(args):
 
             y1, y2 = correlated_normals(zeta2_star, eps2_star, j2_star)
 
-            dx = n * eps1_star + math.sqrt(n) * eps2_star * y1
+            dx = -(n * eps1_star + math.sqrt(n) * eps2_star * y1)
             x_new = x + dx
 
             dj = n * j1_star + math.sqrt(n) * j2_star * y2
