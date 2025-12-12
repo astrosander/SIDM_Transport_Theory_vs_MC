@@ -37,8 +37,8 @@ import numpy as np
 
 Array = np.ndarray
 
-_LOG_MAX = float(np.log(np.finfo(float).max))      # ~709.78
-_LOG_MIN_SUB = -745.0                             # safe underflow bound
+_LOG_MIN = -745.0   # safe exp lower for float64 (includes subnormals)
+_LOG_MAX = 709.0    # safe exp upper for float64
 
 
 # -------------------------
@@ -105,8 +105,9 @@ class GLQuad:
         return xm, self.w, half
 
 
-def _exp_clip(logx):
-    return np.exp(np.clip(logx, _LOG_MIN_SUB, _LOG_MAX))
+def _exp_clip(logv: float) -> float:
+    """Clip log value to safe range and return exp."""
+    return float(np.exp(np.clip(logv, _LOG_MIN, _LOG_MAX)))
 
 
 def _sqrt_ratio_from_logs(log_num, log_den):
@@ -174,7 +175,8 @@ class AppendixA:
     g0_bw: Callable[[Array], Array]
     n_theta: int = 48
     n_x: int = 48
-    j_circular_eps: float = 1e-10
+    unbound_scale: float = 0.25     # scale for unbound tail: gbar(x'<=0) = unbound_scale * exp(x')
+    j_circular_eps: float = 1e-10    # use j=1-eps internally for j>=1
 
     def __post_init__(self):
         self.theta = ThetaQuad(self.n_theta)
@@ -185,7 +187,7 @@ class AppendixA:
         xprime = np.asarray(xprime, dtype=float)
         out = np.zeros_like(xprime)
         m_unb = xprime <= 0.0
-        out[m_unb] = np.exp(xprime[m_unb])
+        out[m_unb] = self.unbound_scale * np.exp(xprime[m_unb])
         m_bnd = (xprime > 0.0) & (xprime <= self.x_D)
         if np.any(m_bnd):
             out[m_bnd] = self.g0_bw(xprime[m_bnd])
@@ -194,12 +196,12 @@ class AppendixA:
     def _int_bar_g_minusinf_to_x(self, x: float) -> float:
         """Integral ∫_{-∞}^{x} gbar(x') dx' for x>0."""
         if x <= 0:
-            return float(np.exp(x))
+            return float(self.unbound_scale * np.exp(x))
         xb = min(x, self.x_D)
         if xb <= 0:
-            return 1.0
+            return float(self.unbound_scale)
         xp, w, half = self.glx.map(0.0, xb)
-        return 1.0 + half * float(np.sum(w * self.g0_bw(xp)))
+        return float(self.unbound_scale + half * np.sum(w * self.g0_bw(xp)))
 
     # ---- analytic I1/I4 ----
     @staticmethod
@@ -285,8 +287,10 @@ class AppendixA:
         if not (0.0 < j <= 1.0):
             raise ValueError("Require 0<j<=1")
 
-        # regularize exact j=1
-        if self.j_circular_eps and j >= 1.0:
+        # regularize exact j=1 (treat as limit j -> 1-)
+        if j >= 1.0:
+            j_eff = 1.0 - self.j_circular_eps
+        elif j > 1.0 - self.j_circular_eps:
             j_eff = 1.0 - self.j_circular_eps
         else:
             j_eff = j
@@ -375,13 +379,21 @@ def compute_tables(
     x_D: float,
     n_theta: int = 48,
     n_x: int = 48,
+    unbound_scale: float = 0.25,
     j_circular_eps: float = 1e-10,
 ) -> Dict[str, Array]:
     X_TABLE = np.asarray(X_TABLE, dtype=float)
     J_GRID  = np.asarray(J_GRID, dtype=float)
 
-    calc = AppendixA(P_star=P_star, x_D=x_D, g0_bw=g0_bw,
-                     n_theta=n_theta, n_x=n_x, j_circular_eps=j_circular_eps)
+    calc = AppendixA(
+        P_star=P_star,
+        x_D=x_D,
+        g0_bw=g0_bw,
+        n_theta=n_theta,
+        n_x=n_x,
+        unbound_scale=unbound_scale,
+        j_circular_eps=j_circular_eps,
+    )
 
     nx, nj = X_TABLE.size, J_GRID.size
     out = {k: np.empty((nx, nj)) for k in
@@ -513,7 +525,7 @@ def make_gbar_from_table2(
             else:
                 raise ValueError("extrapolate must be 'slope' or 'flat'")
 
-        out[m] = np.exp(np.clip(lg_i, _LOG_MIN_SUB, _LOG_MAX))
+        out[m] = np.exp(np.clip(lg_i, _LOG_MIN, _LOG_MAX))
         return out
 
     return g0_bw
@@ -528,6 +540,7 @@ def print_table1_like(
     j_values: Array = np.array([1.000, 0.401, 0.161, 0.065, 0.026], dtype=float),
     n_theta: int = 48,
     n_x: int = 48,
+    unbound_scale: float = 0.25,
     j_circular_eps: float = 1e-10,
 ) -> None:
     """
@@ -542,6 +555,7 @@ def print_table1_like(
         g0_bw=g0_bw,
         n_theta=n_theta,
         n_x=n_x,
+        unbound_scale=unbound_scale,
         j_circular_eps=j_circular_eps,
     )
 
