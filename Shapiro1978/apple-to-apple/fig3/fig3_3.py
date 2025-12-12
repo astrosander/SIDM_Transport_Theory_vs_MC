@@ -173,7 +173,7 @@ def apply_cloning(x, j, u_tag, weight):
     u = x_to_u(x)
     
     if u > u_tag:
-        return X_B, math.sqrt(random.random()), x_to_u(X_B), weight
+        return X_B, math.sqrt(random.random()), x_to_u(X_B), 1.0
     
     for k in range(len(U_BOUNDS)):
         u_boundary = U_BOUNDS[k]
@@ -295,19 +295,20 @@ def run_simulation(
             idx = np.argmin(np.abs(logX_bins - logx))
             counts[idx] += weight
 
-        idx_norm = 0
-        best_d = 1e99
+        mask = X_BINS <= 0.5
+        num = 0.0
+        den = 0.0
         for k in range(len(X_BINS)):
-            d = abs(X_BINS[k] - 0.2)
-            if d < best_d:
-                best_d = d
-                idx_norm = k
-
-        if counts[idx_norm] > 0.0:
-            g0_norm = g0_bw(X_BINS[idx_norm])
-            factor = g0_norm / counts[idx_norm]
-            counts *= factor
-
+            if mask[k] and counts[k] > 0.0:
+                num += g0_bw(X_BINS[k])
+                den += counts[k]
+        
+        if den > 0.0:
+            factor = num / den
+        else:
+            factor = 1.0
+        
+        counts *= factor
         snapshots.append(counts)
 
     next_measure = measure_start
@@ -520,19 +521,20 @@ def run_simulation_parallel(
 
             star_batches = updated_batches
 
-            idx_norm = 0
-            best_d = 1e99
+            mask = X_BINS <= 0.5
+            num = 0.0
+            den = 0.0
             for k in range(len(X_BINS)):
-                d = abs(X_BINS[k] - 0.2)
-                if d < best_d:
-                    best_d = d
-                    idx_norm = k
-
-            if total_counts[idx_norm] > 0.0:
-                g0_norm = g0_bw(X_BINS[idx_norm])
-                factor = g0_norm / total_counts[idx_norm]
-                total_counts *= factor
-
+                if mask[k] and total_counts[k] > 0.0:
+                    num += g0_bw(X_BINS[k])
+                    den += total_counts[k]
+            
+            if den > 0.0:
+                factor = num / den
+            else:
+                factor = 1.0
+            
+            total_counts *= factor
             gbar_blocks.append(total_counts.copy())
     finally:
         if created_pool:
@@ -564,11 +566,11 @@ def run_simulation_task(args):
 
 def main():
     N_STARS = 5000
-    N_STEPS = 30000
+    N_STEPS = 3000#0
     N_BLOCKS = 6
 
     TARGET_STARS_PER_PROC = 200
-    N_PROCS = min(cpu_count(), 8, max(1, N_STARS // TARGET_STARS_PER_PROC))
+    N_PROCS = 32#min(cpu_count(), 8, max(1, N_STARS // TARGET_STARS_PER_PROC))
 
     print("Warming up numba JIT functions...")
     _warmup_numba()
