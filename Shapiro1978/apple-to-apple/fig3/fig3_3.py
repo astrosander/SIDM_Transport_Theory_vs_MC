@@ -98,8 +98,9 @@ X_CRIT_TARGET = 10.0
 
 X_B = 0.20
 
-U_BOUNDS = np.array([1.0, 0.1, 0.01, 0.001], dtype=np.float64)
+U_BOUNDS = np.array([1.0, 0.1, 0.01, 0.001, 0.0001, 0.00001], dtype=np.float64)
 K_CLONES = 10.0
+MAX_WEIGHT = 1e6
 
 @njit(cache=True)
 def x_to_u(x):
@@ -173,12 +174,21 @@ def apply_cloning(x, j, u_tag, weight):
     u = x_to_u(x)
     
     if u > u_tag:
+        for b in U_BOUNDS:
+            if b > u_tag:
+                if weight < 1.0 - 1e-12:
+                    weight_new = weight * K_CLONES
+                    if weight_new > 1.0:
+                        weight_new = 1.0
+                    return x, j, b, weight_new
+                else:
+                    return X_B, math.sqrt(random.random()), x_to_u(X_B), 1.0
         return X_B, math.sqrt(random.random()), x_to_u(X_B), 1.0
     
     for k in range(len(U_BOUNDS)):
         u_boundary = U_BOUNDS[k]
         if u < u_boundary < u_tag:
-            weight_new = weight * K_CLONES
+            weight_new = max(weight / K_CLONES, 1.0 / MAX_WEIGHT)
             u_tag_new = u_boundary
             return x, j, u_tag_new, weight_new
     
@@ -253,17 +263,26 @@ def choose_time_step_numba(x, j, eps2_star, j2_star):
 
 @njit(cache=True)
 def correlated_normals_numba(zeta2_star, eps2_star, j2_star):
-    if eps2_star == 0.0 or j2_star == 0.0:
-        return np.random.normal(), np.random.normal()
+    y1 = np.random.normal()
+    z  = np.random.normal()
+
+    if (not math.isfinite(zeta2_star) or
+        not math.isfinite(eps2_star) or
+        not math.isfinite(j2_star) or
+        eps2_star == 0.0 or
+        j2_star == 0.0):
+        return y1, z
 
     rho = zeta2_star / (eps2_star * j2_star)
+
+    if not math.isfinite(rho):
+        return y1, z
+
     if rho > 0.999:
         rho = 0.999
     elif rho < -0.999:
         rho = -0.999
 
-    y1 = np.random.normal()
-    z  = np.random.normal()
     y2 = rho * y1 + math.sqrt(1.0 - rho*rho) * z
     return y1, y2
 
@@ -368,8 +387,21 @@ def evolve_block_numba(x, j, cycle, u_tag, weight,
             dx = -(nstep * eps1_star + math.sqrt(nstep) * eps2_star * y1)
             x_new = xi + dx
 
-            dj = nstep * j1_star + math.sqrt(nstep) * j2_star * y2
-            j_new = ji + dj
+            use_2d_walk = False
+            sqrt_n_j2 = 0.0
+            if j2_star > 0.0:
+                sqrt_n_j2 = math.sqrt(nstep) * j2_star
+                if sqrt_n_j2 >= 0.25 * ji:
+                    use_2d_walk = True
+
+            if use_2d_walk:
+                y3 = np.random.normal()
+                y4 = np.random.normal()
+                j_sq = (ji + sqrt_n_j2 * y3) ** 2 + nstep * j2_star * j2_star * y4 * y4
+                j_new = math.sqrt(j_sq) if j_sq > 0.0 else 0.0
+            else:
+                dj = nstep * j1_star + math.sqrt(nstep) * j2_star * y2
+                j_new = ji + dj
 
             if j_new < 0.0:
                 j_new = -j_new
@@ -392,14 +424,35 @@ def evolve_block_numba(x, j, cycle, u_tag, weight,
                 u_val = x_to_u(x_new)
 
                 if u_val > ut:
-                    x_new, j_new, cyc_new, ut, w = inject_new_star(X_B)
+                    found_boundary = False
+                    for m in range(U_BOUNDS.size):
+                        u_boundary = U_BOUNDS[m]
+                        if u_boundary > ut:
+                            if w < 1.0 - 1e-12:
+                                w = w * K_CLONES
+                                if w > 1.0:
+                                    w = 1.0
+                                ut = u_boundary
+                                found_boundary = True
+                            else:
+                                x_new, j_new, cyc_new, ut, w = inject_new_star(X_B)
+                                found_boundary = True
+                            break
+                    if not found_boundary:
+                        x_new, j_new, cyc_new, ut, w = inject_new_star(X_B)
                 else:
                     for m in range(U_BOUNDS.size):
                         u_boundary = U_BOUNDS[m]
                         if u_val < u_boundary and u_boundary < ut:
-                            w *= K_CLONES
+                            w = max(w / K_CLONES, 1.0 / MAX_WEIGHT)
                             ut = u_boundary
                             break
+
+            if (not math.isfinite(x_new) or
+                not math.isfinite(j_new) or
+                not math.isfinite(w) or
+                x_new <= 0.0):
+                x_new, j_new, cyc_new, ut, w = inject_new_star(X_B)
 
             x[i]      = x_new
             j[i]      = j_new
@@ -441,15 +494,24 @@ def choose_time_step(x, j, eps2_star, j2_star):
 
 
 def correlated_normals(zeta2_star, eps2_star, j2_star):
-    if eps2_star == 0.0 or j2_star == 0.0:
-        return random.gauss(0, 1), random.gauss(0, 1)
+    y1 = random.gauss(0.0, 1.0)
+    z  = random.gauss(0.0, 1.0)
+
+    if (not math.isfinite(zeta2_star) or
+        not math.isfinite(eps2_star) or
+        not math.isfinite(j2_star) or
+        eps2_star == 0.0 or
+        j2_star == 0.0):
+        return y1, z
 
     rho = zeta2_star / (eps2_star * j2_star)
+
+    if not math.isfinite(rho):
+        return y1, z
+
     rho = max(min(rho, 0.999), -0.999)
 
-    y1 = random.gauss(0, 1)
-    z  = random.gauss(0, 1)
-    y2 = rho * y1 + math.sqrt(1.0 - rho*rho) * z
+    y2 = rho * y1 + math.sqrt(1.0 - rho * rho) * z
     return y1, y2
 
 
@@ -500,6 +562,8 @@ def run_simulation(
             idx = np.argmin(np.abs(logX_bins - logx))
             counts[idx] += weight
 
+        counts = np.nan_to_num(counts, nan=0.0, posinf=0.0, neginf=0.0)
+        
         mask = X_BINS <= 2.0
         num = 0.0
         den = 0.0
@@ -563,7 +627,14 @@ def run_simulation(
                 new_stars.append(reinject_star((x, j, cycle_new, u_tag, weight)))
             else:
                 x_final, j_final, u_tag_final, weight_final = apply_cloning(x_new, j_new, u_tag, weight)
-                new_stars.append((x_final, j_final, cycle_new, u_tag_final, weight_final))
+                
+                if (not math.isfinite(x_final) or
+                    not math.isfinite(j_final) or
+                    not math.isfinite(weight_final) or
+                    x_final <= 0.0):
+                    new_stars.append(initialize_star())
+                else:
+                    new_stars.append((x_final, j_final, cycle_new, u_tag_final, weight_final))
 
         stars = new_stars
 
@@ -673,7 +744,14 @@ def process_stars_block(args):
                 new_stars.append(reinject_star((x, j, cycle_new, u_tag, weight)))
             else:
                 x_final, j_final, u_tag_final, weight_final = apply_cloning(x_new, j_new, u_tag, weight)
-                new_stars.append((x_final, j_final, cycle_new, u_tag_final, weight_final))
+                
+                if (not math.isfinite(x_final) or
+                    not math.isfinite(j_final) or
+                    not math.isfinite(weight_final) or
+                    x_final <= 0.0):
+                    new_stars.append(initialize_star())
+                else:
+                    new_stars.append((x_final, j_final, cycle_new, u_tag_final, weight_final))
         
         stars = new_stars
     
@@ -738,6 +816,8 @@ def run_simulation_parallel(
 
             star_batches = updated_batches
 
+            total_counts = np.nan_to_num(total_counts, nan=0.0, posinf=0.0, neginf=0.0)
+
             mask = X_BINS <= 2.0
             num = 0.0
             den = 0.0
@@ -801,6 +881,8 @@ def run_simulation_numba(
 
         counts = compute_counts_numba(x, weight, LOGX_BINS)
 
+        counts = np.nan_to_num(counts, nan=0.0, posinf=0.0, neginf=0.0)
+
         mask = X_BINS <= 2.0
         num = 0.0
         den = 0.0
@@ -809,10 +891,11 @@ def run_simulation_numba(
                 num += g0_bw(X_BINS[k])
                 den += counts[k]
 
-        factor = num / den if den > 0.0 else 1.0
-        counts *= factor
-
-        gbar_blocks.append(counts.copy())
+        MIN_DEN = 50.0
+        if den > MIN_DEN:
+            factor = num / den
+            counts *= factor
+            gbar_blocks.append(counts.copy())
 
     gbar_blocks = np.array(gbar_blocks[1:], dtype=np.float64)
     gbar_mean = gbar_blocks.mean(axis=0)
@@ -823,8 +906,8 @@ def run_simulation_numba(
 
 def main():
     N_STARS  = 5000
-    N_STEPS  = 1000000
-    N_BLOCKS = 100
+    N_STEPS  = 200000
+    N_BLOCKS = 40
 
     print("Warming up numba JIT functions...")
     _warmup_numba()
@@ -878,9 +961,9 @@ def main():
     plt.tight_layout()
     plt.show()
 
-    print("\n x-bin    g0(x)   gbar(no LC)   gbar(LC)")
-    for x, g0, gn, gl in zip(X_BINS, g0_vals, gbar_nolc_mean, gbar_lc_mean):
-        print(f"{x:8.3g}  {g0:7.3f}   {gn:11.3f}   {gl:11.3f}")
+    print("\n x-bin    g0(x)   gbar(no LC)   err(no LC)   gbar(LC)   err(LC)")
+    for x, g0, gn, gn_err, gl, gl_err in zip(X_BINS, g0_vals, gbar_nolc_mean, gbar_nolc_std, gbar_lc_mean, gbar_lc_std):
+        print(f"{x:8.3g}  {g0:7.3f}   {gn:11.3f}   {gn_err:11.3f}   {gl:11.3f}   {gl_err:11.3f}")
 
 
 if __name__ == "__main__":
