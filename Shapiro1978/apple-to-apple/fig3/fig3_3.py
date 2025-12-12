@@ -51,7 +51,7 @@ G0_TAB = np.array([
 
 NEG_E1 = np.array([
     [1.41e-1, 1.40e-1, 1.33e-1, 1.29e-1, 1.29e-1],
-    [-1.47e-3, -4.67e-3, -6.33e-3, -5.52e-3, -4.78e-3],
+    [1.47e-3, 4.67e-3, 6.33e-3, 5.52e-3, 4.78e-3],
     [1.96e-3, 1.59e-3, 2.83e-3, 3.38e-3, 3.49e-3],
     [3.64e-3, 4.64e-3, 4.93e-3, 4.97e-3, 4.98e-3],
     [8.39e-4, 8.53e-4, 8.56e-4, 8.56e-4, 8.56e-4],
@@ -421,32 +421,8 @@ def evolve_block_numba(x, j, cycle, u_tag, weight,
                         if j_new < jmin:
                             x_new, j_new, cyc_new, ut, w = inject_new_star(X_B)
 
-                u_val = x_to_u(x_new)
-
-                if u_val > ut:
-                    found_boundary = False
-                    for m in range(U_BOUNDS.size):
-                        u_boundary = U_BOUNDS[m]
-                        if u_boundary > ut:
-                            if w < 1.0 - 1e-12:
-                                w = w * K_CLONES
-                                if w > 1.0:
-                                    w = 1.0
-                                ut = u_boundary
-                                found_boundary = True
-                            else:
-                                x_new, j_new, cyc_new, ut, w = inject_new_star(X_B)
-                                found_boundary = True
-                            break
-                    if not found_boundary:
-                        x_new, j_new, cyc_new, ut, w = inject_new_star(X_B)
-                else:
-                    for m in range(U_BOUNDS.size):
-                        u_boundary = U_BOUNDS[m]
-                        if u_val < u_boundary and u_boundary < ut:
-                            w = max(w / K_CLONES, 1.0 / MAX_WEIGHT)
-                            ut = u_boundary
-                            break
+                w = 1.0
+                ut = ut
 
             if (not math.isfinite(x_new) or
                 not math.isfinite(j_new) or
@@ -879,7 +855,8 @@ def run_simulation_numba(
         evolve_block_numba(x, j, cycle, u_tag, weight,
                            loss_cone, steps_per_block)
 
-        counts = compute_counts_numba(x, weight, LOGX_BINS)
+        ones = np.ones_like(x)
+        counts = compute_counts_numba(x, ones, LOGX_BINS)
 
         counts = np.nan_to_num(counts, nan=0.0, posinf=0.0, neginf=0.0)
 
