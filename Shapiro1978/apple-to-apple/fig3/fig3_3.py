@@ -301,7 +301,7 @@ def inject_new_star(x_outer):
 
     j = math.sqrt(np.random.random())
 
-    u_tag = x_to_u(x)
+    u_tag = 0.0
     weight = 1.0
     cycle = 0.0
 
@@ -313,16 +313,16 @@ def initialize_all_stars_numba(n_stars, x_outer):
     x      = np.empty(n_stars, dtype=np.float64)
     j      = np.empty(n_stars, dtype=np.float64)
     cycle  = np.zeros(n_stars, dtype=np.float64)
-    u_tag  = np.empty(n_stars, dtype=np.float64)
-    weight = np.empty(n_stars, dtype=np.float64)
+    u_tag  = np.zeros(n_stars, dtype=np.float64)
+    weight = np.ones(n_stars, dtype=np.float64)
 
     for i in range(n_stars):
         xi, ji, cyc, ut, w = inject_new_star(x_outer)
         x[i] = xi
         j[i] = ji
         cycle[i] = cyc
-        u_tag[i] = ut
-        weight[i] = w
+        u_tag[i] = 0.0
+        weight[i] = 1.0
 
     return x, j, cycle, u_tag, weight
 
@@ -422,7 +422,7 @@ def evolve_block_numba(x, j, cycle, u_tag, weight,
                             x_new, j_new, cyc_new, ut, w = inject_new_star(X_B)
 
                 w = 1.0
-                ut = ut
+                ut = 0.0
 
             if (not math.isfinite(x_new) or
                 not math.isfinite(j_new) or
@@ -859,24 +859,21 @@ def run_simulation_numba(
         counts = compute_counts_numba(x, ones, LOGX_BINS)
 
         counts = np.nan_to_num(counts, nan=0.0, posinf=0.0, neginf=0.0)
-
-        mask = X_BINS <= 2.0
-        num = 0.0
-        den = 0.0
-        for k in range(len(X_BINS)):
-            if mask[k] and counts[k] > 0.0:
-                num += g0_bw(X_BINS[k])
-                den += counts[k]
-
-        MIN_DEN = 50.0
-        if den > MIN_DEN:
-            factor = num / den
-            counts *= factor
-            gbar_blocks.append(counts.copy())
+        gbar_blocks.append(counts.copy())
 
     gbar_blocks = np.array(gbar_blocks[1:], dtype=np.float64)
-    gbar_mean = gbar_blocks.mean(axis=0)
-    gbar_std  = gbar_blocks.std(axis=0)
+    raw_mean = gbar_blocks.mean(axis=0)
+    raw_std  = gbar_blocks.std(axis=0)
+
+    g0_vals = np.array([g0_bw(x) for x in X_BINS])
+    mask = X_BINS <= 2.0
+
+    num = g0_vals[mask].sum()
+    den = raw_mean[mask].sum()
+    factor = num / den if den > 0.0 else 1.0
+
+    gbar_mean = raw_mean * factor
+    gbar_std  = raw_std * factor
 
     return gbar_mean, gbar_std
 
