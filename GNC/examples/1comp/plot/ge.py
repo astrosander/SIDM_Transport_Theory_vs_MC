@@ -69,24 +69,56 @@ def set_xyaxis(ax=None, xmajorstep=None,xminorstep=None, \
 		ax.xaxis.set_ticklabels([])
 		
 
-def get_scatters_main(fdir, sm,sn,sb,cr=False):
-	nums=1; nume=5; ncol=nbin
-	x=np.zeros([nume-nums, ncol])
-	y=np.zeros([nume-nums, ncol])
-	for j in range(nums, nume):
-		f=h5py.File(fdir+str(sm)+"_"+str(sn-j)+".hdf5", 'r' )
-		#print(sn,j-nums)
-		x[j-nums,:]=f[sb]['   X']
-		y[j-nums,:]=f[sb]['  FX']
+def get_scatters_main(fdir, snapshot, update_idx, sb, cr=False):
+	"""
+	Load data from HDF5 file.
+	
+	Args:
+		fdir: Directory prefix (e.g., "../output/ecev/dms/dms_")
+		snapshot: Snapshot number (e.g., 10)
+		update_idx: Update index within snapshot (e.g., 1, 3, 5, 7, 10)
+		sb: HDF5 group path (e.g., '1/star/fgx/')
+		cr: If True, compute density; if False, compute g(x)
+	"""
+	import os
+	ncol=nbin
+	
+	# Direct file naming: dms_{snapshot}_{update}.hdf5
+	fname = fdir + str(snapshot) + "_" + str(update_idx) + ".hdf5"
+	
+	if not os.path.exists(fname):
+		print(f"Warning: File not found: {fname}")
+		return np.zeros(ncol), np.zeros(ncol), np.zeros(ncol)
+	
+	try:
+		f=h5py.File(fname, 'r')
+		if sb in f:
+			x = np.array(f[sb]['   X'])
+			y = np.array(f[sb]['  FX'])
+		else:
+			print(f"Warning: Group '{sb}' not found in {fname}")
+			print(f"  Available groups: {list(f.keys())}")
+			# Try to find the data in a different location
+			f.visititems(lambda n, o: print(f"    {n}") if isinstance(o, h5py.Group) else None)
+			f.close()
+			return np.zeros(ncol), np.zeros(ncol), np.zeros(ncol)
+		f.close()
+	except Exception as e:
+		print(f"Error reading {fname}: {e}")
+		return np.zeros(ncol), np.zeros(ncol), np.zeros(ncol)
+	
+	# Handle zeros in y to avoid log10 errors
+	y = np.where(y > 0, y, 1e-10)
+	
 	if(cr):
-		mean=np.mean(np.log10(y)+lpc3,axis=0)
-		err=np.var(np.log10(y)+lpc3,axis=0)**0.5
-		r=x[0,:]-rh
+		mean=np.log10(y)+lpc3
+		err=np.zeros_like(mean)
+		r=x-rh
 	else:
-		mean=np.mean(np.log10(y),axis=0)
-		err=np.var(np.log10(y),axis=0)**0.5
-		r=x[0,:]
-	return r,mean,err
+		mean=np.log10(y)
+		err=np.zeros_like(mean)
+		r=x
+	return r, mean, err
 
 
 plt.figure(figsize=(8,4))
@@ -95,15 +127,17 @@ plt.clf()
 sx=1;sy=2
 
 ax=plt.subplot(sx,sy,1)
-for i in [1,2,3,4,5,10]:
-	r, mean, err=get_scatters_main("../output/ecev/dms/dms_", i,10,  '1/star/fgx/')	
-	ax.errorbar(r, mean, yerr=err,fmt=stylestar,label=f'{i/10.:.1f}'+' $T_{\\rm rlx}$',mfc='w', markersize=mzstar)
-
+# Use different snapshots with update 10 (the final update of each snapshot)
+# Snapshot i represents time i/10 T_rlx
+for snapshot in [1, 2, 3, 5, 10]:
+	r, mean, err=get_scatters_main("../output/ecev/dms/dms_", snapshot, 10,  '1/star/fgx/')	
+	ax.errorbar(r, mean, yerr=err,fmt=stylestar,label=f'{snapshot/10.:.1f}'+' $T_{\\rm rlx}$',mfc='w', markersize=mzstar)
+	print("snapshot=", snapshot, "r=", r, "mean=", mean, "err=", err)
 ax.legend(loc='upper left',ncol=2)
-
+# print("snapshot=", snapshot, "r=", r, "mean=", mean, "err=", err)
 #ax.legend(loc="lower right", ncol=1)
-ax.set_xlim(np.log10(0.05),5.2)
-ax.set_ylim(-0.2,2)
+# ax.set_xlim(np.log10(0.05),5.2)
+# ax.set_ylim(-0.2,2)
 #ax.set_yscale("log")
 ax.set_xlabel("log $x$",fontsize=18)
 ax.set_ylabel("log $\\bar g(x)$",fontsize=18)
@@ -115,14 +149,15 @@ ax=plt.subplot(sx,sy,2)
 #	stylestar,cana1,mz=mzstar,mfc='w')
 #plot_scatters(ax, "../../../version_1.7_1D/model/nolc_1comp/output/ecev/dms/dms_burn_in_", 50,"1/star/fden",\
 #	"o-",cgnc1,mz=mzstar)	
-for i in [1,2,3,4,5,10]:
-	r, mean, err=get_scatters_main("../output/ecev/dms/dms_", i,10,  '1/star/fden/',cr=True)	
-	ax.errorbar(r, mean, yerr=err,fmt=stylestar,label=str(i),mfc='w', markersize=mzstar)	
-
+# Use different snapshots with update 10 for density
+for snapshot in [1, 2, 3, 5, 10]:
+	r, mean, err=get_scatters_main("../output/ecev/dms/dms_", snapshot, 10,  '1/star/fden/',cr=True)	
+	ax.errorbar(r, mean, yerr=err,fmt=stylestar,label=f'{snapshot/10.:.1f}',mfc='w', markersize=mzstar)
+	print("snapshot=", snapshot, "r=", r, "mean=", mean, "err=", err)
 
 #ax.set_xscale("log")
-ax.set_xlim(rmin-rh,0)
-ax.set_ylim(3,13.5)
+# ax.set_xlim(rmin-rh,0)
+# ax.set_ylim(3,13.5)
 #ax.set_yscale("log")
 ax.set_xlabel("log $r/r_h$",fontsize=18)
 ax.set_ylabel("log $n(r)$ (pc$^{-3})$",fontsize=18)

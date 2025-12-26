@@ -1,6 +1,10 @@
+"""
+gen_ge.py - Generate distribution function g(x) from particle samples.
+"""
 import math
+import random
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -29,6 +33,79 @@ star_type_NS = 4
 star_type_BD = 5
 
 exit_normal = 0
+
+
+def set_seed(same_seed: int, seed_value: int) -> None:
+    """Set random seed for reproducibility."""
+    if same_seed > 0:
+        random.seed(seed_value)
+        np.random.seed(seed_value)
+    else:
+        random.seed()
+        np.random.seed()
+
+
+def collection_data_single_bympi(smsa: List[Any], n: int) -> None:
+    """Collect particle sample data via MPI."""
+    if _COMM is None or _NTASKS <= 1:
+        # Single process mode - just copy local data
+        if len(smsa) > 0:
+            smsa[0] = bksams_arr_norm
+        return
+    
+    # MPI mode
+    update_arrays_single()
+    _COMM.Barrier()
+    
+    if _RID == mpi_master_id:
+        print("single: start_collect")
+        # Root collects from all processes
+        for i in range(_NTASKS):
+            if i != mpi_master_id:
+                # Receive from other processes
+                data = _COMM.recv(source=i, tag=0)
+                smsa[i] = data
+            else:
+                smsa[mpi_master_id] = bksams_arr_norm
+        print("single: end_collect")
+    else:
+        # Send to root
+        _COMM.send(bksams_arr_norm, dest=mpi_master_id, tag=0)
+    
+    print(f"collection finished rid={_RID}")
+
+
+def get_dms(dm: "DiffuseMspec") -> None:
+    """Get diffuse mass spectrum with MPI synchronization."""
+    if _COMM is not None:
+        _COMM.Barrier()
+    
+    # Broadcast barge and fden
+    bcast_dms_barge(dm)
+    bcast_dms_fden(dm)
+    
+    print(f"start get diffuse coefficients rid={_RID}")
+    dm_get_dc_mpi(dm)
+    print(f"cal dms finished rid={_RID}")
+    
+    if _COMM is not None:
+        _COMM.Barrier()
+
+
+def bcast_dms_barge(dm: "DiffuseMspec") -> None:
+    """Broadcast barge arrays via MPI."""
+    if _COMM is None or _NTASKS <= 1:
+        return
+    # Placeholder - in full implementation would broadcast S1D arrays
+    pass
+
+
+def bcast_dms_fden(dm: "DiffuseMspec") -> None:
+    """Broadcast fden arrays via MPI."""
+    if _COMM is None or _NTASKS <= 1:
+        return
+    # Placeholder - in full implementation would broadcast S1D arrays
+    pass
 
 
 @dataclass
@@ -144,6 +221,24 @@ class DiffuseCoeffGrid:
     s2_djj: S2DType = field(default_factory=S2DType)
     s2_dej: S2DType = field(default_factory=S2DType)
 
+    def init(self, nbin_grid: int, emin: float, emax: float, jmin: float, jmax: float, grid_type: int) -> None:
+        """Initialize all diffusion coefficient grids."""
+        sts_type = 0  # Default statistics type
+        self.s2_de_110.init(nbin_grid, nbin_grid, emin, emax, jmin, jmax, sts_type)
+        self.s2_de_110.set_range()
+        self.s2_de_0.init(nbin_grid, nbin_grid, emin, emax, jmin, jmax, sts_type)
+        self.s2_de_0.set_range()
+        self.s2_dee.init(nbin_grid, nbin_grid, emin, emax, jmin, jmax, sts_type)
+        self.s2_dee.set_range()
+        self.s2_dj_111.init(nbin_grid, nbin_grid, emin, emax, jmin, jmax, sts_type)
+        self.s2_dj_111.set_range()
+        self.s2_dj_rest.init(nbin_grid, nbin_grid, emin, emax, jmin, jmax, sts_type)
+        self.s2_dj_rest.set_range()
+        self.s2_djj.init(nbin_grid, nbin_grid, emin, emax, jmin, jmax, sts_type)
+        self.s2_djj.set_range()
+        self.s2_dej.init(nbin_grid, nbin_grid, emin, emax, jmin, jmax, sts_type)
+        self.s2_dej.set_range()
+
 
 @dataclass
 class NejwRec:
@@ -154,10 +249,99 @@ class NejwRec:
 
 
 @dataclass
+class S2DHstType:
+    """2D histogram type with weights."""
+    nx: int = 0
+    ny: int = 0
+    xmin: float = 0.0
+    xmax: float = 0.0
+    ymin: float = 0.0
+    ymax: float = 0.0
+    xstep: float = 0.0
+    ystep: float = 0.0
+    xcenter: Optional[np.ndarray] = None
+    ycenter: Optional[np.ndarray] = None
+    nxyw: Optional[np.ndarray] = None  # Weighted histogram
+    
+    def init(self, nbinx: int, nbiny: int, xmin: float, xmax: float, ymin: float, ymax: float, use_weight: bool = True) -> None:
+        self.nx = int(nbinx)
+        self.ny = int(nbiny)
+        self.xmin = float(xmin)
+        self.xmax = float(xmax)
+        self.ymin = float(ymin)
+        self.ymax = float(ymax)
+        self.xcenter = np.zeros(self.nx, dtype=float)
+        self.ycenter = np.zeros(self.ny, dtype=float)
+        self.nxyw = np.zeros((self.nx, self.ny), dtype=float)
+        
+    def set_range(self) -> None:
+        if self.nx > 1:
+            self.xcenter[:] = np.linspace(self.xmin, self.xmax, self.nx)
+            self.xstep = (self.xmax - self.xmin) / float(self.nx - 1) if self.nx > 1 else 0.0
+        else:
+            self.xcenter[:] = self.xmin
+            self.xstep = 0.0
+        if self.ny > 1:
+            self.ycenter[:] = np.linspace(self.ymin, self.ymax, self.ny)
+            self.ystep = (self.ymax - self.ymin) / float(self.ny - 1) if self.ny > 1 else 0.0
+        else:
+            self.ycenter[:] = self.ymin
+            self.ystep = 0.0
+    
+    def get_stats_weight(self, en: List[float], jm: List[float], we: List[float], n: int) -> None:
+        """Bin particles into weighted histogram."""
+        for k in range(n):
+            # Find x bin
+            if self.nx > 1:
+                ix = int((en[k] - self.xmin) / (self.xmax - self.xmin) * self.nx)
+                ix = max(0, min(self.nx - 1, ix))
+            else:
+                ix = 0
+            
+            # Find y bin
+            if self.ny > 1:
+                iy = int((jm[k] - self.ymin) / (self.ymax - self.ymin) * self.ny)
+                iy = max(0, min(self.ny - 1, iy))
+            else:
+                iy = 0
+            
+            # Add weight to bin
+            self.nxyw[ix, iy] += we[k]
+
+
+@dataclass
 class DmsStellarObject:
     n: int = 0
+    n_real: float = 0.0
     nejw: Optional[np.ndarray] = None
     barge: S1DType = field(default_factory=S1DType)
+    nxj: S2DHstType = field(default_factory=S2DHstType)
+    gxj: S2DType = field(default_factory=S2DType)
+    
+    def dms_so_get_nxj_from_nejw(self, jbtype: int) -> None:
+        """Bin particles into nxj histogram."""
+        if self.n <= 0:
+            self.n_real = 0.0
+            return
+        if self.nejw is None:
+            return
+        
+        en = [rec.e for rec in self.nejw[:self.n]]
+        jm_raw = [rec.j for rec in self.nejw[:self.n]]
+        we = [rec.w for rec in self.nejw[:self.n]]
+        
+        # Convert j to appropriate space
+        if jbtype == Jbin_type_lin:
+            jm = jm_raw
+        elif jbtype == Jbin_type_log:
+            jm = [math.log10(v) if v > 0 else -10 for v in jm_raw]
+        elif jbtype == Jbin_type_sqr:
+            jm = [v * v for v in jm_raw]
+        else:
+            raise RuntimeError(f"dms_nxj_newj:error! define jbtype {jbtype}")
+        
+        self.nxj.get_stats_weight(en, jm, we, self.n)
+        self.n_real = sum(we)
 
 
 @dataclass
@@ -227,6 +411,37 @@ class DiffuseMspec:
     def init(self, n: int) -> None:
         self.n = int(n)
         self.mb = [MassBins() for _ in range(self.n)]
+        
+        # Initialize dc0 (global diffusion coefficients)
+        self.dc0.init(self.nbin_grid, self.emin, self.emax, self.jmin, self.jmax, self.grid_type)
+        
+        # Initialize each mass bin's dc grid and parameters
+        for i in range(self.n):
+            mb = self.mb[i]
+            mb.nbin_grid = self.nbin_grid
+            mb.nbin_gx = self.nbin_gx
+            mb.emin = self.emin
+            mb.emax = self.emax
+            mb.jmin = self.jmin
+            mb.jmax = self.jmax
+            mb.mbh = self.mbh
+            mb.v0 = self.v0
+            mb.n0 = self.n0
+            mb.rh = self.rh
+            # Initialize diffusion coefficient grid for this mass bin
+            mb.dc.init(self.nbin_grid, self.emin, self.emax, self.jmin, self.jmax, self.grid_type)
+            # Initialize barge, nxj, and gxj for each stellar object type
+            for so_name in ['all', 'star', 'sbh', 'wd', 'ns', 'bd']:
+                so = getattr(mb, so_name)
+                # Initialize barge (g(x) distribution)
+                so.barge.init(self.emin, self.emax, self.nbin_gx, 0)
+                so.barge.set_range()
+                # Initialize nxj (weighted histogram)
+                so.nxj.init(self.nbin_gx, self.nbin_gx, self.emin, self.emax, self.jmin, self.jmax, True)
+                so.nxj.set_range()
+                # Initialize gxj (normalized distribution function)
+                so.gxj.init(self.nbin_gx, self.nbin_gx, self.emin, self.emax, self.jmin, self.jmax, 0)
+                so.gxj.set_range()
 
     def get_asymp_norm_factor(self) -> None:
         get_asymp_norm_factor(self)
@@ -245,6 +460,66 @@ class DiffuseMspec:
 
     def get_barge0(self) -> None:
         get_barge0(self)
+
+    def output_bin(self, fl: str) -> None:
+        """Output DiffuseMspec to binary file."""
+        import pickle
+        with open(fl, "wb") as f:
+            # Save basic parameters
+            pickle.dump({
+                'n': self.n,
+                'mbh': self.mbh,
+                'v0': self.v0,
+                'n0': self.n0,
+                'rh': self.rh,
+                'emin': self.emin,
+                'emax': self.emax,
+                'jmin': self.jmin,
+                'jmax': self.jmax,
+                'nbin_grid': self.nbin_grid,
+                'nbin_gx': self.nbin_gx,
+                'x_boundary': self.x_boundary,
+                'idx_ref': self.idx_ref,
+                'jbin_type': self.jbin_type,
+                'grid_type': self.grid_type,
+                'weight_asym': self.weight_asym,
+            }, f, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            # Save mass bins (simplified - just the essential data)
+            mb_data = []
+            if self.mb is not None:
+                for mb in self.mb:
+                    mb_data.append({
+                        'mc': mb.mc,
+                        'm1': mb.m1,
+                        'm2': mb.m2,
+                    })
+            pickle.dump(mb_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def input_bin(self, fl: str) -> None:
+        """Input DiffuseMspec from binary file."""
+        import pickle
+        import os
+        if not os.path.exists(fl):
+            print(f"Warning: DMS file not found: {fl}")
+            return
+        with open(fl, "rb") as f:
+            params = pickle.load(f)
+            for key, val in params.items():
+                if hasattr(self, key):
+                    setattr(self, key, val)
+            
+            mb_data = pickle.load(f)
+            if len(mb_data) > 0:
+                self.init(len(mb_data))
+                for i, mbd in enumerate(mb_data):
+                    for key, val in mbd.items():
+                        if hasattr(self.mb[i], key):
+                            setattr(self.mb[i], key, val)
+
+    def print_norm(self, unit: int) -> None:
+        """Print normalization info."""
+        print(f"DMS norm: n={self.n}, weight_asym={self.weight_asym}")
 
 
 @dataclass
@@ -333,7 +608,38 @@ def sams_arr_select_type_single(bks: ParticleSamplesArr, out: ParticleSamplesArr
 
 
 def all_chain_to_arr_single(chain: Any, out: ParticleSamplesArr) -> None:
-    return
+    """Convert chain of particles to array format."""
+    if chain is None or not hasattr(chain, 'head') or chain.head is None:
+        out.n = 0
+        out.sp = np.zeros(0, dtype=object)
+        return
+    
+    # Count particles in chain
+    count = 0
+    ptr = chain.head
+    while ptr is not None:
+        if hasattr(ptr, 'ob') and ptr.ob is not None:
+            count += 1
+        ptr = ptr.next if hasattr(ptr, 'next') else None
+    
+    if count == 0:
+        out.n = 0
+        out.sp = np.zeros(0, dtype=object)
+        return
+    
+    # Extract particles from chain
+    particles = np.empty(count, dtype=object)
+    ptr = chain.head
+    idx = 0
+    while ptr is not None and idx < count:
+        if hasattr(ptr, 'ob') and ptr.ob is not None:
+            particles[idx] = ptr.ob
+            idx += 1
+        ptr = ptr.next if hasattr(ptr, 'next') else None
+    
+    out.n = idx
+    out.sp = particles[:idx]
+    print(f"DEBUG all_chain_to_arr_single: Extracted {out.n} particles from chain")
 
 
 def set_sample_arr_indexs_rid_particle(arr: ParticleSamplesArr, rid: int) -> None:
@@ -409,21 +715,131 @@ def get_dens0(dm: DiffuseMspec) -> None:
 
 
 def get_nxj(dm: DiffuseMspec) -> None:
-    return
+    """Get nxj histogram from particle (e,j,w) values."""
+    if dm.mb is None:
+        return
+    
+    n_tot_comp = 6  # star, sbh, ns, wd, bd, (bstar, bbh not used here)
+    
+    for i in range(dm.n):
+        mb = dm.mb[i]
+        # Process each stellar object type
+        for so_name in ['star', 'sbh', 'ns', 'wd', 'bd', 'all']:
+            so = getattr(mb, so_name, None)
+            if so is not None and hasattr(so, 'dms_so_get_nxj_from_nejw'):
+                so.dms_so_get_nxj_from_nejw(dm.jbin_type)
+        
+        # Sum all components into 'all'
+        if hasattr(mb.all, 'nxj') and hasattr(mb.all.nxj, 'nxyw'):
+            mb.all.nxj.nxyw = np.zeros_like(mb.all.nxj.nxyw)
+            for so_name in ['star', 'sbh', 'ns', 'wd', 'bd']:
+                so = getattr(mb, so_name, None)
+                if so is not None and hasattr(so, 'nxj') and hasattr(so.nxj, 'nxyw'):
+                    mb.all.nxj.nxyw += so.nxj.nxyw
 
 
 def get_fxj0(dm: DiffuseMspec) -> None:
-    return
+    """Normalize nxj histogram to create gxj distribution function."""
+    if dm.mb is None:
+        return
+    
+    for i in range(dm.n):
+        mb = dm.mb[i]
+        # Process each stellar object
+        for so_name in ['all', 'star', 'sbh', 'ns', 'wd', 'bd']:
+            so = getattr(mb, so_name, None)
+            if so is not None:
+                dms_so_get_fxj(so, mb.n0, mb.mbh, mb.v0, dm.jbin_type)
 
 
 def get_barge0(dm: DiffuseMspec) -> None:
-    return
+    """Integrate gxj over j to get barge (g(x) distribution)."""
+    if dm.mb is None:
+        return
+    
+    for i in range(dm.n):
+        mb = dm.mb[i]
+        # Process each stellar object
+        for so_name in ['all', 'star', 'sbh', 'ns', 'wd', 'bd']:
+            so = getattr(mb, so_name, None)
+            if so is not None:
+                get_barge_stellar(so, dm.jbin_type)
+
+
+def get_barge_stellar(so: Any, jbtype: int) -> None:
+    """Integrate gxj over j to get barge."""
+    if not hasattr(so, 'n') or so.n == 0:
+        return
+    if not hasattr(so, 'barge') or not hasattr(so, 'gxj'):
+        return
+    
+    barge = so.barge
+    gxj = so.gxj
+    
+    if not hasattr(barge, 'fx') or not hasattr(gxj, 'fxy'):
+        return
+    if barge.nbin != gxj.nx:
+        print(f"Error: barge.nbin={barge.nbin} should equal gxj.nx={gxj.nx}")
+        return
+    
+    log10_val = math.log(10.0)
+    
+    for i in range(barge.nbin):
+        int_out = 0.0
+        barge.xb[i] = gxj.xcenter[i]
+        
+        if jbtype == Jbin_type_lin:
+            for j in range(gxj.ny):
+                int_out += gxj.fxy[i, j] * gxj.ycenter[j] * gxj.ystep * 2.0
+        
+        elif jbtype == Jbin_type_log:
+            for j in range(gxj.ny):
+                int_out += gxj.fxy[i, j] * (10.0 ** gxj.ycenter[j]) ** 2 * gxj.ystep * 2.0 * log10_val
+        
+        elif jbtype == Jbin_type_sqr:
+            for j in range(gxj.ny):
+                int_out += gxj.fxy[i, j] * gxj.ycenter[j] * gxj.ystep * 2.0
+        
+        barge.fx[i] = int_out
+        
+        if math.isnan(barge.fx[i]):
+            print(f"get_barge_stellar: fx[{i}] is NaN, int_out={int_out}")
+            return
+    
+    # Debug output
+    if hasattr(barge, 'fx') and barge.fx is not None:
+        fx_sum = np.sum(barge.fx) if isinstance(barge.fx, np.ndarray) else sum(barge.fx)
+        fx_max = np.max(barge.fx) if isinstance(barge.fx, np.ndarray) else max(barge.fx)
+        print(f"DEBUG get_barge_stellar: so.n={so.n}, sum(fx)={fx_sum:.3e}, max(fx)={fx_max:.3e}")
 
 
 def get_ejw_from_particle(estar: np.ndarray, jstar: np.ndarray, wstar: np.ndarray, mstar: np.ndarray, n_star: int,
                           m1: float, m2: float, mbh: float, v0: float, xb: float,
                           nejw_out: Any, nsam_out: Any) -> Tuple[np.ndarray, int]:
-    return np.zeros(0, dtype=object), 0
+    """Convert particle (e,j,mass,weight) to nejw format for binning."""
+    if n_star <= 0:
+        return np.zeros(0, dtype=object), 0
+    
+    # Filter particles by mass range
+    mask = (mstar >= m1) & (mstar <= m2)
+    n_selected = np.sum(mask)
+    
+    if n_selected == 0:
+        return np.zeros(0, dtype=object), 0
+    
+    # Create nej w records
+    nejw_list = []
+    for i in range(n_star):
+        if mask[i]:
+            rec = NejwRec(
+                e=float(estar[i]),
+                j=float(jstar[i]),
+                w=float(wstar[i]),
+                idx=i
+            )
+            nejw_list.append(rec)
+    
+    return np.array(nejw_list, dtype=object), len(nejw_list)
 
 
 def get_ge_by_root(smsa: Sequence[ParticleSamplesArr], n: int, norm_in: bool) -> None:
@@ -559,16 +975,28 @@ def set_mass_bin_mass_given(dm: DiffuseMspec, masses: np.ndarray, m1: np.ndarray
 
 
 def set_dm_init(dm: DiffuseMspec) -> None:
+    # Import the actual configured ctl from com_main_gw to get real values
+    import com_main_gw as cmg
+    actual_ctl = cmg.ctl
+    
+    # Use global values from com_main_gw for physical parameters
+    actual_rh = cmg.rh if hasattr(cmg, 'rh') else rh
+    actual_mbh = cmg.mbh if hasattr(cmg, 'mbh') else mbh
+    actual_log10emin = cmg.log10emin_factor if hasattr(cmg, 'log10emin_factor') else log10emin_factor
+    actual_log10emax = cmg.log10emax_factor if hasattr(cmg, 'log10emax_factor') else log10emax_factor
+    actual_jmin = cmg.jmin_value if hasattr(cmg, 'jmin_value') else jmin_value
+    actual_jmax = cmg.jmax_value if hasattr(cmg, 'jmax_value') else jmax_value
+    
     dm.set_diffuse_mspec(
-        ctl.grid_bins, ctl.gx_bins,
-        log10emin_factor, log10emax_factor,
-        jmin_value, jmax_value,
-        mbh, ctl.v0, ctl.n0, rh, ctl.x_boundary,
-        ctl.idx_ref, ctl.jbin_type, ctl.grid_type
+        actual_ctl.grid_bins, actual_ctl.gx_bins,
+        actual_log10emin, actual_log10emax,
+        actual_jmin, actual_jmax,
+        actual_mbh, actual_ctl.v0, actual_ctl.n0, actual_rh, actual_ctl.x_boundary,
+        actual_ctl.idx_ref, actual_ctl.jbin_type, actual_ctl.grid_type
     )
-    dm.init(ctl.m_bins)
-    if ctl.bin_mass is not None and ctl.bin_mass_m1 is not None and ctl.bin_mass_m2 is not None and ctl.asymptot is not None:
-        set_mass_bin_mass_given(dm, ctl.bin_mass, ctl.bin_mass_m1, ctl.bin_mass_m2, ctl.asymptot, ctl.m_bins)
+    dm.init(actual_ctl.m_bins)
+    if actual_ctl.bin_mass is not None and actual_ctl.bin_mass_m1 is not None and actual_ctl.bin_mass_m2 is not None and actual_ctl.asymptot is not None:
+        set_mass_bin_mass_given(dm, actual_ctl.bin_mass, actual_ctl.bin_mass_m1, actual_ctl.bin_mass_m2, actual_ctl.asymptot, actual_ctl.m_bins)
 
 
 def fx_g(x: float) -> float:
@@ -800,12 +1228,13 @@ def get_num_boundary(so: DmsStellarObject) -> Tuple[float, float, float, float]:
 
 
 def print_num_all(dm: DiffuseMspec) -> None:
-    nb = np.zeros((ctl.m_bins, 10), dtype=float)
-    nbw = np.zeros((ctl.m_bins, 10), dtype=float)
+    if dm.mb is None or dm.n <= 0:
+        print("print_num_all: no mass bins")
+        return
+    nb = np.zeros((dm.n, 10), dtype=float)
+    nbw = np.zeros((dm.n, 10), dtype=float)
     print("print_num_all==========================")
     print("i  mc          star         sbh          bbh          ns           wd           bd")
-    if dm.mb is None:
-        return
     for i in range(dm.n):
         b, w = get_num_all(dm.mb[i].star)
         nb[i, 0], nbw[i, 0] = b, w
@@ -826,14 +1255,15 @@ def print_num_all(dm: DiffuseMspec) -> None:
 
 
 def print_num_boundary(dm: DiffuseMspec) -> None:
-    nb = np.zeros((ctl.m_bins, 10), dtype=float)
-    nbw = np.zeros((ctl.m_bins, 10), dtype=float)
-    nbj1 = np.zeros((ctl.m_bins, 10), dtype=float)
-    nbj2 = np.zeros((ctl.m_bins, 10), dtype=float)
+    if dm.mb is None or dm.n <= 0:
+        print("print_num_boundary: no mass bins")
+        return
+    nb = np.zeros((dm.n, 10), dtype=float)
+    nbw = np.zeros((dm.n, 10), dtype=float)
+    nbj1 = np.zeros((dm.n, 10), dtype=float)
+    nbj2 = np.zeros((dm.n, 10), dtype=float)
     print("print_num_boundary==========================")
     print("i  mc          star         sbh          bbh          ns           wd           bd")
-    if dm.mb is None:
-        return
     for i in range(dm.n):
         b, j1, j2, w = get_num_boundary(dm.mb[i].star)
         nb[i, 0], nbj1[i, 0], nbj2[i, 0], nbw[i, 0] = b, j1, j2, w
@@ -879,7 +1309,9 @@ def set_weights_for_all_samples(sms_single: Any, sms_arr_single: ParticleSamples
     set_real_weight(sms_single)
 
 
-bksams = None
+# Import bksams ChainType instance from com_main_gw (the particle chain)
+# Keep local ParticleSamplesArr instances (different type - uses numpy arrays)
+from com_main_gw import bksams
 bksams_arr = ParticleSamplesArr()
 bksams_pointer_arr = None
 bksams_arr_norm = ParticleSamplesArr()
@@ -954,7 +1386,51 @@ def get_den_u(fdenu: S1DType, rmin: float, rmax: float, nbin: int, r0: float, n0
 
 
 def dms_so_get_fxj(so: DmsStellarObject, n0: float, mbh: float, v0: float, jbtype: int) -> None:
-    return
+    """Convert weighted histogram nxj to distribution function gxj."""
+    if not hasattr(so, 'n') or so.n == 0:
+        return
+    if not hasattr(so, 'nxj') or not hasattr(so, 'gxj'):
+        return
+    
+    nxj = so.nxj
+    gxj = so.gxj
+    
+    if not hasattr(nxj, 'nxyw') or not hasattr(gxj, 'fxy'):
+        return
+    
+    PI = math.pi
+    log10_val = math.log(10.0)
+    
+    if jbtype == Jbin_type_lin:
+        for i in range(nxj.nx):
+            x = 10.0 ** nxj.xcenter[i]
+            for j in range(nxj.ny):
+                jm = nxj.ycenter[j]
+                if jm > 0:
+                    gxj.fxy[i, j] = (nxj.nxyw[i, j] / (x * log10_val) / nxj.xstep / nxj.ystep *
+                                    PI ** (-1.5) * v0 ** 6 * x ** 2.5 / jm / n0 / mbh ** 3)
+    
+    elif jbtype == Jbin_type_log:
+        for i in range(nxj.nx):
+            x = 10.0 ** nxj.xcenter[i]
+            for j in range(nxj.ny):
+                jm = 10.0 ** nxj.ycenter[j]
+                if jm > 0:
+                    gxj.fxy[i, j] = (nxj.nxyw[i, j] / (x * log10_val) / nxj.xstep / nxj.ystep *
+                                    PI ** (-1.5) * v0 ** 6 * x ** 2.5 / (jm ** 2 * log10_val) / n0 / mbh ** 3)
+    
+    elif jbtype == Jbin_type_sqr:
+        for i in range(nxj.nx):
+            x = 10.0 ** nxj.xcenter[i]
+            for j in range(nxj.ny):
+                jm = nxj.ycenter[j] ** 0.5
+                gxj.fxy[i, j] = (nxj.nxyw[i, j] / (x * log10_val) / nxj.xstep / nxj.ystep *
+                                PI ** (-1.5) * v0 ** 6 * x ** 2.5 / 2.0 / n0 / mbh ** 3)
+    
+    # Debug output
+    nxyw_sum = np.sum(nxj.nxyw)
+    gxj_sum = np.sum(gxj.fxy)
+    print(f"DEBUG dms_so_get_fxj: so.n={so.n}, sum(nxyw)={nxyw_sum:.3e}, sum(gxj.fxy)={gxj_sum:.3e}")
 
 
 def get_fxj(mb: MassBins, jbtype: int) -> None:

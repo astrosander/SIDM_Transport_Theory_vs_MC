@@ -32,12 +32,40 @@ def my_integral_none(a: float, b: float, fcn, nsteps: int = 4096) -> float:
     return s * h / 3.0
 
 
+try:
+    from mpi4py import MPI
+    _MPI_COMM = MPI.COMM_WORLD
+    _MPI_AVAILABLE = True
+except ImportError:
+    MPI = None
+    _MPI_COMM = None
+    _MPI_AVAILABLE = False
+
+
 def collect_data_mpi(arr_2d: list[list[float]], xbin: int, nbg: int, ned: int, nblock: int, ntasks: int) -> None:
-    return
+    """Collect 2D array data from all MPI processes."""
+    if not _MPI_AVAILABLE or ntasks <= 1:
+        return
+    
+    import numpy as np
+    
+    # Convert list to numpy for MPI
+    local_arr = np.array(arr_2d, dtype=np.float64)
+    global_arr = np.zeros_like(local_arr)
+    
+    # Allreduce to collect data from all processes
+    _MPI_COMM.Allreduce(local_arr, global_arr, op=MPI.SUM)
+    
+    # Copy back to original list
+    for i in range(len(arr_2d)):
+        for j in range(len(arr_2d[0])):
+            arr_2d[i][j] = float(global_arr[i, j])
 
 
 def mpi_barrier() -> None:
-    return
+    """MPI barrier synchronization."""
+    if _MPI_AVAILABLE and _MPI_COMM is not None:
+        _MPI_COMM.Barrier()
 
 
 def get_cfunction(s: float, e: float, ld: int, md: int, nd: int) -> float:
