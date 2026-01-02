@@ -19,9 +19,7 @@ PSTAR   = 0.005
 X_BOUND = 0.2
 SEED    = 20251028
 
-U_EXP = 1.25  # 5/4, SM78: u ∝ |E|^{-5/4}
-
-E1_SCALE_DEFAULT = 1.2
+E1_SCALE_DEFAULT = 1.0
 
 LC_SCALE_DEFAULT = 1.0
 
@@ -72,6 +70,24 @@ DX = X_EDGES[1:] - X_EDGES[:-1]
 
 
 def make_gbar_from_occupancy(x_centers, N_x, gexp, x_norm):
+    """
+    Map occupancy N(E) → ḡ(E) using paper's N(E) → g(E) ∝ x^{gexp}.
+
+    This is the primary method for computing ḡ(x) and matches SM78's definition:
+        ḡ(E) ∝ N(E) * x^{gexp}
+    where N(E) is the time-averaged occupancy per energy bin from snapshots,
+    and gexp = 2.5 for SM78 canonical case.
+
+    For SM78 fiducial model, this gives ḡ(x) ∝ x^{-0.48} in 1≲x≲100.
+
+    Args:
+        x_centers: Energy bin centers
+        N_x: Time-averaged occupancy per bin (from snapshots)
+        gexp: Exponent for N(E) → g(E) mapping (default: 2.5 for SM78)
+        x_norm: x value at which to normalize ḡ to 1
+
+    Returns (gbar_norm, gbar_raw).
+    """
     x_centers = np.asarray(x_centers, dtype=float)
     N_x = np.asarray(N_x, dtype=float)
 
@@ -88,7 +104,31 @@ def make_gbar_from_occupancy(x_centers, N_x, gexp, x_norm):
     return g_norm, g_raw
 
 
-def make_gbar_from_flux(x_centers, N_cap, N_occ, total_measure, flux_exp, x_norm, show_progress=False):
+def make_gbar_from_flux(x_centers, N_cap, N_occ, total_measure, flux_exp, x_norm):
+    """
+    Compute ḡ(E) from capture flux Γ_cap = N_cap / N_occ per t0.
+
+    From the steady-state flux relation (SM78 style):
+        Γ_cap(x) ∝ ḡ(x) / x^flux_exp
+    so to recover ḡ(x) we divide out the x^flux_exp factor:
+        ḡ(x) ∝ Γ_cap(x) / x^flux_exp
+
+    In our implementation Γ_cap(x) already grows ~ x^flux_exp, so we must DIVIDE
+    by x^flux_exp to get a roughly flat ḡ(x) consistent with occupancy-based ḡ.
+
+    For SM78 fiducial model (gexp=2.5, E2-x-power=0.62), flux_exp ≈ 3.10
+    makes flux-based ḡ match occupancy-based ḡ (both give slope ≈ -0.48).
+
+    Args:
+        x_centers: Energy bin centers
+        N_cap: Total capture counts per bin (raw counts)
+        N_occ: Total occupancy counts per bin (raw counts, not normalized)
+        total_measure: Total time/snapshots for normalization (to compute N_occ per t0)
+        flux_exp: Exponent for the flux relation (default: 3.10 for SM78 fiducial)
+        x_norm: x value at which to normalize ḡ to 1
+
+    Returns (gbar_norm, gbar_raw).
+    """
     x_centers = np.asarray(x_centers, dtype=float)
     N_cap = np.asarray(N_cap, dtype=float)
     N_occ = np.asarray(N_occ, dtype=float)
@@ -102,33 +142,14 @@ def make_gbar_from_flux(x_centers, N_cap, N_occ, total_measure, flux_exp, x_norm
         g_raw[mask] = gamma_cap[mask] / np.power(x_centers[mask], flux_exp)
 
     norm_idx = np.argmin(np.abs(x_centers - x_norm))
-    
-    # If the requested normalization bin has no captures, find the closest bin with captures
-    if g_raw[norm_idx] == 0.0 or not np.isfinite(g_raw[norm_idx]):
-        # Find all bins with valid (non-zero, finite) g_raw
-        valid_mask = (g_raw > 0.0) & np.isfinite(g_raw)
-        if not np.any(valid_mask):
-            raise RuntimeError(
-                f"No bins with valid g_raw (flux mode); need more captures. "
-                f"Total captures: {N_cap.sum()}, requested x_norm: {x_norm}"
-            )
-        
-        # Find the closest valid bin to the requested normalization point
-        valid_indices = np.where(valid_mask)[0]
-        distances = np.abs(x_centers[valid_indices] - x_norm)
-        closest_valid_idx = valid_indices[np.argmin(distances)]
-        
-        if show_progress:
-            import sys
-            print(
-                f"[diag] flux mode: requested x_norm={x_norm:.3g} has no captures; "
-                f"using x={x_centers[closest_valid_idx]:.3g} (bin {closest_valid_idx}) instead.",
-                file=sys.stderr,
-            )
-        norm_idx = closest_valid_idx
+    if g_raw[norm_idx] == 0.0:
+        raise RuntimeError(
+            f"Normalization bin at x={x_norm} has zero g_raw (flux mode); "
+            "need more captures / different x_norm."
+        )
 
     g_norm = g_raw / g_raw[norm_idx]
-    return g_norm, g_raw, x_centers[norm_idx]
+    return g_norm, g_raw
 
 GBAR_X_PAPER = np.array([
     0.2250, 0.3030, 0.4950, 1.0400, 1.2600, 1.6200, 2.3500, 5.0000,
@@ -240,8 +261,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                    zero_drift=False, zero_diffusion=False,
                    step_size_factor=1.0, n_max_override=None,
                    E2_scale=1.0, J2_scale=1.0, covEJ_scale=1.0,
-                   E2_x_power=0.0, E2_x_ref=1.0, use_sm78_physics=False,
-                   lc_strength_scale=1.0):
+                   E2_x_power=0.0, E2_x_ref=1.0, use_sm78_physics=False):
     if use_jit and HAVE_NUMBA:
         njit = nb.njit
         fastmath = dict(fastmath=True, nogil=True, cache=True)
@@ -257,7 +277,8 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         if noloss_flag:
             return 0.0
         v = 2.0 * x / X_D - (x / X_D) ** 2
-        jmin = math.sqrt(v) if v > 0.0 else 0.0
+        jmin = 0.0 if v <= 0.0 else math.sqrt(v)
+        jmin = min(1.0, jmin)  # Safety clamp: j cannot exceed 1.0
         if use_sm78_physics:
             return jmin
         else:
@@ -316,7 +337,6 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
     covEJ_scale_val = covEJ_scale
     E2_x_power_val = E2_x_power
     E2_x_ref_val = E2_x_ref
-    lc_strength_scale_val = lc_strength_scale
 
     A_e1 = SM78_A_e1
     ALPHA_e1 = SM78_ALPHA_e1
@@ -336,12 +356,25 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
 
     @njit(**fastmath)
     def diff_coeffs_sm78_exact_star(x, j):
-        # Clamp x to the interpolation grid bounds (X_GRID is ascending: [0.336, ..., 3180])
-        if x < X_GRID[0]:
-            x = X_GRID[0]
-        if x > X_GRID[-1]:
+        """
+        Exact SM78 orbit-averaged diffusion coefficients in the SAME
+        normalized units as the original Table 1 ("starred" units).
+
+        That is: this should return the analogs of
+            NEG_E1, E2, J2, J1, ZETA2
+        evaluated at (x, j) for P* = PSTAR_CANON.
+
+        Returns:
+            (e1_star, E2_star, j1_star, J2_star, covEJ_star)
+        all for pstar = PSTAR_CANON, i.e. BEFORE any pstar scaling.
+
+        IMPORTANT: Do NOT include pstar in these formulas; pstar
+        scaling is handled later in bilinear_coeffs().
+        """
+        if x < X_GRID[-1]:
             x = X_GRID[-1]
-        # Clamp j to valid range [0, 1]
+        if x > X_GRID[0]:
+            x = X_GRID[0]
         if j < 0.0:
             j = 0.0
         if j > 1.0:
@@ -453,10 +486,12 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         Jmax = 1.0 / math.sqrt(2.0 * x_clamp)
 
         e1 = -e1_scale_val * e1_star * v0_sq
-        sigE = max(E2_star, 0.0) * v0_sq
+        sigE_star = math.sqrt(max(E2_star, 0.0))
+        sigE = sigE_star * v0_sq
 
         j1 = j1_star * Jmax
-        sigJ = max(J2_star, 0.0) * Jmax
+        sigJ_star = math.sqrt(max(J2_star, 0.0))
+        sigJ = sigJ_star * Jmax
 
         covEJ = covEJ_star * v0_sq * Jmax
 
@@ -476,50 +511,47 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                n_min=0.01, n_max=3.0e4,
                diag_counts=None, lc_floor_frac=0.10, lc_gap_scale=None,
                step_size_factor_val=1.0, n_max_override_val=3.0e4,
-               use_sm78_physics=False, lc_strength_scale=1.0):
-        if use_sm78_physics and n_min > 1e-5:
-            n_min = 1e-5
+               use_sm78_physics=False):
         jmin = j_min_of_x(x, lc_scale_val, noloss_flag, use_sm78_physics)
+        E = -x
         Jmax = 1.0 / math.sqrt(2.0 * x)
-        
-        E2_star = sigE
-        J2_star = sigJ / Jmax if Jmax > 0.0 else 0.0
-        
-        HUGE = 1.0e60
-        if E2_star > 0.0 and x > 0.0:
-            n_E = (step_size_factor_val * 0.15 * x / E2_star) ** 2
+        J = j * Jmax
+
+        if sigE > 0.0:
+            n_E = (step_size_factor_val * 0.15 * abs(E) / sigE) ** 2
         else:
-            n_E = HUGE
+            n_E = n_max
 
-        if J2_star > 0.0:
-            n_J_iso = (step_size_factor_val * 0.10 / J2_star) ** 2
-            margin = max(1.0075 - j, 0.0) 
-            if margin > 0.0:
-                n_J_top = (step_size_factor_val * 0.40 * margin / J2_star) ** 2
-            else:
-                n_J_top = HUGE
-
-            if noloss_flag or jmin <= 0.0 or J2_star <= 0.0:
-                n_J_lc = HUGE
-            else:
-                if use_sm78_physics:
-                    d_allowed = max(0.25 * abs(j - jmin), 0.10 * jmin)
-                else:
-                    gap_scale = cone_gamma_val if lc_gap_scale is None else lc_gap_scale
-                    floor = lc_floor_frac if lc_floor_frac > 0.0 else 0.0
-                    d_allowed = max(gap_scale * abs(j - jmin), floor * jmin)
-
-                if d_allowed > 0.0:
-                    d_allowed_scaled = d_allowed / lc_strength_scale
-                    n_J_lc = (step_size_factor_val * d_allowed_scaled / J2_star) ** 2
-                else:
-                    n_J_lc = HUGE
-                if n_J_lc > n_max:
-                    n_J_lc = n_max
+        if sigJ > 0.0:
+            n_J_iso = (step_size_factor_val * 0.10 * Jmax / sigJ) ** 2
         else:
-            n_J_iso = HUGE
-            n_J_top = HUGE
-            n_J_lc = HUGE
+            n_J_iso = n_max
+
+        if sigJ > 0.0:
+            delta_top = max(1e-6 * Jmax, 1.0075 * Jmax - J)
+            n_J_top = (step_size_factor_val * 0.40 * delta_top / sigJ) ** 2
+        else:
+            n_J_top = n_max
+
+        if noloss_flag or jmin <= 0.0 or sigJ == 0.0:
+            n_J_lc = n_max
+        else:
+            Jmin = jmin * Jmax
+            dJ = abs(J - Jmin)
+            # SM78 eq. (29d): n^{1/2} * j_2 <= max{0.25|J-J_min|, 0.10*J_min}
+            # This is implemented as: floor = max(gap, lc_floor_frac * Jmin)
+            # where gap = cone_gamma * dJ (default cone_gamma=0.25, lc_floor_frac=0.10)
+            gap_scale = cone_gamma_val if lc_gap_scale is None else lc_gap_scale
+            gap = gap_scale * dJ
+            if lc_floor_frac > 0.0:
+                floor = max(gap, lc_floor_frac * Jmin)
+            else:
+                floor = gap
+            n_J_lc = (step_size_factor_val * floor / sigJ) ** 2
+            if n_J_lc < 1.0:
+                n_J_lc = 1.0
+            if n_J_lc > n_max:
+                n_J_lc = n_max
 
         n = n_E
         winner = 0
@@ -557,25 +589,17 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         return y1, y2
 
     @njit(**fastmath)
-    def u_of_x(x):
-        # x = |E| in your units
-        # SM78: u ∝ |E|^{-5/4}
-        if x <= 0.0:
-            return 1.0e30
-        return x ** (-U_EXP)
-
-    @njit(**fastmath)
-    def floor_index_for_u(u, floors):
+    def floor_index_for_j2(j2, floors):
         k = -1
         for i in range(floors.size):
-            if u < floors[i]:
+            if j2 < floors[i]:
                 k = i
         return k
 
     @njit(**fastmath)
-    def target_floor_with_hysteresis(u, floors, current_idx, split_hyst=0.8):
+    def target_floor_with_hysteresis(j2, floors, current_idx, split_hyst=0.8):
         k = current_idx
-        while (k + 1) < floors.size and u < split_hyst * floors[k + 1]:
+        while (k + 1) < floors.size and j2 < split_hyst * floors[k + 1]:
             k += 1
         return k
 
@@ -590,7 +614,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                  n_max_override_val=3.0e4, E2_scale_local=1.0,
                  J2_scale_local=1.0, covEJ_scale_local=1.0,
                  E2_x_power_local=0.0, E2_x_ref_local=1.0,
-                 use_sm78_physics=False, lc_strength_scale=1.0):
+                 use_sm78_physics=False):
         E2_scale_val = E2_scale_local
         J2_scale_val = J2_scale_local
         covEJ_scale_val = covEJ_scale_local
@@ -607,79 +631,60 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                        lc_floor_frac=lc_floor_frac, lc_gap_scale=lc_gap_scale,
                        step_size_factor_val=step_size_factor_val,
                        n_max_override_val=n_max_override_val,
-                       use_sm78_physics=use_sm78_physics,
-                       lc_strength_scale=lc_strength_scale)
+                       use_sm78_physics=use_sm78_physics)
 
-        # SM78 step adjustment: truncate to next integer orbit count if possible.
         next_int = math.floor(phase) + 1.0
-        n_to_next_int = next_int - phase
-
-        if use_sm78_physics and n_raw >= n_to_next_int:
-            n = n_to_next_int
-            crossed_peri = True
+        crossed_peri = (phase + n_raw >= next_int)
+        if crossed_peri:
+            n = next_int - phase
         else:
             n = n_raw
-            crossed_peri = False
 
-        e1_curr, sigE_curr, j1_curr, sigJ_curr, rho_curr = bilinear_coeffs(
-            x, j, pstar_val, e1_scale_val,
-            zero_coeffs_flag, zero_drift_flag, zero_diffusion_flag,
-            E2_scale_local, J2_scale_local, covEJ_scale_local,
-            E2_x_power_local, E2_x_ref_local, use_sm78_physics
-        )
+        E = -x
+        Jmax = 1.0 / math.sqrt(2.0 * x)
+        J = j * Jmax
 
-        y1_step, y2_step = correlated_normals(rho_curr, sigE_curr, sigJ_curr)
+        y1, y2 = correlated_normals(rho, sigE, sigJ)
 
-        E_curr = -x
-        deltaE = n * e1_curr + math.sqrt(n) * sigE_curr * y1_step
-        E_new = E_curr + deltaE
+        deltaE = n * e1 + math.sqrt(n) * sigE * y1
+        E_new = E + deltaE
         if E_new >= -1e-6:
             E_new = -1e-6
         x_new = -E_new
+
         if x_new > x_max:
             x_new = x_max
             E_new = -x_new
 
-        Jmax_curr = 1.0 / math.sqrt(2.0 * x)
-        J2_star_curr = sigJ_curr / Jmax_curr if Jmax_curr > 0.0 else 0.0
-        j1_star_curr = j1_curr / Jmax_curr if Jmax_curr > 0.0 else 0.0
+        Jmax_new = 1.0 / math.sqrt(2.0 * x_new)
 
-        j_min_curr = j_min_of_x(x, lc_scale_val, noloss_flag, use_sm78_physics)
-        inside_loss_cone = (j <= j_min_curr)
-
-        if use_sm78_physics:
-            # --- Literal SM78 criterion for using the 2D random walk (eq. 28) ---
-            large_step_2d = (math.sqrt(n) * J2_star_curr >= 0.25 * j)
-            low_j = (j <= 0.4)  # SM78: eq. (28) applies when J ≲ 0.4 J_max
-            use_2d = inside_loss_cone and low_j and large_step_2d
-        else:
-            # --- Generic / non-SM78 mode: keep your previous "loss-cone-width" logic ---
-            d_lc = max(0.25 * abs(j - j_min_curr), 0.10 * j_min_curr)
-            large_step_lc = (math.sqrt(n) * J2_star_curr >= d_lc)
-            low_j = (j <= 0.4)
-            use_2d = inside_loss_cone and low_j and large_step_lc
+        use_2d = (math.sqrt(n) * sigJ > J / 4.0)
 
         if use_2d:
             z1 = np.random.normal()
             z2 = np.random.normal()
-            j_new = math.sqrt(
-                (j + math.sqrt(n) * z1 * J2_star_curr) ** 2 +
-                (math.sqrt(n) * z2 * J2_star_curr) ** 2
+            J_new = math.sqrt(
+                (J + math.sqrt(n) * z1 * sigJ) ** 2 +
+                (math.sqrt(n) * z2 * sigJ) ** 2
             )
         else:
-            j_new = j + n * j1_star_curr + math.sqrt(n) * J2_star_curr * y2_step
+            J_new = J + n * j1 + math.sqrt(n) * sigJ * y2
 
-        if j_new < 0.0:
-            j_new = -j_new
-        if j_new > 1.0:
-            j_new = 2.0 - j_new
-            j_new = min(max(j_new, 0.0), 1.0)
+        if J_new < 0.0:
+            J_new = -J_new
+        if J_new > Jmax_new:
+            J_new = 2.0 * Jmax_new - J_new
+            if J_new < 0.0:
+                J_new = 0.0
+            if J_new > Jmax_new:
+                J_new = Jmax_new
 
+        j_new = J_new / Jmax_new
         phase_new = phase + n
 
         captured = False
         ghost_captured = False
-        if crossed_peri and (not noloss_flag):
+        if (not noloss_flag) and crossed_peri:
             j_min_new = j_min_of_x(x_new, lc_scale_val, noloss_flag, use_sm78_physics)
             if j_new < j_min_new:
                 if not disable_capture:
@@ -728,8 +733,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                    covEJ_scale=1.0,
                    E2_x_power=0.0,
                    E2_x_ref=1.0,
-                   use_sm78_physics=False,
-                   lc_strength_scale=1.0):
+                   use_sm78_physics=False):
         np.random.seed(seed)
         SPLIT_HYST = 0.8
         noloss_flag = noloss
@@ -755,7 +759,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         j = math.sqrt(np.random.random())
         phase = 0.0
         w = 1.0
-        parent_floor_idx = floor_index_for_u(u_of_x(x), floors)
+        parent_floor_idx = floor_index_for_j2(j * j, floors)
 
         MAX_CLONES = 65536 if use_clones else 0
         cx = np.zeros(MAX_CLONES, dtype=np.float64)
@@ -792,8 +796,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 E2_scale_local=E2_scale, J2_scale_local=J2_scale,
                 covEJ_scale_local=covEJ_scale,
                 E2_x_power_local=E2_x_power, E2_x_ref_local=E2_x_ref,
-                use_sm78_physics=use_sm78_physics,
-                lc_strength_scale=lc_strength_scale
+                use_sm78_physics=use_sm78_physics
             )
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -812,11 +815,11 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                         else:
                             x = X_BOUND
                     j = math.sqrt(np.random.random())
-                parent_floor_idx = floor_index_for_u(u_of_x(x), floors)
+                parent_floor_idx = floor_index_for_j2(j * j, floors)
             elif use_clones:
-                u_now = u_of_x(x)
+                j2_now = j * j
                 target_idx = target_floor_with_hysteresis(
-                    u_now, floors, parent_floor_idx, SPLIT_HYST
+                    j2_now, floors, parent_floor_idx, SPLIT_HYST
                 )
                 while parent_floor_idx < target_idx:
                     parent_floor_idx += 1
@@ -855,31 +858,43 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                         E2_scale_local=E2_scale, J2_scale_local=J2_scale,
                         covEJ_scale_local=covEJ_scale,
                         E2_x_power_local=E2_x_power, E2_x_ref_local=E2_x_ref,
-                        use_sm78_physics=use_sm78_physics,
-                        lc_strength_scale=lc_strength_scale
+                        use_sm78_physics=use_sm78_physics
                     )
                     cx[i] = x_c2
                     cj[i] = j_c2
                     cph[i] = ph_c2
 
                     if cap_c or (x_c2 < X_BOUND):
-                        # SM78: clones are NOT replaced if consumed or lost;
-                        # they are simply removed after being counted.
-                        cw[i] = 0.0
-                        cactive[i] = 0
+                        if use_sm78_physics:
+                            cx[i], cj[i] = inject_star_sm78()
+                        else:
+                            if noloss_flag:
+                                cx[i] = sample_x_from_g0_jit()
+                            else:
+                                if outer_injection:
+                                    x_inj = sample_x_from_g0_jit()
+                                    while x_inj < outer_inj_x_min:
+                                        x_inj = sample_x_from_g0_jit()
+                                    cx[i] = x_inj
+                                else:
+                                    cx[i] = X_BOUND
+                            cj[i] = math.sqrt(np.random.random())
+                        cph[i] = ph_c2
+                        cfloor_idx[i] = floor_index_for_j2(cj[i] * cj[i], floors)
+                        cactive[i] = 1
                         i += 1
                         continue
 
-                    if cfloor_idx[i] >= 0 and u_of_x(x_c2) >= floors[cfloor_idx[i]]:
+                    if cfloor_idx[i] >= 0 and j_c2 * j_c2 >= floors[cfloor_idx[i]]:
                         w += cw[i]
                         cw[i] = 0.0
                         cactive[i] = 0
                         i += 1
                         continue
 
-                    u_c = u_of_x(x_c2)
+                    j2_c = j_c2 * j_c2
                     target_idx_c = target_floor_with_hysteresis(
-                        u_c, floors, cfloor_idx[i], SPLIT_HYST
+                        j2_c, floors, cfloor_idx[i], SPLIT_HYST
                     )
                     while cfloor_idx[i] < target_idx_c:
                         cfloor_idx[i] += 1
@@ -911,7 +926,6 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
         crossings = 0
         caps = 0
         max_ccount = ccount
-        cap_E_sum = 0.0
 
         while t0_used < n_relax:
             x_prev = x
@@ -928,8 +942,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                 E2_scale_local=E2_scale, J2_scale_local=J2_scale,
                 covEJ_scale_local=covEJ_scale,
                 E2_x_power_local=E2_x_power, E2_x_ref_local=E2_x_ref,
-                use_sm78_physics=use_sm78_physics,
-                lc_strength_scale=lc_strength_scale
+                use_sm78_physics=use_sm78_physics
             )
             dt0 = (n_used * P_of_x(x_prev)) / T0
             t0_used += dt0
@@ -960,7 +973,6 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                     caps += 1
                     if cap_hist is not None:
                         cap_hist[bin_index(x_prev)] += 1
-                    cap_E_sum += w * x_prev
                 
                 if use_sm78_physics:
                     x, j = inject_star_sm78()
@@ -991,11 +1003,11 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                             else:
                                 x = X_BOUND
                     j = math.sqrt(np.random.random())
-                parent_floor_idx = floor_index_for_u(u_of_x(x), floors)
+                parent_floor_idx = floor_index_for_j2(j * j, floors)
             elif use_clones:
-                u_now = u_of_x(x)
+                j2_now = j * j
                 target_idx = target_floor_with_hysteresis(
-                    u_now, floors, parent_floor_idx, SPLIT_HYST
+                    j2_now, floors, parent_floor_idx, SPLIT_HYST
                 )
                 while parent_floor_idx < target_idx:
                     parent_floor_idx += 1
@@ -1036,8 +1048,7 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                         E2_scale_local=E2_scale, J2_scale_local=J2_scale,
                         covEJ_scale_local=covEJ_scale,
                         E2_x_power_local=E2_x_power, E2_x_ref_local=E2_x_ref,
-                        use_sm78_physics=use_sm78_physics,
-                        lc_strength_scale=lc_strength_scale
+                        use_sm78_physics=use_sm78_physics
                     )
 
                     cx[i] = x_c2
@@ -1048,30 +1059,59 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
                         crossings += 1
 
                     if cap_c or (x_c2 < X_BOUND):
-                        # SM78: clones are NOT replaced if consumed or lost;
-                        # they are simply removed after being counted.
                         if cap_c:
                             caps += 1
                             if cap_hist is not None:
                                 cap_hist[bin_index(x_c)] += 1
-                            cap_E_sum += cw[i] * x_c
-                        cw[i] = 0.0
-                        cactive[i] = 0
+                        
+                        if use_sm78_physics:
+                            cx[i], cj[i] = inject_star_sm78()
+                            if inj_hist is not None:
+                                inj_hist[bin_index(cx[i])] += 1
+                        else:
+                            if inj_hist is not None:
+                                if outer_injection and not noloss_flag:
+                                    x_inj = sample_x_from_g0_jit()
+                                    while x_inj < outer_inj_x_min:
+                                        x_inj = sample_x_from_g0_jit()
+                                    cx[i] = x_inj
+                                    inj_hist[bin_index(x_inj)] += 1
+                                elif noloss_flag:
+                                    cx[i] = sample_x_from_g0_jit()
+                                    inj_hist[bin_index(cx[i])] += 1
+                                else:
+                                    cx[i] = X_BOUND
+                                    inj_hist[bin_index(cx[i])] += 1
+                            else:
+                                if noloss_flag:
+                                    cx[i] = sample_x_from_g0_jit()
+                                else:
+                                    if outer_injection:
+                                        x_inj = sample_x_from_g0_jit()
+                                        while x_inj < outer_inj_x_min:
+                                            x_inj = sample_x_from_g0_jit()
+                                        cx[i] = x_inj
+                                    else:
+                                        cx[i] = X_BOUND
+                            cj[i] = math.sqrt(np.random.random())
+                        cph[i] = ph_c2
+                        cfloor_idx[i] = floor_index_for_j2(cj[i] * cj[i], floors)
+                        cactive[i] = 1
                         if ccount > max_ccount:
                             max_ccount = ccount
                         i += 1
                         continue
 
-                    if cfloor_idx[i] >= 0 and u_of_x(x_c2) >= floors[cfloor_idx[i]]:
+                    if cfloor_idx[i] >= 0 and j_c2 * j_c2 >= floors[cfloor_idx[i]]:
                         w += cw[i]
                         cw[i] = 0.0
                         cactive[i] = 0
                         i += 1
                         continue
 
-                    u_c = u_of_x(x_c2)
+                    j2_c = j_c2 * j_c2
                     target_idx_c = target_floor_with_hysteresis(
-                        u_c, floors, cfloor_idx[i], SPLIT_HYST
+                        j2_c, floors, cfloor_idx[i], SPLIT_HYST
                     )
                     while cfloor_idx[i] < target_idx_c:
                         cfloor_idx[i] += 1
@@ -1106,35 +1146,9 @@ def _build_kernels(use_jit=True, noloss=False, lc_scale=LC_SCALE_DEFAULT,
             ghost_cap_hist = np.zeros(x_bins.size, dtype=np.int64)
         
         if use_snapshots:
-            return (
-                g_acc,
-                snapshots,
-                t0_used,
-                crossings,
-                caps,
-                cap_E_sum,
-                max_ccount,
-                weight_sum,
-                diag_counts,
-                cap_hist,
-                inj_hist,
-                ghost_cap_hist,
-            )
+            return g_acc, snapshots, crossings, caps, max_ccount, weight_sum, diag_counts, cap_hist, inj_hist, ghost_cap_hist
         else:
-            return (
-                g_acc,
-                total_t0,
-                total_t0,
-                crossings,
-                caps,
-                cap_E_sum,
-                max_ccount,
-                weight_sum,
-                diag_counts,
-                cap_hist,
-                inj_hist,
-                ghost_cap_hist,
-            )
+            return g_acc, total_t0, crossings, caps, max_ccount, weight_sum, diag_counts, cap_hist, inj_hist, ghost_cap_hist
 
     return P_of_x, T0, run_stream, sample_x_from_g0_jit
 
@@ -1147,8 +1161,7 @@ def _worker_one(args):
      enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
      enable_cap_inj_diag, outer_injection, outer_inj_x_min,
      zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override,
-     E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref, use_sm78_physics,
-     lc_strength_scale) = args
+     E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref, use_sm78_physics) = args
 
     P_of_x, T0, run_stream, sample_x_from_g0_jit = _build_kernels(
         use_jit=use_jit, noloss=noloss, lc_scale=lc_scale,
@@ -1156,8 +1169,7 @@ def _worker_one(args):
         zero_drift=zero_drift, zero_diffusion=zero_diffusion,
         step_size_factor=step_size_factor, n_max_override=n_max_override,
         E2_scale=E2_scale, J2_scale=J2_scale, covEJ_scale=covEJ_scale,
-        E2_x_power=E2_x_power, E2_x_ref=E2_x_ref, use_sm78_physics=use_sm78_physics,
-        lc_strength_scale=lc_strength_scale
+        E2_x_power=E2_x_power, E2_x_ref=E2_x_ref, use_sm78_physics=use_sm78_physics
     )
 
     x_init = sample_x_from_g0(u0)
@@ -1170,8 +1182,7 @@ def _worker_one(args):
         enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
         enable_cap_inj_diag, outer_injection, outer_inj_x_min,
         zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override,
-        E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref, use_sm78_physics,
-        lc_strength_scale
+        E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref, use_sm78_physics
     )
 
     result = run_stream(
@@ -1182,8 +1193,7 @@ def _worker_one(args):
         enable_diag_counts, disable_capture, lc_floor_frac, lc_gap_scale,
         enable_cap_inj_diag, outer_injection, outer_inj_x_min,
         zero_coeffs, zero_drift, zero_diffusion, step_size_factor, n_max_override,
-        E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref, use_sm78_physics,
-        lc_strength_scale
+        E2_scale, J2_scale, covEJ_scale, E2_x_power, E2_x_ref, use_sm78_physics
     )
     return result
 
@@ -1232,7 +1242,6 @@ def run_parallel_gbar(
     gbar_x_norm=0.225,
     gbar_flux_exp=3.10,
     use_sm78_physics=False,
-    lc_strength_scale=1.0,
 ):
     if noloss:
         use_clones = False
@@ -1266,10 +1275,8 @@ def run_parallel_gbar(
 
     g_total = np.zeros_like(X_BINS, dtype=np.float64)
     total_measure = 0.0
-    total_t0_measured = 0.0
     peri_total = 0
     caps_total = 0
-    capE_total = 0.0
     max_ccount = 0
     total_done = 0
     weight_sums = []
@@ -1324,34 +1331,17 @@ def run_parallel_gbar(
                         E2_x_power,
                         E2_x_ref,
                         use_sm78_physics,
-                        lc_strength_scale,
                     ),
                 )
                 for sid in range(n_streams)
             ]
 
             for f in cf.as_completed(futs):
-                (
-                    g_b,
-                    measure_b,
-                    t0_b,
-                    peri_b,
-                    caps_b,
-                    capE_b,
-                    ccount_b,
-                    wsum_b,
-                    diag_b,
-                    cap_b,
-                    inj_b,
-                    ghost_b,
-                ) = f.result()
-
+                g_b, measure_b, peri_b, caps_b, ccount_b, wsum_b, diag_b, cap_b, inj_b, ghost_b = f.result()
                 g_total += g_b
                 total_measure += measure_b
-                total_t0_measured += t0_b
                 peri_total += peri_b
                 caps_total += caps_b
-                capE_total += capE_b
                 weight_sums.append(wsum_b)
                 if enable_diag_counts:
                     diag_counts_total += diag_b
@@ -1426,40 +1416,6 @@ def run_parallel_gbar(
                 f"std={wsum_arr.std():.6f}",
                 file=sys.stderr,
             )
-        if total_t0_measured > 0.0 and caps_total > 0:
-            F_mc = caps_total / total_t0_measured
-            E_cap_mean = capE_total / caps_total
-            Edot_mc = capE_total / total_t0_measured
-
-            print(
-                f"[diag] capture/heating diagnostics:",
-                file=sys.stderr,
-            )
-            print(
-                f"       total_t0_measured = {total_t0_measured:.3e}",
-                file=sys.stderr,
-            )
-            print(
-                f"       total captures    = {caps_total:d}",
-                file=sys.stderr,
-            )
-            print(
-                f"       F_MC (captures per t0)     = {F_mc:.3e}",
-                file=sys.stderr,
-            )
-            print(
-                f"       <x>_cap (mean binding x)   = {E_cap_mean:.3e}",
-                file=sys.stderr,
-            )
-            print(
-                f"       Ė_MC (sum x per t0)        = {Edot_mc:.3e}",
-                file=sys.stderr,
-            )
-        elif total_t0_measured > 0.0 and caps_total == 0:
-            print(
-                f"[diag] capture/heating diagnostics: total_t0_measured={total_t0_measured:.3e}, no captures recorded.",
-                file=sys.stderr,
-            )
 
     if total_measure <= 0.0:
         raise RuntimeError("No time/snapshots accumulated; check parameters.")
@@ -1497,19 +1453,18 @@ def run_parallel_gbar(
                 )
             p_flux = gbar_flux_exp
             N_occ = g_total.copy()
-            gbar_norm, gbar_raw, x_norm_used = make_gbar_from_flux(
+            gbar_norm, gbar_raw = make_gbar_from_flux(
                 x_centers=X_BINS,
                 N_cap=cap_hist_total,
                 N_occ=N_occ,
                 total_measure=total_measure,
                 flux_exp=p_flux,
                 x_norm=gbar_x_norm,
-                show_progress=show_progress,
             )
             if show_progress:
                 print(
                     f"[diag] ḡ mode: using capture flux Γ_cap(x) / x^{p_flux:.2f}, "
-                    f"normalized at x={x_norm_used:.3g}",
+                    f"normalized at x={gbar_x_norm:.3g}",
                     file=sys.stderr,
                 )
         elif debug_occupancy_norm:
@@ -1522,21 +1477,6 @@ def run_parallel_gbar(
                     f"normalized at x={X_BINS[norm_idx_occ]:.3g}",
                     file=sys.stderr,
                 )
-                mask = (
-                    (X_BINS >= 1.0)
-                    & (X_BINS <= 100.0)
-                    & np.isfinite(N_x)
-                    & (N_x > 0.0)
-                )
-                if mask.sum() >= 2:
-                    logx = np.log10(X_BINS[mask])
-                    logN = np.log10(N_x[mask])
-                    p_fit, _ = np.polyfit(logx, logN, 1)
-                    print(
-                        f"[diag] best-fit N(E) ∝ x^{p_fit:.3f} in 1≲x≲100 "
-                        "(occupancy slope, before applying gexp).",
-                        file=sys.stderr,
-                    )
         else:
             gbar_norm, gbar_raw = make_gbar_from_occupancy(
                 x_centers=X_BINS,
@@ -1575,14 +1515,14 @@ def run_parallel_gbar(
                 if show_progress:
                     print(
                         "[diag] debug_occupancy_norm: no positive N_x; returning zeros.",
-                        file=sys.stderr,
-                    )
-                return gbar_norm, gbar_raw
-
+                    file=sys.stderr,
+                )
+            return gbar_norm, gbar_raw
+            
             norm_idx_occ = norm_idx if N_x[norm_idx] > 0 else positive_bins[0]
             gbar_norm = N_x / N_x[norm_idx_occ]
             gbar_raw = N_x.copy()
-
+            
             if show_progress:
                 print(
                     f"[diag] debug_occupancy_norm: returning occupancy N_x only "
@@ -1590,22 +1530,6 @@ def run_parallel_gbar(
                     f"This is N(E), not g(E).",
                     file=sys.stderr,
                 )
-                mask = (
-                    (X_BINS >= 1.0)
-                    & (X_BINS <= 100.0)
-                    & np.isfinite(N_x)
-                    & (N_x > 0.0)
-                )
-                if mask.sum() >= 2:
-                    logx = np.log10(X_BINS[mask])
-                    logN = np.log10(N_x[mask])
-                    p_fit, _ = np.polyfit(logx, logN, 1)
-                    print(
-                        f"[diag] best-fit N(E) ∝ x^{p_fit:.3f} in 1≲x≲100 "
-                        "(occupancy slope, before applying gexp).",
-                        file=sys.stderr,
-                    )
-            return gbar_norm, gbar_raw
         else:
             if gbar_from_flux:
                 if not enable_cap_inj_diag:
@@ -1614,19 +1538,18 @@ def run_parallel_gbar(
                     )
                 N_occ = g_total.copy()
                 p_flux = gbar_flux_exp
-                gbar_norm, gbar_raw, x_norm_used = make_gbar_from_flux(
+                gbar_norm, gbar_raw = make_gbar_from_flux(
                     x_centers=X_BINS,
                     N_cap=cap_hist_total,
                     N_occ=N_occ,
                     total_measure=total_measure,
                     flux_exp=p_flux,
                     x_norm=gbar_x_norm,
-                    show_progress=show_progress,
                 )
                 if show_progress:
                     print(
                         f"[diag] ḡ mode: using capture flux Γ_cap(x) / x^{p_flux:.2f}, "
-                        f"normalized at x={x_norm_used:.3g}",
+                        f"normalized at x={gbar_x_norm:.3g}",
                         file=sys.stderr,
                     )
             else:
@@ -1684,229 +1607,302 @@ def main():
         "--streams",
         type=int,
         default=400,
+        help="number of non-clone time-carrying streams (default: 400)",
     )
     ap.add_argument(
         "--windows",
         type=float,
         default=6.0,
+        help="t0 windows per stream (measurement duration, default: 6)",
     )
     ap.add_argument(
         "--procs",
         type=int,
         default=48,
+        help="number of worker processes (default: 48)",
     )
     ap.add_argument(
         "--floors_min_exp",
         type=int,
         default=8,
+        help="min exponent k for floors 10^{-k} (default: 8 => 1e-8)",
     )
     ap.add_argument(
         "--floor-step",
         type=int,
         default=1,
+        help="stride for floor exponents (e.g. 2 => decades 0,2,4,...)",
     )
     ap.add_argument(
         "--clones",
         type=int,
         default=9,
+        help="clones per split (default: 9, matching SM78 canonical model)",
     )
     ap.add_argument(
         "--nojit",
         action="store_true",
+        help="disable numba JIT (slow fallback)",
     )
     ap.add_argument(
         "--no-progress",
         action="store_true",
+        help="disable progress display",
     )
     ap.add_argument(
         "--seed",
         type=int,
         default=SEED,
+        help="base RNG seed (default: %(default)s)",
     )
     ap.add_argument(
         "--pstar",
         type=float,
         default=PSTAR,
+        help="P* parameter (default: %(default)s)",
     )
     ap.add_argument(
         "--warmup",
         type=float,
         default=2.0,
+        help="equilibration time in t0 before tallying (default: 2)",
     )
     ap.add_argument(
         "--replicates",
         type=int,
         default=1,
+        help="repeat the whole measurement K times (accumulating raw tallies)",
     )
     ap.add_argument(
         "--gexp",
         type=float,
         default=2.5,
+        help=(
+            "Exponent in g(x) ∝ N(E) x^gexp conversion. "
+            "For an apples-to-apples comparison with Shapiro & Marchant (1978), "
+            "this should be 2.5 as implied by eqs. (9), (11) and (13). "
+            "The parameter is kept for diagnostic testing only (default: 2.5)."
+        ),
     )
     ap.add_argument(
         "--use-tunable-gexp",
         action="store_true",
+        help=(
+            "DEPRECATED: This flag is now a no-op. The code always uses the --gexp "
+            "parameter. For Fig. 3 reproduction, use --gexp 2.5 (the default)."
+        ),
     )
     ap.add_argument(
         "--gbar-no-clones",
         action="store_true",
+        help=(
+            "Accumulate ḡ(x) from parent stream only "
+            "(ignore clones in the histogram)."
+        ),
     )
     ap.add_argument(
         "--snapshots",
         action="store_true",
+        help=(
+            "Use per-t0 snapshots for ḡ accumulation "
+            "(closer to SM78 Fig. 3 procedure) instead "
+            "of continuous time-weighting."
+        ),
     )
     ap.add_argument(
         "--snaps-per-t0",
         type=int,
         default=40,
+        help="Snapshots per t0 when --snapshots is set (default: 40).",
     )
     ap.add_argument(
         "--noloss",
         action="store_true",
+        help="Disable loss-cone capture (for BW g0 diagnostics).",
     )
     ap.add_argument(
         "--e1-scale",
         type=float,
         default=E1_SCALE_DEFAULT,
+        help="Scale factor for energy drift e1 (default: %.3f)" % E1_SCALE_DEFAULT,
     )
     ap.add_argument(
         "--lc_scale",
         type=float,
         default=LC_SCALE_DEFAULT,
+        help="Scale factor for loss-cone boundary j_min (default: %.3f; <1 shrinks the cone)" % LC_SCALE_DEFAULT,
     )
     ap.add_argument(
         "--cone-gamma",
         type=float,
         default=0.25,
+        help="γ factor in eq. 29d for loss-cone step limiting (default: 0.25, matching SM78).",
     )
     ap.add_argument(
         "--diag-29-counts",
         action="store_true",
+        help="Enable diagnostic counters for eq. 29 constraint winners (29a/29b/29c/29d).",
     )
     ap.add_argument(
         "--disable-capture",
         action="store_true",
+        help="Disable capture events while keeping loss-cone geometry (for testing 29d effect alone).",
     )
     ap.add_argument(
         "--lc-floor-frac",
         type=float,
         default=0.10,
+        help="Floor fraction for eq. 29d loss-cone limiter (default: 0.10). Set to 0.0 to disable floor.",
     )
     ap.add_argument(
         "--lc-gap-scale",
         type=float,
         default=None,
+        help="Override cone_gamma for eq. 29d gap calculation (default: use --cone-gamma value).",
     )
     ap.add_argument(
         "--cap-inj-diag",
         action="store_true",
+        help="Enable capture/injection diagnostics: histogram captures and injections by x-bin.",
     )
     ap.add_argument(
         "--outer-injection",
         action="store_true",
+        help="Use outer-boundary injection (x >= --outer-inj-x-min from reservoir). "
+             "By default, x-bound injection is used (x_b = 0.2, canonical SM78).",
     )
     ap.add_argument(
         "--use-x-bound-injection",
         action="store_true",
+        help="DEPRECATED: Use --outer-injection to enable outer-boundary injection. "
+             "By default, x-bound injection (x_b = 0.2) is used for canonical SM78.",
     )
     ap.add_argument(
         "--outer-inj-x-min",
         type=float,
         default=10.0,
+        help="Minimum x for outer-boundary injection (default: 10.0). "
+             "Stars are injected from the reservoir distribution with x >= this value.",
     )
     ap.add_argument(
         "--debug-occupancy-norm",
         action="store_true",
+        help=(
+            "DEBUG: Use occupancy-based normalization (capture-independent) "
+            "instead of gexp-based conversion. Useful for testing cloning neutrality."
+        ),
     )
     ap.add_argument(
         "--zero-coeffs",
         action="store_true",
+        help="DIAGNOSTIC: Zero out all drift and diffusion coefficients (Step 1 test).",
     )
     ap.add_argument(
         "--zero-drift",
         action="store_true",
+        help="DIAGNOSTIC: Zero out drift terms (e1, j1) to test diffusion only (Step 2a).",
     )
     ap.add_argument(
         "--zero-diffusion",
         action="store_true",
+        help="DIAGNOSTIC: Zero out diffusion terms (E2, J2, covEJ) to test drift only (Step 2b).",
     )
     ap.add_argument(
         "--step-size-factor",
         type=float,
         default=1.0,
+        help="DIAGNOSTIC: Scale factor for eq. 29 step-size constants (default: 1.0). Use <1.0 for smaller steps (Step 3).",
     )
     ap.add_argument(
         "--n-max-override",
         type=float,
         default=None,
+        help="DIAGNOSTIC: Override maximum step size n_max (default: 3.0e4). Use smaller values to force smaller steps (Step 3).",
     )
     ap.add_argument(
         "--E2-scale",
         type=float,
         default=1.0,
+        help="DIAGNOSTIC: Scale factor for energy diffusion E2* (default: 1.0). Use to test if missing factor in diffusion.",
     )
     ap.add_argument(
         "--J2-scale",
         type=float,
         default=1.0,
+        help="DIAGNOSTIC: Scale factor for angular momentum diffusion J2* (default: 1.0). Use to test if missing factor in diffusion.",
     )
     ap.add_argument(
         "--covEJ-scale",
         type=float,
         default=1.0,
+        help="DIAGNOSTIC: Scale factor for E-J covariance ζ*² (default: 1.0). Use to test if missing factor in correlation.",
     )
     ap.add_argument(
         "--E2-x-power",
         type=float,
         default=0.0,
+        help="DIAGNOSTIC: Energy-dependent power-law scaling for E2: E2_eff = E2 * (x/x_ref)^power (default: 0.0). Use to test what exponent would fix the slope.",
     )
     ap.add_argument(
         "--E2-x-ref",
         type=float,
         default=1.0,
+        help="DIAGNOSTIC: Reference energy for --E2-x-power scaling (default: 1.0).",
     )
     ap.add_argument(
         "--gbar-from-flux",
         action="store_true",
+        help="Compute ḡ(x) from capture flux diagnostics instead of snapshot occupancy (experimental).",
     )
     ap.add_argument(
         "--gbar-x-norm",
         type=float,
         default=0.225,
+        help="x at which ḡ is normalized to 1 (default: 0.225, matching paper).",
     )
     flux_exp_group = ap.add_mutually_exclusive_group()
     flux_exp_group.add_argument(
         "--gbar-flux-exp",
         type=float,
         default=3.10,
+        help=(
+            "Exponent p in ḡ ∝ Γ_cap(x) / x^p when using --gbar-from-flux "
+            "(p ≈ gexp + E2_x_power; default: 3.10 for SM78 fiducial). "
+            "This value makes flux-based ḡ match occupancy-based ḡ."
+        ),
     )
     flux_exp_group.add_argument(
         "--gbar-flux-power",
         type=float,
         dest="gbar_flux_exp",
+        help=(
+            "Alias for --gbar-flux-exp. Exponent p in ḡ ∝ Γ_cap(x) / x^p "
+            "when using --gbar-from-flux (default: 3.10)."
+        ),
     )
     ap.add_argument(
         "--use-sm78-physics",
         action="store_true",
-    )
-    ap.add_argument(
-        "--lc-strength-scale",
-        type=float,
-        default=1.0,
+        help=(
+            "Use exact SM78 diffusion coefficients, loss cone, and outer boundary "
+            "instead of parametric tunings (E2_x_power, J2_scale, lc_scale, etc.)."
+        ),
     )
 
     args = ap.parse_args()
 
     if args.use_sm78_physics:
-        #   
+        args.e1_scale = 1.0
         args.E2_scale = 1.0
         args.J2_scale = 1.0
         args.covEJ_scale = 1.0
         args.E2_x_power = 0.0
         args.E2_x_ref = 1.0
         args.lc_scale = 1.0
+        # KEEP canonical SM78 step-rule numbers for eq. (29d):
+        # n^{1/2} * j_2 <= max{0.25|J-J_min|, 0.10*J_min}
         args.lc_floor_frac = 0.10
-        args.cone_gamma   = 0.25
+        args.cone_gamma = 0.25
         args.lc_gap_scale = None
         args.outer_injection = False
 
@@ -1939,7 +1935,7 @@ def main():
         use_snapshots=args.snapshots,
         snaps_per_t0=args.snaps_per_t0,
         noloss=args.noloss,
-        use_clones=(not args.noloss),
+        use_clones=(not args.noloss and not args.gbar_no_clones),
         lc_scale=args.lc_scale,
         e1_scale=args.e1_scale,
         x_max=None,
@@ -1966,27 +1962,59 @@ def main():
         gbar_x_norm=args.gbar_x_norm,
         gbar_flux_exp=args.gbar_flux_exp,
         use_sm78_physics=args.use_sm78_physics,
-        lc_strength_scale=args.lc_strength_scale,
     )
 
-    print("x_center   gbar_MC_norm   gbar_MC_raw      gbar_paper   gbar_err_paper")
+    # Select reference data based on mode
+    if args.noloss:
+        # For no-loss mode, compare against BW's g_0 (1D isotropic solution)
+        # Interpolate G0_TAB at X_BINS from X_G0, G0_TAB
+        gp_ref = np.interp(X_BINS, X_G0, G0_TAB, left=np.nan, right=np.nan)
+        gp_err = np.full_like(gp_ref, np.nan)  # No error bars for g0 reference
+        ref_label = "g0_BW"
+    else:
+        # For loss-cone mode, compare against SM78 Fig. 3 data
+        gp_ref = GBAR_PAPER
+        gp_err = GBAR_ERR_PAPER
+        ref_label = "gbar_paper"
+    
+    print(f"# x_center   gbar_MC_norm   gbar_MC_raw      {ref_label:12s}   err_{ref_label}")
     residuals = []
-    for xb, g_norm, g_raw, gp, gp_err in zip(
-        X_BINS, gbar_norm, gbar_raw, GBAR_PAPER, GBAR_ERR_PAPER
+    for xb, g_norm, g_raw, gp, gp_err_val in zip(
+        X_BINS, gbar_norm, gbar_raw, gp_ref, gp_err
     ):
-        print(
-            f"{xb:10.3g}  {g_norm:12.6e}  {g_raw:12.6e}  "
-            f"{gp:11.4f}  {gp_err:14.4f}"
-        )
-        if gp_err > 0:
-            residuals.append((g_norm - gp) / gp_err)
+        if np.isnan(gp):
+            print(
+                f"{xb:10.3g}  {g_norm:12.6e}  {g_raw:12.6e}  "
+                f"{'N/A':>12s}  {'N/A':>12s}"
+            )
+        else:
+            if not np.isnan(gp_err_val) and gp_err_val > 0:
+                print(
+                    f"{xb:10.3g}  {g_norm:12.6e}  {g_raw:12.6e}  "
+                    f"{gp:11.4f}  {gp_err_val:14.4f}"
+                )
+                residuals.append((g_norm - gp) / gp_err_val)
+            else:
+                print(
+                    f"{xb:10.3g}  {g_norm:12.6e}  {g_raw:12.6e}  "
+                    f"{gp:11.4f}  {'N/A':>14s}"
+                )
+                # For g0 comparison without error bars, use absolute residuals
+                residuals.append(g_norm - gp)
     
     if residuals:
         residuals_arr = np.array(residuals)
-        chi2 = np.sum(residuals_arr**2)
-        chi2_per_dof = chi2 / len(residuals_arr)
-        print(f"chi^2/dof = {chi2_per_dof:.3f} (target: < 2.0 for good agreement)")
-        print(f"max |residual| = {np.abs(residuals_arr).max():.3f} sigma")
+        if args.noloss:
+            # For g0, report absolute residuals and RMS
+            rms_residual = np.sqrt(np.mean(residuals_arr**2))
+            max_residual = np.abs(residuals_arr).max()
+            print(f"# RMS residual = {rms_residual:.6f} (target: < 0.1 for good agreement)")
+            print(f"# max |residual| = {max_residual:.6f}")
+        else:
+            chi2 = np.sum(residuals_arr**2)
+            chi2_per_dof = chi2 / len(residuals_arr)
+            print(f"# chi^2/dof = {chi2_per_dof:.3f} (target: < 2.0 for good agreement)")
+            print(f"# max |residual| = {np.abs(residuals_arr).max():.3f} sigma")
 
 
 if __name__ == "__main__":

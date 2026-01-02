@@ -42,6 +42,36 @@ _LOG_MAX = 709.0    # safe exp upper for float64
 
 
 # -------------------------
+# Helper functions
+# -------------------------
+
+def _asarray1d(x):
+    """Convert to 1D float array."""
+    x = np.asarray(x, dtype=float)
+    return x
+
+
+def _interp_loglog(x, xk, yk):
+    """
+    log-log interpolation in x for y>0; falls back to linear in y if any y<=0.
+    """
+    x = _asarray1d(x)
+    xk = np.asarray(xk, dtype=float)
+    yk = np.asarray(yk, dtype=float)
+
+    if np.all(yk > 0):
+        lx = np.log(x)
+        lxk = np.log(xk)
+        lyk = np.log(yk)
+        ly = np.interp(lx, lxk, lyk)
+        y = np.exp(ly)
+    else:
+        y = np.interp(x, xk, yk)
+
+    return y
+
+
+# -------------------------
 # Quadrature helpers
 # -------------------------
 
@@ -175,7 +205,8 @@ class AppendixA:
     g0_bw: Callable[[Array], Array]
     n_theta: int = 48
     n_x: int = 48
-    unbound_scale: float = 0.25     # scale for unbound tail: gbar(x'<=0) = unbound_scale * exp(x')
+    unbound_scale: float = 1.0       # scale for unbound tail: gbar(x'<=0) = unbound_scale * exp(x')
+                                     # Table 1 convention: unbound_scale=1.0 (∫_{-∞}^0 e^{x'}dx'=1)
     j_circular_eps: float = 1e-10    # use j=1-eps internally for j>=1
 
     def __post_init__(self):
@@ -369,6 +400,40 @@ class AppendixA:
             j_eff=float(j_eff),
         )
 
+    def coeffs_star_circular_limit(self, x: float, eps_list=(1e-3, 3e-4, 1e-4, 3e-5)) -> Dict[str, float]:
+        """
+        Extrapolate coefficients to j->1 using a linear fit in eps = (1-j).
+        This is much more stable than evaluating exactly at j=1.
+        
+        Args:
+            x: Energy parameter
+            eps_list: List of (1-j) values to use for extrapolation
+            
+        Returns:
+            Dictionary of coefficients extrapolated to j=1
+        """
+        eps = np.array(eps_list, dtype=float)
+        js = 1.0 - eps
+
+        vals = {k: [] for k in ["eps1_star","eps2_star2","j1_star","j2_star2","zeta_star2"]}
+        for j in js:
+            c = self.coeffs_star(x, float(j))  # base evaluation
+            for k in vals:
+                vals[k].append(c[k])
+
+        out = {}
+        for k, y in vals.items():
+            y = np.array(y, dtype=float)
+            # linear fit: y(eps) ~ a*eps + b; take b at eps=0
+            a, b = np.polyfit(eps, y, 1)
+            out[k] = float(b)
+
+        out["eps2_star"] = float(np.sqrt(max(0.0, out["eps2_star2"])))
+        out["j2_star"]   = float(np.sqrt(max(0.0, out["j2_star2"])))
+        out["x_p"], out["x_ap"] = x_p_x_ap(float(x), float(1.0 - eps_list[-1]))
+        out["j_eff"] = 1.0
+        return out
+
 
 def compute_tables(
     X_TABLE: Array,
@@ -379,7 +444,7 @@ def compute_tables(
     x_D: float,
     n_theta: int = 48,
     n_x: int = 48,
-    unbound_scale: float = 0.25,
+    unbound_scale: float = 1.0,
     j_circular_eps: float = 1e-10,
 ) -> Dict[str, Array]:
     X_TABLE = np.asarray(X_TABLE, dtype=float)
@@ -423,109 +488,85 @@ def quick_checks(tables: Dict[str, Array], X_TABLE: Array, J_GRID: Array) -> Dic
 # Helpers: build g0_bw(x) from SM78 Table 2 and print "Table 1"-like block
 # ---------------------------------------------------------------------
 
-# SM78 Table 2 (central values only)
-TABLE2_X = np.array([
+# -------------------------
+# Table 2 (paper) -> gbar(x) helper
+# -------------------------
+
+_TABLE2_X = np.array([
     2.25e-1, 3.03e-1, 4.95e-1, 1.04e0, 1.26e0, 1.62e0, 2.35e0,
-    5.00e0, 7.20e0, 8.94e0, 1.21e1, 1.97e1, 4.16e1, 5.03e1,
-    6.46e1, 9.36e1, 1.98e2, 2.87e2, 3.56e2, 4.80e2, 7.84e2,
+    5.00e0, 7.20e0, 8.94e0, 1.21e1, 1.97e1,
+    4.16e1, 5.03e1, 6.46e1, 9.36e1,
+    1.98e2, 2.87e2, 3.56e2, 4.80e2, 7.84e2,
     1.65e3, 2.00e3, 2.57e3, 3.73e3
 ], dtype=float)
 
-TABLE2_G = np.array([
+_TABLE2_G = np.array([
     1.00, 1.07, 1.13, 1.60, 1.34, 1.37, 1.55,
-    2.11, 2.22, 2.20, 2.41, 3.00, 3.50, 3.79,
-    3.61, 3.66, 4.03, 3.98, 3.31, 2.92, 2.35,
+    2.11, 2.22, 2.20, 2.41, 3.00,
+    3.50, 3.79, 3.61, 3.66,
+    4.03, 3.98, 3.31, 2.92, 2.35,
     1.57, 0.85, 0.74, 0.20
 ], dtype=float)
 
 
 def make_gbar_from_table2(
     *,
-    x_tab: Array = TABLE2_X,
-    g_tab: Array = TABLE2_G,
-    extrapolate: str = "slope",
-    below_behavior: str = "slope",
-    g_floor: float = 1e-300,
+    below_behavior: str = "flat",   # "flat" or "slope"
+    above_behavior: str = "zero",   # "zero" or "slope"
 ) -> Callable[[Array], Array]:
     """
-    Return a callable g0_bw(x) for x>0 built from SM78 Table 2.
-
-    Interpolation is performed in (log x, log g) space.
+    Returns a callable g0_bw(x) (for x>0) based on Table 2.
+    Uses log-log interpolation for stability.
 
     Parameters
     ----------
-    extrapolate : {"slope","flat"}
-        Behavior for x > max(x_tab).
-        - "slope": extend last log-log slope
-        - "flat":  hold g constant at last value
-    below_behavior : {"slope","flat"}
-        Behavior for 0 < x < min(x_tab).
-        - "slope": extend first log-log slope
-        - "flat":  hold g constant at first value (often ~1)
-    g_floor : float
-        Floor for g before taking logs.
-
-    Notes
-    -----
-    This returns ONLY the bound-star isotropized DF for x>0.
-    The module's AppendixA.bar_g() already handles x'<=0 via exp(x').
+    below_behavior : {"flat", "slope"}
+        Behavior for x < x_min.
+        - "flat": g(x<x_min)=g(x_min)
+        - "slope": extrapolate with the log-log slope from the first two points
+    above_behavior : {"zero", "slope"}
+        Behavior for x > x_max.
+        - "zero": g(x>x_max)=0
+        - "slope": extrapolate with the log-log slope from the last two points
     """
-    x_tab = np.asarray(x_tab, dtype=float)
-    g_tab = np.asarray(g_tab, dtype=float)
+    xk = _TABLE2_X
+    yk = _TABLE2_G
 
-    if np.any(x_tab <= 0):
-        raise ValueError("x_tab must be > 0")
-    if np.any(g_tab <= 0):
-        raise ValueError("g_tab must be > 0 (use g_floor if needed)")
+    # precompute endpoint slopes in log-log
+    s_lo = np.log(yk[1]/yk[0]) / np.log(xk[1]/xk[0])
+    s_hi = np.log(yk[-1]/yk[-2]) / np.log(xk[-1]/xk[-2])
 
-    # sort
-    idx = np.argsort(x_tab)
-    x_tab = x_tab[idx]
-    g_tab = g_tab[idx]
+    x_min, x_max = xk[0], xk[-1]
+    y_min, y_max = yk[0], yk[-1]
 
-    lx = np.log(x_tab)
-    lg = np.log(np.clip(g_tab, g_floor, None))
+    def g0_bw(x):
+        x = _asarray1d(x)
+        out = np.empty_like(x)
 
-    # end slopes in log-log
-    slope_lo = (lg[1] - lg[0]) / (lx[1] - lx[0])
-    slope_hi = (lg[-1] - lg[-2]) / (lx[-1] - lx[-2])
+        m_mid = (x >= x_min) & (x <= x_max)
+        if np.any(m_mid):
+            out[m_mid] = _interp_loglog(x[m_mid], xk, yk)
 
-    def g0_bw(x: Array) -> Array:
-        x = np.asarray(x, dtype=float)
-        out = np.zeros_like(x)
-
-        m = x > 0.0
-        if not np.any(m):
-            return out
-
-        xx = x[m]
-        lxx = np.log(xx)
-
-        # inside range: interpolate
-        lxx_clip = np.clip(lxx, lx[0], lx[-1])
-        lg_i = np.interp(lxx_clip, lx, lg)
-
-        # below range
-        mb = lxx < lx[0]
-        if np.any(mb):
+        m_lo = x < x_min
+        if np.any(m_lo):
             if below_behavior == "flat":
-                lg_i[mb] = lg[0]
+                out[m_lo] = y_min
             elif below_behavior == "slope":
-                lg_i[mb] = lg[0] + slope_lo * (lxx[mb] - lx[0])
+                out[m_lo] = y_min * (x[m_lo] / x_min) ** s_lo
             else:
-                raise ValueError("below_behavior must be 'slope' or 'flat'")
+                raise ValueError("below_behavior must be 'flat' or 'slope'")
 
-        # above range
-        ma = lxx > lx[-1]
-        if np.any(ma):
-            if extrapolate == "flat":
-                lg_i[ma] = lg[-1]
-            elif extrapolate == "slope":
-                lg_i[ma] = lg[-1] + slope_hi * (lxx[ma] - lx[-1])
+        m_hi = x > x_max
+        if np.any(m_hi):
+            if above_behavior == "zero":
+                out[m_hi] = 0.0
+            elif above_behavior == "slope":
+                out[m_hi] = y_max * (x[m_hi] / x_max) ** s_hi
             else:
-                raise ValueError("extrapolate must be 'slope' or 'flat'")
+                raise ValueError("above_behavior must be 'zero' or 'slope'")
 
-        out[m] = np.exp(np.clip(lg_i, _LOG_MIN, _LOG_MAX))
+        # enforce nonnegative
+        out = np.maximum(out, 0.0)
         return out
 
     return g0_bw
@@ -540,7 +581,7 @@ def print_table1_like(
     j_values: Array = np.array([1.000, 0.401, 0.161, 0.065, 0.026], dtype=float),
     n_theta: int = 48,
     n_x: int = 48,
-    unbound_scale: float = 0.25,
+    unbound_scale: float = 1.0,
     j_circular_eps: float = 1e-10,
 ) -> None:
     """
@@ -562,7 +603,10 @@ def print_table1_like(
     print("   x        j        -eps1*       eps2*        j1*         j2*       zeta*2")
     for xv in x_values:
         for jv in j_values:
-            c = calc.coeffs_star(float(xv), float(jv))
+            if abs(jv - 1.0) < 1e-6:
+                c = calc.coeffs_star_circular_limit(float(xv))
+            else:
+                c = calc.coeffs_star(float(xv), float(jv))
             print(f"{xv:8.3g}  {jv:7.3f}  {-c['eps1_star']: .3e}  {c['eps2_star']: .3e}"
                   f"  {c['j1_star']: .3e}  {c['j2_star']: .3e}  {c['zeta_star2']: .3e}")
         print()

@@ -18,7 +18,7 @@ from com_main_gw import (
     star_type_WD,
     star_type_BD,
 )
-from com_main_gw import (
+from sams_sub_single import (
     sams_get_weight_clone_single,
     set_real_weight_arr_single,
     sams_arr_select_type_single,
@@ -118,6 +118,6 @@ def get_sts_one_species_single(sma, sma_arr, pteve, isnap: int) -> None:
 
 
 def init_pro() -> None:
-    global aomax, aomin
-    aomax = rh / 2.0 / emin_factor
-    aomin = rh / 2.0 / emax_factor
+    import com_main_gw
+    com_main_gw.aomax = rh / 2.0 / emin_factor
+    com_main_gw.aomin = rh / 2.0 / emax_factor

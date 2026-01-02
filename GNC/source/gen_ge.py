@@ -179,10 +179,14 @@ class S1DType:
 class S2DType:
     nbinx: int = 0
     nbiny: int = 0
+    nx: int = 0  # Alias for nbinx
+    ny: int = 0  # Alias for nbiny
     xmin: float = 0.0
     xmax: float = 0.0
     ymin: float = 0.0
     ymax: float = 0.0
+    xstep: float = 0.0
+    ystep: float = 0.0
     xcenter: Optional[np.ndarray] = None
     ycenter: Optional[np.ndarray] = None
     fxy: Optional[np.ndarray] = None
@@ -191,6 +195,8 @@ class S2DType:
     def init(self, nbinx: int, nbiny: int, xmin: float, xmax: float, ymin: float, ymax: float, sts_type: int) -> None:
         self.nbinx = int(nbinx)
         self.nbiny = int(nbiny)
+        self.nx = self.nbinx
+        self.ny = self.nbiny
         self.xmin = float(xmin)
         self.xmax = float(xmax)
         self.ymin = float(ymin)
@@ -203,12 +209,16 @@ class S2DType:
     def set_range(self) -> None:
         if self.nbinx > 1:
             self.xcenter[:] = np.linspace(self.xmin, self.xmax, self.nbinx)
+            self.xstep = (self.xmax - self.xmin) / float(self.nbinx - 1) if self.nbinx > 1 else 0.0
         else:
             self.xcenter[:] = self.xmin
+            self.xstep = 0.0
         if self.nbiny > 1:
             self.ycenter[:] = np.linspace(self.ymin, self.ymax, self.nbiny)
+            self.ystep = (self.ymax - self.ymin) / float(self.nbiny - 1) if self.nbiny > 1 else 0.0
         else:
             self.ycenter[:] = self.ymin
+            self.ystep = 0.0
 
 
 @dataclass
@@ -289,24 +299,38 @@ class S2DHstType:
             self.ystep = 0.0
     
     def get_stats_weight(self, en: List[float], jm: List[float], we: List[float], n: int) -> None:
-        """Bin particles into weighted histogram."""
+        """Bin particles into weighted histogram.
+        
+        Replicates Fortran bin2_weight with flag=0 (sts_type_dstr).
+        See sts_fc.f90 lines 175-190 and return_idxy lines 306-321.
+        """
+        # Compute step sizes (Fortran flag=0 uses simple division)
+        xstep = (self.xmax - self.xmin) / float(self.nx) if self.nx > 1 else 1.0
+        ystep = (self.ymax - self.ymin) / float(self.ny) if self.ny > 1 else 1.0
+        
         for k in range(n):
-            # Find x bin
-            if self.nx > 1:
-                ix = int((en[k] - self.xmin) / (self.xmax - self.xmin) * self.nx)
-                ix = max(0, min(self.nx - 1, ix))
-            else:
-                ix = 0
+            x_val = en[k]
+            y_val = jm[k]
             
-            # Find y bin
-            if self.ny > 1:
-                iy = int((jm[k] - self.ymin) / (self.ymax - self.ymin) * self.ny)
-                iy = max(0, min(self.ny - 1, iy))
+            # Find x bin index (flag=0 sts_type_dstr, Fortran lines 306-312)
+            if x_val >= self.xmin and x_val < self.xmax:
+                ix = int((x_val - self.xmin) / xstep) + 1  # Fortran is 1-indexed
+            elif abs(x_val - self.xmax) < 1e-10:  # x == xmax
+                ix = self.nx
             else:
-                iy = 0
+                ix = -9999  # Out of bounds
             
-            # Add weight to bin
-            self.nxyw[ix, iy] += we[k]
+            # Find y bin index
+            if y_val >= self.ymin and y_val < self.ymax:
+                iy = int((y_val - self.ymin) / ystep) + 1  # Fortran is 1-indexed
+            elif abs(y_val - self.ymax) < 1e-10:  # y == ymax
+                iy = self.ny
+            else:
+                iy = -9999  # Out of bounds
+            
+            # Convert to 0-indexed for Python and add weight
+            if ix > 0 and ix <= self.nx and iy > 0 and iy <= self.ny:
+                self.nxyw[ix - 1, iy - 1] += we[k]
 
 
 @dataclass
@@ -767,7 +791,10 @@ def get_barge0(dm: DiffuseMspec) -> None:
 
 
 def get_barge_stellar(so: Any, jbtype: int) -> None:
-    """Integrate gxj over j to get barge."""
+    """Integrate gxj over j to get barge (g(x) distribution).
+    
+    Replicates get_barge_stellar from stellar_obj.f90 lines 193-256.
+    """
     if not hasattr(so, 'n') or so.n == 0:
         return
     if not hasattr(so, 'barge') or not hasattr(so, 'gxj'):
@@ -784,24 +811,33 @@ def get_barge_stellar(so: Any, jbtype: int) -> None:
     
     log10_val = math.log(10.0)
     
+    # Fortran lines 200-248
     for i in range(barge.nbin):
         int_out = 0.0
+        # Fortran line 207: Set x-coordinate
         barge.xb[i] = gxj.xcenter[i]
         
         if jbtype == Jbin_type_lin:
+            # Fortran lines 210-216: Linear j-bins
+            # Integration: sum of g(x,j) * j * dj * 2
             for j in range(gxj.ny):
                 int_out += gxj.fxy[i, j] * gxj.ycenter[j] * gxj.ystep * 2.0
         
         elif jbtype == Jbin_type_log:
+            # Fortran lines 225-232: Log j-bins
+            # Integration: sum of g(x,j) * (10^log_j)^2 * d(log_j) * 2 * log(10)
             for j in range(gxj.ny):
                 int_out += gxj.fxy[i, j] * (10.0 ** gxj.ycenter[j]) ** 2 * gxj.ystep * 2.0 * log10_val
         
         elif jbtype == Jbin_type_sqr:
+            # Fortran lines 240-242: Squared j-bins
+            # Integration: sum of g(x,j) * j^2 * d(j^2) * 2
             for j in range(gxj.ny):
                 int_out += gxj.fxy[i, j] * gxj.ycenter[j] * gxj.ystep * 2.0
         
         barge.fx[i] = int_out
         
+        # Check for NaN (Fortran lines 219-223)
         if math.isnan(barge.fx[i]):
             print(f"get_barge_stellar: fx[{i}] is NaN, int_out={int_out}")
             return
@@ -816,28 +852,35 @@ def get_barge_stellar(so: Any, jbtype: int) -> None:
 def get_ejw_from_particle(estar: np.ndarray, jstar: np.ndarray, wstar: np.ndarray, mstar: np.ndarray, n_star: int,
                           m1: float, m2: float, mbh: float, v0: float, xb: float,
                           nejw_out: Any, nsam_out: Any) -> Tuple[np.ndarray, int]:
-    """Convert particle (e,j,mass,weight) to nejw format for binning."""
+    """Convert particle (e,j,mass,weight) to nejw format for binning.
+    
+    This replicates get_ejw_from_particle from dms.f90 lines 520-572.
+    Energy is converted from physical energy to log10(x) where x = |E|/v0^2.
+    """
     if n_star <= 0:
         return np.zeros(0, dtype=object), 0
     
-    # Filter particles by mass range
-    mask = (mstar >= m1) & (mstar <= m2)
-    n_selected = np.sum(mask)
+    # Convert energy to dimensionless form: x = |E|/v0^2 (Fortran line 530)
+    xstar = np.abs(estar[:n_star]) / (v0 ** 2)
+    
+    # Filter particles by mass range (Fortran line 532)
+    mask = (mstar[:n_star] >= m1) & (mstar[:n_star] <= m2)
+    idx = np.where(mask)[0]
+    n_selected = len(idx)
     
     if n_selected == 0:
         return np.zeros(0, dtype=object), 0
     
-    # Create nej w records
+    # Create nejw records with log10(x) for energy (Fortran line 537)
     nejw_list = []
-    for i in range(n_star):
-        if mask[i]:
-            rec = NejwRec(
-                e=float(estar[i]),
+    for i in idx:
+        rec = NejwRec(
+                e=float(math.log10(xstar[i])),  # Store as log10(x)
                 j=float(jstar[i]),
                 w=float(wstar[i]),
-                idx=i
+                idx=int(i)
             )
-            nejw_list.append(rec)
+        nejw_list.append(rec)
     
     return np.array(nejw_list, dtype=object), len(nejw_list)
 
@@ -1386,7 +1429,10 @@ def get_den_u(fdenu: S1DType, rmin: float, rmax: float, nbin: int, r0: float, n0
 
 
 def dms_so_get_fxj(so: DmsStellarObject, n0: float, mbh: float, v0: float, jbtype: int) -> None:
-    """Convert weighted histogram nxj to distribution function gxj."""
+    """Convert weighted histogram nxj to distribution function gxj.
+    
+    Replicates dms_so_get_fxj from stellar_obj.f90 lines 145-192.
+    """
     if not hasattr(so, 'n') or so.n == 0:
         return
     if not hasattr(so, 'nxj') or not hasattr(so, 'gxj'):
@@ -1401,29 +1447,41 @@ def dms_so_get_fxj(so: DmsStellarObject, n0: float, mbh: float, v0: float, jbtyp
     PI = math.pi
     log10_val = math.log(10.0)
     
+    # Match Fortran exactly - lines 152-191
     if jbtype == Jbin_type_lin:
+        # Fortran lines 153-163
         for i in range(nxj.nx):
             x = 10.0 ** nxj.xcenter[i]
             for j in range(nxj.ny):
                 jm = nxj.ycenter[j]
+                # Fortran line 157-159: exact formula
+                # Skip if jm is zero to avoid division by zero
                 if jm > 0:
                     gxj.fxy[i, j] = (nxj.nxyw[i, j] / (x * log10_val) / nxj.xstep / nxj.ystep *
                                     PI ** (-1.5) * v0 ** 6 * x ** 2.5 / jm / n0 / mbh ** 3)
+                else:
+                    gxj.fxy[i, j] = 0.0
     
     elif jbtype == Jbin_type_log:
+        # Fortran lines 164-175
         for i in range(nxj.nx):
             x = 10.0 ** nxj.xcenter[i]
             for j in range(nxj.ny):
                 jm = 10.0 ** nxj.ycenter[j]
+                # Fortran line 169-171: exact formula
                 if jm > 0:
                     gxj.fxy[i, j] = (nxj.nxyw[i, j] / (x * log10_val) / nxj.xstep / nxj.ystep *
                                     PI ** (-1.5) * v0 ** 6 * x ** 2.5 / (jm ** 2 * log10_val) / n0 / mbh ** 3)
+                else:
+                    gxj.fxy[i, j] = 0.0
     
     elif jbtype == Jbin_type_sqr:
+        # Fortran lines 176-187
         for i in range(nxj.nx):
             x = 10.0 ** nxj.xcenter[i]
             for j in range(nxj.ny):
                 jm = nxj.ycenter[j] ** 0.5
+                # Fortran line 181-183: exact formula
                 gxj.fxy[i, j] = (nxj.nxyw[i, j] / (x * log10_val) / nxj.xstep / nxj.ystep *
                                 PI ** (-1.5) * v0 ** 6 * x ** 2.5 / 2.0 / n0 / mbh ** 3)
     

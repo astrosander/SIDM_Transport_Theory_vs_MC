@@ -1,2 +1,5 @@
 *.nbc
 *.nbi
+*.gitkeep
+*.hdf5
+*.pyc

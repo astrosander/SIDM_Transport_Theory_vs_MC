@@ -38,6 +38,9 @@ star_type_BD = 5
 Jbin_type_lin = 1
 Jbin_type_log = 2
 jbin_type_sqr = 3
+# Lowercase aliases for consistency
+jbin_type_lin = Jbin_type_lin
+jbin_type_log = Jbin_type_log
 
 # Exit flags
 exit_normal = 0
@@ -98,6 +101,10 @@ log10emax_factor: float = math.log10(1e5)
 clone_e0_factor: float = 1.0
 clone_emax: float = 1.0
 log10clone_emax: float = 0.0
+
+# Semi-major axis bounds (set in init_pro)
+aomax: float = 0.0  # Will be set to rh / 2.0 / emin_factor
+aomin: float = 0.0  # Will be set to rh / 2.0 / emax_factor
 my_unit_vel_c: float = 299792.458  # km/s
 
 # Output unit

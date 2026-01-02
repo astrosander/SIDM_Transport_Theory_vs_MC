@@ -188,6 +188,8 @@ plt.clf()
 sx=1;sy=2
 
 # First panel: log g(x) vs log x
+print("First panel: log g(x) vs log x")
+
 ax=plt.subplot(sx,sy,1)
 colors = ['#1F77B4', '#FF7F0E', '#2CA02C', '#D62728', '#9467BD', '#8C564B']
 for i, snapshot in enumerate([1, 2, 3, 5, 10]):
@@ -196,9 +198,12 @@ for i, snapshot in enumerate([1, 2, 3, 5, 10]):
 	ax.errorbar(r, mean, yerr=err, fmt=stylestar, 
 	            label=f'{time_frac:.1f}'+' $T_{\\rm rlx}$',
 	            mfc='w', markersize=mzstar, color=colors[i])
-	print(f"snapshot={snapshot}, time={time_frac:.1f} T_rlx")
-	print(f"  r range: [{r[0]:.3f}, {r[-1]:.3f}]")
-	print(f"  log g(x) range: [{mean[0]:.3f}, {mean[-1]:.3f}]")
+    
+	print(f"snapshot={snapshot}, time={float(time_frac):.1f}, r={np.array2string(r, precision=2)}, mean={np.array2string(mean, precision=2)}, err={np.array2string(err, precision=2)}")
+	# print("\n")
+	# print(f"snapshot={snapshot}, time={time_frac:.1f} T_rlx")
+	# print(f"  r range: [{r[0]:.3f}, {r[-1]:.3f}]")
+	# print(f"  log g(x) range: [{mean[0]:.3f}, {mean[-1]:.3f}]")
 
 ax.legend(loc='upper left', ncol=2, fontsize=10)
 ax.set_xlabel("log $x$", fontsize=18)
@@ -208,6 +213,7 @@ ax.set_ylim(-0.5, 1.8)
 ax.set_xlim(-1.5, 5.0)
 
 # Second panel: log n(r) vs log(r/r_h)
+print("Second panel: log n(r) vs log(r/r_h)")
 ax=plt.subplot(sx,sy,2)
 for i, snapshot in enumerate([1, 2, 3, 5, 10]):
 	time_frac = snapshot / 10.0
@@ -215,9 +221,12 @@ for i, snapshot in enumerate([1, 2, 3, 5, 10]):
 	ax.errorbar(r, mean, yerr=err, fmt=stylestar, 
 	            label=f'{time_frac:.1f}',
 	            mfc='w', markersize=mzstar, color=colors[i])
-	print(f"snapshot={snapshot}, time={time_frac:.1f} T_rlx (density)")
-	print(f"  log(r/r_h) range: [{r[0]:.3f}, {r[-1]:.3f}]")
-	print(f"  log n(r) range: [{mean[0]:.3f}, {mean[-1]:.3f}]")
+	print(f"snapshot={snapshot}, time={float(time_frac):.1f}, r={np.array2string(r, precision=2)}, mean={np.array2string(mean, precision=2)}, err={np.array2string(err, precision=2)}")
+	# print("\n")
+	
+	# print(f"snapshot={snapshot}, time={time_frac:.1f} T_rlx (density)")
+	# print(f"  log(r/r_h) range: [{r[0]:.3f}, {r[-1]:.3f}]")
+	# print(f"  log n(r) range: [{mean[0]:.3f}, {mean[-1]:.3f}]")
 
 ax.set_xlabel("log $r/r_h$", fontsize=18)
 ax.set_ylabel("log $n(r)$ (pc$^{-3}$)", fontsize=18)
